@@ -1,0 +1,91 @@
+name: Build Windows (MSVC + CUDA)
+
+on:
+  workflow_dispatch:  # Только ручной запуск
+
+permissions:
+  contents: read  # Минимально необходимые права
+
+env:
+  VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+  VCPKG_TARGET_TRIPLET: x64-windows
+  CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4"
+  BUILD_DIR: build-windows
+  VCPKG_BINARY_CACHE: ${{ github.workspace }}\vcpkg-binary-cache
+
+jobs:
+  build:
+    runs-on: windows-2022  # VS 2022 (MSVC v143) — стабильный и предсказуемый выбор
+    timeout-minutes: 240   # Сборка ffmpeg из кэша + CUDA может быть долгой
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup MSVC (Visual Studio 2022)
+        uses: ilammy/msvc-dev-cmd@v1
+        # Action автоматически находит и активирует окружение VS на раннере
+
+      - name: Setup CUDA 13.4
+        uses: mjun0812/setup-cuda@v1
+        with:
+          version: '13.4'
+          method: 'auto'
+
+      - name: Setup vcpkg binary cache directory
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path $env:VCPKG_BINARY_CACHE
+          # Явно указываем vcpkg использовать файловый кэш в этой директории
+          echo "VCPKG_BINARY_SOURCES=clear;files,$env:VCPKG_BINARY_CACHE,readwrite" >> $env:GITHUB_ENV
+
+      - name: Cache vcpkg binaries
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_BINARY_CACHE }}
+          # Ключ включает хэш файлов, определяющих зависимости, и метку раннера.
+          # Любое изменение зависимостей инвалидирует кэш.
+          key: vcpkg-${{ runner.os }}-x64-windows-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt', '**/vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-x64-windows-
+
+      - name: Bootstrap vcpkg and install dependencies
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
+          & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
+          # --only-binarycaching: запрещаем сборку из исходников, если кэш не сработал
+          & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows curl:x64-windows libjpeg-turbo:x64-windows --only-binarycaching
+
+      - name: Configure CMake
+        shell: pwsh
+        run: |
+          cmake -S . -B $env:BUILD_DIR -G "Ninja Multi-Config" `
+            -DCMAKE_CONFIGURATION_TYPES=Release `
+            -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe" `
+            -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET_TRIPLET `
+            -DCMAKE_PREFIX_PATH="$env:VCPKG_ROOT\installed\x64-windows" `
+            -DCMAKE_CUDA_ARCHITECTURES=120a `
+            -DINFERNIX_BUILD_APPS=ON `
+            -DBUILD_TESTING=ON
+
+      - name: Build (Release)
+        shell: pwsh
+        run: |
+          cmake --build $env:BUILD_DIR --config Release --parallel
+
+      - name: Run tests
+        shell: pwsh
+        run: |
+          ctest --test-dir $env:BUILD_DIR -C Release --output-on-failure
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: infernix-windows-release
+          # Охватываем оба вероятных места расположения бинарников.
+          # Если путь окажется другим, шаг упадёт с ошибкой, и его можно будет поправить.
+          path: |
+            ${{ env.BUILD_DIR }}\apps\Release\
+            ${{ env.BUILD_DIR }}\bin\Release\
+          if-no-files-found: error
