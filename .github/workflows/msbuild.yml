@@ -1,4 +1,4 @@
-name: Build Infernix (Windows, CUDA 13.4, sm_120a)
+name: Build Infernix (Windows, CUDA 13.2, sm_120a)
 
 on:
   workflow_dispatch: # Позволяет запускать сборку вручную со страницы Actions
@@ -12,10 +12,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup CUDA Toolkit 13.4
+      - name: Setup CUDA Toolkit 13.2
         uses: Jimver/cuda-toolkit@v0.2.15
         with:
-          cuda: '13.4.0' # Указываем вашу версию CUDA
+          cuda: '13.2.0' # Указываем вашу версию CUDA
           method: 'network' # Устанавливает только необходимые компоненты
 
       - name: Configure CMake
