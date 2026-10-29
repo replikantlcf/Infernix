@@ -1,13 +1,13 @@
 name: Build Windows (MSVC + CUDA)
 
 on:
-  workflow_dispatch:  # Только ручной запуск
+  workflow_dispatch:
 
 permissions:
-  contents: read  # Минимально необходимые права
+  contents: read
 
 env:
-  VCPKG_ROOT: ${{ github.workspace }}\vcpkg
+  # VCPKG_ROOT намеренно НЕ задаём здесь: его перезапишет ilammy/msvc-dev-cmd.
   VCPKG_TARGET_TRIPLET: x64-windows
   CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4"
   BUILD_DIR: build-windows
@@ -15,8 +15,8 @@ env:
 
 jobs:
   build:
-    runs-on: windows-2022  # VS 2022 (MSVC v143) — стабильный и предсказуемый выбор
-    timeout-minutes: 240   # Сборка ffmpeg из кэша + CUDA может быть долгой
+    runs-on: windows-2022
+    timeout-minutes: 240
 
     steps:
       - name: Checkout repository
@@ -24,7 +24,6 @@ jobs:
 
       - name: Setup MSVC (Visual Studio 2022)
         uses: ilammy/msvc-dev-cmd@v1
-        # Action автоматически находит и активирует окружение VS на раннере
 
       - name: Setup CUDA 13.4
         uses: mjun0812/setup-cuda@v1
@@ -36,15 +35,12 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path $env:VCPKG_BINARY_CACHE
-          # Явно указываем vcpkg использовать файловый кэш в этой директории
           echo "VCPKG_BINARY_SOURCES=clear;files,$env:VCPKG_BINARY_CACHE,readwrite" >> $env:GITHUB_ENV
 
       - name: Cache vcpkg binaries
         uses: actions/cache@v4
         with:
           path: ${{ env.VCPKG_BINARY_CACHE }}
-          # Ключ включает хэш файлов, определяющих зависимости, и метку раннера.
-          # Любое изменение зависимостей инвалидирует кэш.
           key: vcpkg-${{ runner.os }}-x64-windows-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt', '**/vcpkg-configuration.json') }}
           restore-keys: |
             vcpkg-${{ runner.os }}-x64-windows-
@@ -52,14 +48,29 @@ jobs:
       - name: Bootstrap vcpkg and install dependencies
         shell: pwsh
         run: |
+          # КРИТИЧНО: переопределяем VCPKG_ROOT, который только что перезаписал msvc-dev-cmd
+          $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
+
+          if (Test-Path $env:VCPKG_ROOT) {
+            Remove-Item -Recurse -Force $env:VCPKG_ROOT
+          }
+
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
-          # --only-binarycaching: запрещаем сборку из исходников, если кэш не сработал
-          & "$env:VCPKG_ROOT\vcpkg.exe" install ffmpeg:x64-windows curl:x64-windows libjpeg-turbo:x64-windows --only-binarycaching
+
+          # Без --only-binarycaching: первый запуск соберёт пакеты и наполнит кэш
+          & "$env:VCPKG_ROOT\vcpkg.exe" install `
+            ffmpeg:x64-windows `
+            curl:x64-windows `
+            libjpeg-turbo:x64-windows `
+            --triplet x64-windows
 
       - name: Configure CMake
         shell: pwsh
         run: |
+          # Здесь VCPKG_ROOT снова переопределяем на всякий случай
+          $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
+
           cmake -S . -B $env:BUILD_DIR -G "Ninja Multi-Config" `
             -DCMAKE_CONFIGURATION_TYPES=Release `
             -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe" `
@@ -83,8 +94,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: infernix-windows-release
-          # Охватываем оба вероятных места расположения бинарников.
-          # Если путь окажется другим, шаг упадёт с ошибкой, и его можно будет поправить.
           path: |
             ${{ env.BUILD_DIR }}\apps\Release\
             ${{ env.BUILD_DIR }}\bin\Release\
