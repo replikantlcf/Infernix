@@ -12,29 +12,32 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Шаг для гарантии наличия CMake 3.28+
+      # Активируем окружение Visual Studio (добавляет cl.exe в PATH)
+      - name: Setup MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64  # Явно указываем целевую архитектуру
+
       - name: Setup CMake
         uses: jwlawson/actions-setup-cmake@v2
         with:
-          cmake-version: '3.28.x' # Устанавливаем минимально требуемую версию
+          cmake-version: '3.28.x'
 
       - name: Setup CUDA Toolkit 13.1
         uses: mjun0812/setup-cuda@v1
         with:
-          version: '13.1.0' # Используем проверенную версию из документации
+          version: '13.1.0'
           method: 'auto'
 
       - name: Configure CMake
         run: cmake --preset release -DCMAKE_CUDA_ARCHITECTURES="120a"
 
       - name: Build with CMake
-        # Убрали --config Release, так как он может дублировать настройки пресета
         run: cmake --build build -j
 
       - name: Package Release ZIP (PowerShell)
         shell: pwsh
         run: |
-          # Сначала найдём, где лежат исполняемые файлы
           $exePath = Get-ChildItem -Path .\build -Filter "infernix-*.exe" -Recurse | Select-Object -First 1
           if (-not $exePath) {
             Write-Error "Исполняемые файлы Infernix не найдены в директории build/"
