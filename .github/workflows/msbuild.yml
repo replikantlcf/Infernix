@@ -1,0 +1,42 @@
+name: Build Infernix (Windows, CUDA 13.4, sm_120a)
+
+on:
+  workflow_dispatch: # Позволяет запускать сборку вручную со страницы Actions
+
+jobs:
+  build:
+    name: Build and Package on Windows
+    runs-on: windows-2022 # Стабильный образ с Visual Studio 2022
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup CUDA Toolkit 13.4
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '13.4.0' # Указываем вашу версию CUDA
+          method: 'network' # Устанавливает только необходимые компоненты
+
+      - name: Configure CMake
+        # Infernix использует пресет "release". Явно задаем архитектуру 120a.
+        run: cmake --preset release -DCMAKE_CUDA_ARCHITECTURES="120a"
+
+      - name: Build with CMake
+        # Собираем проект. Флаг -j использует все доступные ядра.
+        run: cmake --build build --config Release -j
+
+      - name: Package Release ZIP (PowerShell)
+        # Упаковываем содержимое папки build в ZIP-архив.
+        # Если в Infernix есть свой скрипт упаковки, замените этот шаг на его вызов.
+        shell: pwsh
+        run: |
+          # Пример: упаковываем все исполняемые файлы и библиотеки из build/Release
+          # Уточните точную папку с результатами сборки в вашем проекте.
+          Compress-Archive -Path .\build\bin\Release\* -DestinationPath .\infernix-windows-cuda-sm120a.zip -Force
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: infernix-windows-cuda-sm120a
+          path: .\infernix-windows-cuda-sm120a.zip
