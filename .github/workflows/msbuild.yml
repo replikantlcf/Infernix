@@ -1,30 +1,35 @@
-name: Build Infernix (Windows, CUDA 13.4, sm_120a)
+name: Build Infernix (Windows, CUDA 13.1, sm_120a)
 
 on:
-  workflow_dispatch: # Позволяет запускать сборку вручную со страницы Actions
+  workflow_dispatch:
 
 jobs:
   build:
     name: Build and Package on Windows
-    runs-on: windows-2022 # Стабильный образ с Visual Studio 2022
+    runs-on: windows-2022
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup CUDA Toolkit 13.4
+      # Шаг для гарантии наличия CMake 3.28+
+      - name: Setup CMake
+        uses: jwlawson/actions-setup-cmake@v2
+        with:
+          cmake-version: '3.28.x' # Устанавливаем минимально требуемую версию
+
+      - name: Setup CUDA Toolkit 13.1
         uses: mjun0812/setup-cuda@v1
         with:
-          version: '13.4.0' # Указываем точную версию CUDA
-          method: 'auto'    # 'auto' попробует network, затем local
+          version: '13.1.0' # Используем проверенную версию из документации
+          method: 'auto'
 
       - name: Configure CMake
-        # Infernix использует пресет "release". Явно задаем архитектуру 120a.
         run: cmake --preset release -DCMAKE_CUDA_ARCHITECTURES="120a"
 
       - name: Build with CMake
-        # Собираем проект. Флаг -j использует все доступные ядра.
-        run: cmake --build build --config Release -j
+        # Убрали --config Release, так как он может дублировать настройки пресета
+        run: cmake --build build -j
 
       - name: Package Release ZIP (PowerShell)
         shell: pwsh
