@@ -1,4 +1,4 @@
-name: Build Infernix (Windows, CUDA 13.2, sm_120a)
+name: Build Infernix (Windows, CUDA 13.4, sm_120a)
 
 on:
   workflow_dispatch: # Позволяет запускать сборку вручную со страницы Actions
@@ -12,11 +12,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup CUDA Toolkit 13.2
-        uses: Jimver/cuda-toolkit@v0.2.15
+      - name: Setup CUDA Toolkit 13.4
+        uses: mjun0812/setup-cuda@v1
         with:
-          cuda: '13.2.0' # Указываем вашу версию CUDA
-          method: 'network' # Устанавливает только необходимые компоненты
+          version: '13.4.0' # Указываем точную версию CUDA
+          method: 'auto'    # 'auto' попробует network, затем local
 
       - name: Configure CMake
         # Infernix использует пресет "release". Явно задаем архитектуру 120a.
@@ -27,13 +27,17 @@ jobs:
         run: cmake --build build --config Release -j
 
       - name: Package Release ZIP (PowerShell)
-        # Упаковываем содержимое папки build в ZIP-архив.
-        # Если в Infernix есть свой скрипт упаковки, замените этот шаг на его вызов.
         shell: pwsh
         run: |
-          # Пример: упаковываем все исполняемые файлы и библиотеки из build/Release
-          # Уточните точную папку с результатами сборки в вашем проекте.
-          Compress-Archive -Path .\build\bin\Release\* -DestinationPath .\infernix-windows-cuda-sm120a.zip -Force
+          # Сначала найдём, где лежат исполняемые файлы
+          $exePath = Get-ChildItem -Path .\build -Filter "infernix-*.exe" -Recurse | Select-Object -First 1
+          if (-not $exePath) {
+            Write-Error "Исполняемые файлы Infernix не найдены в директории build/"
+            exit 1
+          }
+          $sourceDir = $exePath.DirectoryName
+          Write-Host "Упаковка файлов из: $sourceDir"
+          Compress-Archive -Path "$sourceDir\*" -DestinationPath .\infernix-windows-cuda-sm120a.zip -Force
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
