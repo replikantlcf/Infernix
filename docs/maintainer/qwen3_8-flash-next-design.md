@@ -2085,8 +2085,14 @@ Prefill and forced-token calls read their rows before the launch and upload them
 with a row missing from the host cache (S4b), read them after the launch: the verify graph runs `upload_pinned_when` (Core) before `ple_embed`, which copies the
 rows from the pinned io once the pinned ready word equals the round's io `gate` word. The anchor
 column (committed tokens) and every column of an n-gram copy row are read while the drafter runs;
-the draft columns after the verify launch, while the GPU embeds and runs layer 0. A round that
-warms or captures its graph reads everything first. `ple_embed`, a plain launch at the top of
+the draft columns after the verify launch, while the GPU embeds and runs layer 0. The worker reads
+and releases them before it queues anything else (route copies, sampler, acceptance): until the
+word is published the GPU waits on that thread, and a call that waits for the device deadlocks the
+round. A kernel's first launch is one: the driver loads its code then and, with the process past
+its OS budget (`--vram-past-budget`), waits for the device to do so. Queued ahead of the release
+until 2026-10-30, a first sampler or acceptance launch stalled the round until the gate trapped
+(`kPinnedGateTimeoutNs`, 120 s) in 5 of 7 such starts. A round that warms or captures its graph
+reads everything first. `ple_embed`, a plain launch at the top of
 layer 1, is the only reader.
 
 **Planned.**
@@ -8901,7 +8907,7 @@ elastic pool does the same job with no kernel change:
 - The Program measures the host-to-device rate at startup, by copying expert records from the
   pinned banks into the miss staging slots before any call uses them: best of three, 64 records,
   a few tens of milliseconds (`core/link_probe`; `ProgramOptions::link_bytes_per_second` fixes it
-  in tests). The diagnostic line `host-to-device link: ...` reports it and the choices below.
+  in tests). The Debug diagnostic `PCIe link to the GPU: ...` reports it and the choices below.
 - It rescales the link-bound costs from the reference rate at which they were fitted (27.5 GB/s): the
   prefix cost's restore rate and the walk-span cost.
 - The decode miss split keeps misses / d of a call's misses on the link, d = max(1, floor(1.65 + C t))

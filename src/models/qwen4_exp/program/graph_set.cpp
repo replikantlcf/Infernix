@@ -75,8 +75,10 @@ void ProgramImpl::capture_graph_set() {
     if (c_.lossless || options_.causal_scoring) { return; }
     const auto began = std::chrono::steady_clock::now();
     device_.synchronize();
-    std::size_t free_before = 0, free_after = 0, total = 0;
-    CUDA_CHECK(cudaMemGetInfo(&free_before, &total));
+    // The budget source's free memory: past the OS budget (--vram-past-budget) cudaMemGetInfo stops at the budget
+    // and read 0 MiB for 116 MiB of executables.
+    const auto free_now = [&] { return static_cast<std::size_t>(vram_->query().device_free); };
+    const std::size_t free_before = free_now();
 
     const std::int32_t lanes = plan_.lanes;
     // The rounds that verify, by rows, with their widest verification (decode()): one row up to max_width_
@@ -157,14 +159,14 @@ void ProgramImpl::capture_graph_set() {
     }
     graph_set_.capturing  = false;
     graph_set_.at_startup = true;
-    CUDA_CHECK(cudaMemGetInfo(&free_after, &total));
+    const std::size_t free_after = free_now();
     graph_set_.bytes = static_cast<std::int64_t>(free_before) - static_cast<std::int64_t>(free_after);
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - began).count();
     char line[256];
     std::snprintf(line, sizeof(line),
                   "CUDA graphs: captured %u at startup in %.2f s, %.0f MiB of device memory",
                   graph_set_.captured, seconds, static_cast<double>(graph_set_.bytes) / (1 << 20));
-    diagnostic(line);
+    diagnostic(line, DiagnosticLevel::Debug);
 }
 
 } // namespace detail

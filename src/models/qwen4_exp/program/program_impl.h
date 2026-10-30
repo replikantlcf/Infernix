@@ -1358,7 +1358,7 @@ public:
                         std::to_string(runtime::expert_offload::kPlainDivisorContext) + " context tokens, " +
                         std::to_string(plain_divisor(runtime::expert_offload::kPlainDivisorContext)) + " from there";
             }
-            diagnostic(line, DiagnosticLevel::Info);
+            diagnostic(line, DiagnosticLevel::Debug);
         }
         // The team's size and CPUs (INFERNIX_TMP_CPU_PLACEMENT; today unpinned). The engine thread is not
         // isolated: Dense8 +0.15 %, IQ3_S -0.14 % (2026-10-28).
@@ -1369,7 +1369,15 @@ public:
         const std::uint32_t cpu_jobs    = options_.cpu_expert_jobs;
         const std::uint32_t assist_jobs = options_.cpu_assist_jobs;
         if (cpu_workers > 0 && cpu_jobs > 0) {
-            if (!placement_.text.empty()) { diagnostic(placement_.text, DiagnosticLevel::Info); }
+            // An A/B arm of the placement shows it without debug logging.
+            if (!placement_.text.empty()) {
+                const auto& switches = temporary_switches::offload();
+                diagnostic(placement_.text,
+                           switches.placement != temporary_switches::OffloadSwitches::Placement::kDefault ||
+                                   switches.workers > 0
+                               ? DiagnosticLevel::Info
+                               : DiagnosticLevel::Debug);
+            }
             // The team's rate sets the decode miss split (design §19.3.12); the SSD tier's is measured
             // once its RAM is filled (below).
             if (!tier_) { measure_cpu_rate(record_stride); }
@@ -2615,13 +2623,13 @@ public:
             publish_pinned_word(gate_ready(), word);
         }
         run_decode(batch, round_positions[0], graph, screened);
-        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch) - io_layout_.ngram};
+        if (gated) {
+            read_behind_gate(lanes_[lanes[0]], word, io_prefix(batch) - io_layout_.ngram,
+                             [&] { stage_decode_rows(round_lanes, round_positions); });
+        }
+        residency_->enqueue_route_download(device_.stream, batch);
         for (std::int32_t b = 0; b < batch; ++b) { ++lanes_[lanes[b]].state_tokens; }
-        sample(round_lanes, round_positions, [&] {
-            if (!gated) { return; }
-            read_behind_gate(lanes_[lanes[0]], word, [&] { stage_decode_rows(round_lanes, round_positions); });
-            release_gate.owner = nullptr;
-        });
+        sample(round_lanes, round_positions);
         deferred_ = {.columns = batch, .tokens = 1, .live = false, .pending = true};
         runtime::ExecutionTiming timing;
         timing.submit_host_ns = elapsed_ns(start);
@@ -3232,7 +3240,20 @@ private:
         if (shadows > 0) {
             std::snprintf(shadow_text, sizeof(shadow_text), " and copies of the %u least-used in VRAM", shadows);
         }
+        const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
         char line[640];
+        if (on_ssd == 0) {
+            std::snprintf(line, sizeof(line),
+                          "experts in RAM: %u (read in %.1f s); with the expert cache they hold all %u experts, so none "
+                          "is read from the model files",
+                          in_ram + unpinned, seconds, keys);
+        } else {
+            std::snprintf(line, sizeof(line),
+                          "experts in RAM: %u (read in %.1f s); %u of the %u experts are read from the model files when "
+                          "used",
+                          in_ram + unpinned, seconds, on_ssd, keys);
+        }
+        diagnostic(line);
         std::snprintf(line, sizeof(line),
                       "SSD expert tier: %u RAM slots (%.1f GiB) hold %u experts (%s)%s%s%s, read in %.1f s; %u of %u "
                       "experts are read from the artifact when used",
@@ -3241,8 +3262,8 @@ private:
                       : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
                                                               : "spread across the layers",
                       released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
-                      shadow_text, split, seconds, keys - in_ram - released - unpinned, keys);
-        diagnostic(line);
+                      shadow_text, split, seconds, on_ssd, keys);
+        diagnostic(line, DiagnosticLevel::Debug);
     }
 
     // The frames' warm start from the saved state or the calibrated order; returns how many experts
@@ -3623,8 +3644,8 @@ private:
         return static_cast<std::uint32_t>(&lane - lanes_.data());
     }
 
-    // Publishes a gated round's word if the round ends before its rows are read: the rows are
-    // zeroed (the round's results are discarded with the error), so the enqueued gate passes.
+    // Publishes a gated round's word if reading its rows fails: the rows are zeroed (the round's
+    // results are discarded with the error), so the enqueued gate passes and the stream drains.
     struct GateRelease {
         ProgramImpl* owner = nullptr;
         std::uint32_t word = 0;
@@ -3675,7 +3696,7 @@ private:
             if (rate >= kSlowReadsPerSecond) {
                 std::snprintf(text, sizeof text, "n-gram volume read probe: %.0f reads/s (%.0f us per 4 KiB read, %zu reads)",
                               rate, 1e6 / rate, probe.reads);
-                diagnostic(text);
+                diagnostic(text, DiagnosticLevel::Debug);
             } else {
                 std::snprintf(text, sizeof text,
                               "n-gram volume reads are slow: %.0f reads/s (%zu reads; 17,000 and more is healthy), so a long "
@@ -3982,13 +4003,20 @@ private:
         return word;
     }
 
-    // After a gated launch: submits the queued work, reads the rows (`read`), releases the gate and
-    // counts the reads toward `lane` (the round's first row).
-    void read_behind_gate(Lane& lane, std::uint32_t word, const std::function<void()>& read) {
+    // Right after a gated launch: submits it, reads the rows (`read`, into the io's first `bytes` of
+    // n-gram rows), releases the gate and counts the reads toward `lane` (the round's first row).
+    // Until the word is published the GPU waits on this thread, so nothing may be queued before it:
+    // a call that waits for the device deadlocks the round. A kernel's first launch is one, as the
+    // driver loads its code then and, with the process past its OS budget, waits for the device
+    // to do so (the sampler and acceptance kernels queued here before 2026-10-30: the gate trapped
+    // after kPinnedGateTimeoutNs in 5 of 7 --vram-past-budget starts).
+    void read_behind_gate(Lane& lane, std::uint32_t word, std::size_t bytes, const std::function<void()>& read) {
+        GateRelease release_gate{this, word, bytes};
         device_.flush();
         const NgramVolume::Counters before = volume_.counters();
         read();
         const NgramVolume::Counters& after = volume_.counters();
+        release_gate.owner = nullptr;
         publish_pinned_word(gate_ready(), word);
         ++lane.gate.rounds;
         lane.gate.reads += after.reads - before.reads;
@@ -4228,7 +4256,7 @@ private:
         if (chunk == chunk_) { return; }
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) + ": the expert cache can lend " +
                        std::to_string(lendable >> 20) + " MiB now (the output is the same on the exact route)",
-                   DiagnosticLevel::Info);
+                   DiagnosticLevel::Debug);
         chunk_     = chunk;
         wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
     }
@@ -4368,7 +4396,6 @@ private:
         } else {
             replay(graph, [&] { decode_graph_body(batch, screened); });
         }
-        residency_->enqueue_route_download(s, batch);
     }
 
     // screened-lm-head: whether a round of these rows and `columns` logit columns takes the screened head.
@@ -4745,9 +4772,7 @@ private:
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this round
         residency_->before_round(s, /*landing=*/true, /*walking=*/walk_.active);
         replay(graph, [&] { verify_graph_body(batch, W, screened); });
-        // From here an enqueued gate waits for `word`: an error before it is published still
-        // publishes it (over zeroed rows), so the stream drains and the error keeps its class.
-        GateRelease release_gate{gated ? this : nullptr, word, io_prefix(batch * W) - io_layout_.ngram};
+        if (gated) { read_behind_gate(lanes_[lanes[0]], word, io_prefix(batch * W) - io_layout_.ngram, read_rows); }
         residency_->enqueue_route_download(s, batch * W);
 
         // Acceptance on the device, from the logits plain decode samples (FP32, or BF16: design 16.5); the
@@ -4839,10 +4864,6 @@ private:
         }
         CUDA_CHECK(cudaMemcpyAsync(spec_host(spec_layout_.licensed), licensed.data,
                                    4ULL * (spec_layout_.commit - spec_layout_.licensed), cudaMemcpyDeviceToHost, s));
-        if (gated) {
-            read_behind_gate(lanes_[lanes[0]], word, read_rows);
-            release_gate.owner = nullptr;
-        }
         device_.synchronize();
         check_expert_error();
 
@@ -5070,7 +5091,7 @@ private:
         diagnostic("MTP drafter pool: " + std::to_string(slots) + " of its " + std::to_string(E) +
                        " routed experts in a VRAM pool (" + std::to_string(plan_.drafter_pool >> 20) +
                        " MiB), the rest pinned in RAM; draft steps route among the pooled experts",
-                   DiagnosticLevel::Info);
+                   DiagnosticLevel::Debug);
     }
     // The pool's share of draft picks it held and its swaps since startup, at most every 10 seconds.
     void report_drafter_pool() {
@@ -5083,7 +5104,7 @@ private:
         std::snprintf(line, sizeof(line), "MTP drafter pool: %.1f %% of %llu draft picks pooled, %llu swaps",
                       100.0 * static_cast<double>(s.picks - s.misses) / static_cast<double>(s.picks),
                       static_cast<unsigned long long>(s.picks), static_cast<unsigned long long>(s.swaps));
-        diagnostic(line, DiagnosticLevel::Info);
+        diagnostic(line, DiagnosticLevel::Debug);
     }
 
     std::int32_t* mtp_host(std::size_t offset) const { return static_cast<std::int32_t*>(mtp_host_.data()) + offset; }
@@ -5529,9 +5550,7 @@ private:
     }
 
     // Samples the next token of each row from read_logits (row b = column b) into pending_tokens_.
-    // `before_wait` runs on the host after the sampling work is queued, before its wait.
-    void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions,
-                const std::function<void()>& before_wait = {}) {
+    void sample(std::span<const std::uint32_t> lanes, std::span<const std::int32_t> positions) {
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         // The sampler reads the FP32 logits, or BF16 (design §16.5); a constraint masks them in place (the prompt
@@ -5556,7 +5575,6 @@ private:
                         ops::kSamplePurposeDecode, *work_, s);
         }
         CUDA_CHECK(cudaMemcpyAsync(host_sampled_.data(), sampled_.p, 4ULL * batch, cudaMemcpyDeviceToHost, s));
-        if (before_wait) { before_wait(); }
         device_.synchronize();
         check_expert_error();
         const auto* tokens = static_cast<const std::int32_t*>(host_sampled_.data());
@@ -5714,15 +5732,12 @@ private:
         if (prefix_) { prefix_->index().set_cost(options_.prefix_cost); }
         char text[256];
         std::snprintf(text, sizeof(text),
-                      "host-to-device link: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to "
+                      "PCIe link to the GPU: %.1f GB/s%s; decode promotes every %llu tokens; prefill CPU split up to "
                       "%d columns",
-                      rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (set)" : " measured",
+                      rate / 1e9, options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured",
                       static_cast<unsigned long long>(promotion_interval()),
                       options_.prefill_cpu_split ? split_columns() : 0);
         diagnostic(text, DiagnosticLevel::Debug);
-        std::snprintf(text, sizeof(text), "PCIe link to the GPU: %.1f GB/s%s", rate / 1e9,
-                      options_.link_bytes_per_second > 0.0 ? " (fixed)" : " measured");
-        diagnostic(text);
     }
 
     // ---- the CPU expert team's rates (design §19.3.12) ----
@@ -5889,7 +5904,7 @@ private:
         pool_now_   = residency_->pool_bytes();
         diagnostic("KV pool grew to " + std::to_string(target) + " pages (" +
                    std::to_string(kv_vmm_->mapped_bytes() >> 20) + " MiB); expert cache " + std::to_string(frames) +
-                   " -> " + std::to_string(residency_->frames()) + " frames");
+                   " -> " + std::to_string(residency_->frames()) + " frames", DiagnosticLevel::Debug);
         return true;
     }
 
@@ -5933,7 +5948,7 @@ private:
         frames_now_ = residency_->frames();
         pool_now_   = residency_->pool_bytes();
         diagnostic("KV pool shrank to " + std::to_string(target) + " pages; expert cache " + std::to_string(frames) +
-                   " -> " + std::to_string(residency_->frames()) + " frames");
+                   " -> " + std::to_string(residency_->frames()) + " frames", DiagnosticLevel::Debug);
     }
     DeviceBuffer io_device_, logits32_, logits16_, sampled_, sample_pos_, configs_, token_counts_;
 

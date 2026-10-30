@@ -424,6 +424,8 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
     VRAM, so the expert cache gets about 710 fewer frames.
   - Greedy output is the same as without it when one request runs at a time. For several lanes,
     see `--max-concurrency` below.
+- `--spec auto --draft-tokens auto` chooses between the two: DFlash2 when `--draft-model` names its
+  drafter, else MTP (startup reports which).
 - `--ngram-draft-tokens 7` verifies copy proposals. It works alone or beside MTP; a longer copy
   proposal replaces a round's MTP drafts. On code-editing prompts it accepts most drafts; on prose
   it finds none and costs nothing. In the agentic replay (`bench/agentic_ab`, greedy, seed 42, two
@@ -519,14 +521,15 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   27.1 GiB) would leave too little for the other programs, and recipes A and B (64.5 + 48.8 GiB) do
   not fit.
 
-The startup line names the choice: `n-gram table: in RAM (N MiB, locked for the CPU)`, or `n-gram table:
+The startup `RAM plan:` line names the choice (`n-gram table N GiB` in RAM, or `n-gram table read from its
+volume`); `--log-level debug` adds `n-gram table: in RAM (N MiB, locked for the CPU)`, or `n-gram table:
 read from its volume`, which `auto` follows with `(the RAM ledger keeps the experts resident first)`.
 If Windows will not lock the table, a warning says so: it still serves rows, but under memory
 pressure part of it may be paged out.
 The rows are the same bytes either way, so outputs do not change.
 
 A table read from its volume is timed at startup with a few hundred random 4 KiB reads, one at a
-time (about a second at most), and logged as `n-gram volume read probe: N reads/s`. Below 15,000
+time (about a second at most), and logged at debug as `n-gram volume read probe: N reads/s`. Below 15,000
 reads per second (healthy drives measured 17,000 to 80,000 here and 230,000 on a Samsung 9100 PRO;
 DRAM-less SSDs 300 to 5,700 in other users' logs) the line becomes a warning: a long prompt can spend
 minutes reading n-gram rows, and `--ngram-residency ram` (when the experts fit beside the table) or a
@@ -820,6 +823,10 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
   - If Windows lowers the budget later, the cache shrinks by the same amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
+  - Measured on an RTX 5090 (2026-10-30, greedy 500-token decodes, three runs a side,
+    `--vram-headroom-mib 128`): FP4-Local 9,023 frames against 8,780, single-lane decode 142.7
+    against 139.4 tok/s and two-lane 204.4 against 197.4 tok/s; Ornith-1.5-122B 4,924 experts
+    against 4,797, 73.4 against 71.4 and 84.4 against 82.0 tok/s.
 - With more than one CUDA device visible (Windows), free VRAM is read as the Windows budget less this
   process's usage: there CUDA's own free figure stopped following allocations, so the cache would size
   to almost nothing. `CUDA_VISIBLE_DEVICES` naming one device restores the single-device reading.

@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <exception>
 #include <filesystem>
@@ -282,6 +283,11 @@ int main(int argc, char** argv) {
         engine_options.speculative                       = options.speculative;
         engine_options.use_cuda_graph                    = options.use_cuda_graph;
         engine_options.route_trace_path                  = options.route_trace_path;
+        // Every Engine diagnostic, Debug included: the link probe and the CPU expert team's rates
+        // that tools/bench/abba.py checks are detail the products log only at debug.
+        engine_options.diagnostic_observer.callback = [](const infernix::Diagnostic& diagnostic) {
+            std::fprintf(stderr, "[engine] %s\n", diagnostic.message.c_str());
+        };
 
         infernix::bench::BenchEnvironment env;
         env.artifact_path            = options.artifact_path;
@@ -354,7 +360,10 @@ int main(int argc, char** argv) {
             env.machine.h2d_bytes_per_second = measure_h2d(options.device);
         }
         env.prefill_chunk = engine.options().prefill_chunk; // the model's default when unset
-        // auto resolves to a ceiling, or on Qwen3.5/3.6 without adaptive-mtp to a fixed length.
+        // --spec auto resolves to the artifact's drafter (or none); --draft-tokens auto to a ceiling,
+        // or on Qwen3.5/3.6 without adaptive-mtp to a fixed length.
+        env.speculative.backend           = engine.options().speculative.backend;
+        env.speculative.backend_auto      = engine.options().speculative.backend_auto;
         env.speculative.draft_tokens      = engine.options().speculative.draft_tokens;
         env.speculative.draft_tokens_auto = engine.options().speculative.draft_tokens_auto;
         fill_cuda_environment(env, options.device);
