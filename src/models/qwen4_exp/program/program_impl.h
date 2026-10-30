@@ -421,6 +421,7 @@ struct MtpCumulative {
 struct ResumeStateImpl {
     std::uint32_t target = 0;   // the paused frontier: the positions the lane's state held
     bool generated       = false; // paused after its first token (the ledger runs past the prompt)
+    std::uint32_t counted = 0;  // a prompt pause: the prompt frontier the Engine had counted as prefilled
     std::vector<std::int32_t> history; // prompt, then committed output
     std::uint32_t prompt_tokens = 0;
     // Prefix-cache lookup keys over the ledger (the prompt's, extended over published output
@@ -458,6 +459,9 @@ public:
         // replay reaches without sampling (design §19.3.13).
         std::uint32_t prefill_end = 0;
         bool replay               = false;
+        // The prompt frontier reported to the Engine as prefilled. A lane resumed inside its prompt
+        // from a state below it walks those tokens again without reporting them twice.
+        std::uint32_t counted_tokens = 0;
         std::uint32_t extent      = 0; // the positions the request may ever hold (prompt + output)
         // The prompt's planned prefill calls (design §19.3.1): exclusive ends, the last prompt_tokens.
         std::vector<std::uint32_t> calls;
@@ -948,13 +952,14 @@ public:
         tally += bytes;
     }
 
-    // The startup failure for device allocations the driver placed in system memory.
-    static std::string spill_message(std::uint64_t bytes) {
+    // The startup failure for device allocations the driver placed in system memory, with the
+    // readings that found it (SpillGuard::readings).
+    static std::string spill_message(std::uint64_t bytes, const std::string& readings) {
         return std::to_string(bytes >> 20) +
                " MiB of Infernix's VRAM allocations were placed in shared system memory by the driver's sysmem "
                "fallback: free VRAM, or lower --max-context, --max-concurrency or --prefill-chunk. Setting the NVIDIA "
                "Control Panel 'CUDA - Sysmem Fallback Policy' to 'Prefer No Sysmem Fallback' for this program makes "
-               "this fail at allocation instead.";
+               "this fail at allocation instead. Readings: " + readings + ".";
     }
 
     ProgramImpl(const execution::Parameters& parameters, DeviceContext& device, ProgramOptions options)
@@ -1144,7 +1149,8 @@ public:
         // The expert cache's tables and route log; its frames come last (below).
         // A GGUF import's experts take Basalt's adaptive tier (IQ3_S decode 1.070-1.076x the LFRU in four A/Bs,
         // 2026-10-27/28, hit rate 84.6 against 85.1 % with half the promotions); NVFP4 and block-FP8 banks keep the LFRU
-        // (Dense8 0.971x adaptive).
+        // (Dense8 0.971x adaptive; FP4-Local with the candidate floor 1, 2026-10-30, 3 interleaved runs: 16K decode
+        // 0.979x and struct 0.993x, slower in every pair, hit rate 88.9 against 89.4 %).
         const QType experts_format = parameters_.layers.front().moe.bank->planes.gate_up_format;
         const auto policy = experts_format != QType::NVFP4_MUL && experts_format != QType::FP8_E4M3FN_B128
                                 ? ExpertResidency::VramPolicy::Adaptive
@@ -1156,7 +1162,7 @@ public:
             throw std::logic_error("Qwen4Exp: the Program's device allocations differ from its device plan");
         }
         if (const std::uint64_t spilled = guard.end(allocated); spilled != 0) {
-            throw std::runtime_error(spill_message(spilled));
+            throw std::runtime_error(spill_message(spilled, guard.readings(allocated)));
         }
         // The staging, shared-expert and split streams at the device's greatest priority (the decode graphs keep
         // it as node priorities, core/decode_graph.cpp), so their short kernels take an SM as the routed experts'
@@ -1634,10 +1640,12 @@ public:
             throw std::logic_error("Qwen4Exp: the binding destination is not free");
         }
         // A request paused after its first token binds its ledger; one paused inside its prompt binds
-        // the prompt again, from the deepest cached state (its pause published the frontier).
+        // the prompt again, from the deepest cached state (its pause published the frontier, but the
+        // publication may have been refused or evicted since, so the state can lie below it).
         if (resume != nullptr && resume->impl_->generated) { return bind_replay(*base.impl_, index, *resume->impl_); }
         Lane& lane = lanes_[index];
         kv_busy();
+        refit_chunk_for_binding(q.vision ? q.vision->window.lease_bytes : 0U);
         const BasePlanImpl& b = *base.impl_;
         const auto& data      = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         std::optional<PrefixSelection> selection;
@@ -1785,11 +1793,15 @@ public:
                                                source.reused_tokens ? source.reuse_path : PrefixReusePath::Root};
         CUDA_CHECK(cudaMemsetAsync(static_cast<std::byte*>(gate_stats_.p) + kGateStatsBytes * index, 0, kGateStatsBytes,
                                    device_.stream));
-        lane.prefill_end = lane.prompt_tokens;
-        lane.replay      = false;
-        lane.extent      = b.positions;
-        // A request paused inside its prompt keeps what it had measured and decided.
-        if (resume != nullptr) { restore_request(lane, *resume->impl_); }
+        lane.prefill_end    = lane.prompt_tokens;
+        lane.replay         = false;
+        lane.extent         = b.positions;
+        lane.counted_tokens = lane.state_tokens;
+        // A request paused inside its prompt keeps what it had measured, decided and reported.
+        if (resume != nullptr) {
+            restore_request(lane, *resume->impl_);
+            lane.counted_tokens = resume->impl_->counted;
+        }
         transaction_lane_ = index;
         replaying_        = false;
         ++revision_;
@@ -1851,6 +1863,7 @@ public:
     BindingReservation bind_replay(const BasePlanImpl& b, std::uint32_t index, ResumeStateImpl& r) {
         Lane& lane = lanes_[index];
         kv_busy();
+        refit_chunk_for_binding(0U);
         const auto& prompt = qwen3_5::PreparedPromptAccess::view(*b.prompt);
         const qwen3_5::PreparedPromptData ledger = ledger_prompt(prompt, r);
         const std::uint32_t pages = binding_pages(b, r.target + 1U);
@@ -2034,6 +2047,7 @@ public:
         saved->target        = lane.replay ? lane.prefill_end : lane.state_tokens;
         saved->history       = lane.history;
         saved->prompt_tokens = lane.prompt_tokens;
+        saved->counted       = lane.counted_tokens;
         save_request(lane, *saved);
         // A replaying lane short of its frontier publishes what it has rebuilt so far.
         if (!walking) { prefix_finish(lane, index); }
@@ -2365,6 +2379,10 @@ public:
             lane.prefill_ns += out.timing.submit_host_ns;
             return out;
         }
+        // The Engine counts the prompt past the frontier it was told of: a lane resumed below it
+        // reports nothing until its walk passes it again.
+        out.processed_prompt_tokens = lane.state_tokens > lane.counted_tokens ? lane.state_tokens - lane.counted_tokens : 0U;
+        lane.counted_tokens         = std::max(lane.counted_tokens, lane.state_tokens);
         if (last) {
             const std::uint32_t lanes[] = {index};
             const std::int32_t positions[] = {begin + width - 1};
@@ -4184,6 +4202,37 @@ private:
                    DiagnosticLevel::Warning);
     }
 
+    // The expert cache can shrink after load (elastic KV growth, the VRAM monitor, a vision loan) until
+    // it no longer lends a whole chunk's wide workspace, and then every later long prompt fails; or grow
+    // back, so the loaded chunk fits again (review TK-02). A binding made while no lane prefills and
+    // nothing is lent for prompts re-fits the chunk to what the cache can lend now, less `reserved`
+    // bytes the binding itself will lend (its vision window), within the chunk fitted at load; with
+    // nothing lendable prompts run at the static arena's width. Only where the call grid may move: the
+    // reproducible route's taps, coalescing and resumes sit on the chunk grid (resume_grid), so its
+    // chunk stays the loaded one.
+    void refit_chunk_for_binding(std::uint64_t reserved) {
+        if (loaded_chunk_ == 0) { loaded_chunk_ = chunk_; }
+        if (!options_.free_cache_resume || !options_.expert_cache || loaded_chunk_ <= plan_.static_columns) { return; }
+        if (stream_lease_.valid() || work_lease_.valid() || wide_fallback_.p != nullptr || wide_active_) { return; }
+        for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
+            if (lanes_[i].phase == Phase::Prefill) { return; }
+        }
+        const std::uint64_t pitch    = residency_->lend_pitch();
+        const std::uint64_t lendable = residency_->lendable_bytes();
+        const auto fits              = [&](std::int32_t chunk) {
+            return workspace_bytes(c_, options_, plan_, plan_.lanes, chunk) + pitch + reserved <= lendable;
+        };
+        std::int32_t chunk = loaded_chunk_;
+        while (chunk > plan_.static_columns && !fits(chunk)) { chunk /= 2; }
+        chunk = std::max(chunk, plan_.static_columns);
+        if (chunk == chunk_) { return; }
+        diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) + ": the expert cache can lend " +
+                       std::to_string(lendable >> 20) + " MiB now (the output is the same on the exact route)",
+                   DiagnosticLevel::Info);
+        chunk_     = chunk;
+        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+    }
+
     void enter_wide(std::int32_t columns) {
         DeviceSpan span{};
         // This call's need, and a lease for the prefilling lanes' remaining calls (one too small for this
@@ -5539,6 +5588,7 @@ private:
     Clock::time_point vram_epoch_{};
 
     std::int32_t vocab_ = 0, token_domain_ = 0, chunk_ = 0, columns_ = 0;
+    std::int32_t loaded_chunk_ = 0; // the chunk fitted at load, the most a runtime re-fit may restore
     std::int32_t width_ = 0, span_ = 0, di_ = 0, r_ = 0;
     std::uint32_t kv_pages_ = 0;
 

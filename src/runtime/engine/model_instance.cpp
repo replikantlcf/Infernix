@@ -487,6 +487,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
     // Offloaded experts (Qwen3.5-122B-A10B design §11.2): the RAM ledger places the routed banks in
     // pinned RAM or in the SSD tier before anything is pinned or read.
     std::optional<ExpertRamPlan> expert_ram;
+    bool exclusive_experts = false;
     if (options.expert_tail_skip != 0) {
         // normalize_engine_options admitted it for an artifact with offloaded experts.
         const auto& moe = std::get<models::qwen3_5::MoeConfig>(plan.config().text.ffn);
@@ -509,7 +510,13 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         // archive, and with vision the decoded-media cache and its live items.
         demand.pageable = options.grammar_cache_bytes + options.speculative.ngram_archive_bytes +
                           (options.enable_vision ? options.media_cache_bytes + options.media_live_bytes : 0U);
-        expert_ram = plan_expert_ram(options, demand, host_memory_snapshot());
+        // --expert-ram-layout exclusive (design §11.3; the 122B's default is full): RAM keeps only the experts the
+        // frames do not, and shadows for what VRAM gives back without a promotion. The Program's engine sizes it once
+        // its frames are known (ExpertOffload::plan_exclusive), so the banks load as the SSD tier's with the ledger's
+        // share as its budget; an explicit --expert-ram-mib keeps the ledger's placement.
+        exclusive_experts = options.expert_ram_layout.value_or(ExpertRamLayout::Full) == ExpertRamLayout::Exclusive &&
+                            !options.expert_ram_bytes;
+        expert_ram        = plan_expert_ram(options, demand, host_memory_snapshot(), exclusive_experts);
         if (expert_ram->tier) {
             auto streamed           = models::load_options(options, models::Architecture::Qwen3_5);
             streamed.stream_experts = true;
@@ -551,6 +558,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
             o.expert_ram_bytes      = expert_ram->expert_ram_bytes;
             o.expert_unpinned_bytes = expert_ram->expert_unpinned_bytes;
             o.later_pinned_bytes    = expert_ram->later_pinned_bytes;
+            o.ram_exclusive         = exclusive_experts;
             o.expert_stripe         = options.expert_stripe_path;
         } else if (!options.expert_stripe_path.empty()) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
@@ -597,7 +605,8 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device) 
         if (const std::uint64_t spilled = spill->end(dense_bytes); spilled != 0) {
             throw std::runtime_error(std::to_string(spilled >> 20) +
                                      " MiB of the dense weights were placed in shared system memory by the driver's "
-                                     "sysmem fallback: free VRAM and start again");
+                                     "sysmem fallback: free VRAM and start again (" + spill->readings(dense_bytes) +
+                                     ")");
         }
     }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);

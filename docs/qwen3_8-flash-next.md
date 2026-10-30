@@ -180,8 +180,13 @@ is 56.8 GB, of which the routed experts are 46.9 GiB.
   1.002-1.005x, the first block's cold cache). Its candidate floor is 1 where Basalt's is 2, so any
   expert a round routes may be promoted: decode +1.5 % after a 16K prompt, +5.4 % on the community
   struct fixture and +2.7-4.2 % on its conv and prose fixtures (2026-10-29), for about 70 % more
-  promotions. The NVFP4 conversions keep LFRU, where the adaptive policy decoded 0.970x (Dense8, MTP).
-  Same bits either way.
+  promotions. A round's swaps pair candidates with residents across all the layers of a frame pool,
+  not only within each layer, so a layer that routes more takes frames from one that routes fewer:
+  struct +1.1 % (494 -> 499 tok/s, hits 96.6 -> 96.9 %, about 7 % fewer CPU-served misses), 16K
+  unchanged (2026-10-30). The NVFP4 conversions keep LFRU, where the adaptive policy decoded 0.970x
+  (Dense8, MTP) and, with the floor of 1, 0.979x after a 16K prompt and 0.993x on the struct fixture
+  (NVIDIA FP4-Local, DFlash2 auto, exclusive layout, 3 interleaved runs, every pair slower, hits 88.9
+  against 89.4 %; 2026-10-30). Same bits either way.
 
 **Speed and quality** (RTX 5090 on PCIe 5.0 x8, i9-13900K, INT8 KV, one request, against recipe B
 in the same session on 2026-10-16; the n-gram table in RAM, `auto`; one run of `-r 3`, or `-r 1`
@@ -454,6 +459,10 @@ infernix-serve <artifact>.infernix --ngram-volume <volume>.ngram --kv-dtype int8
   workers measured slower: the CPU and the PCIe stage share the host's memory bandwidth.
   The GSQ-RCO IQ3_S artifact's CPU route decodes its GGUF blocks before multiplying, so it is
   compute-bound and starts 16 workers instead (decode 98.4 tok/s with six, 103.7 with 16).
+  Either way the team leaves four of the process's logical CPUs to the engine, the CUDA runtime
+  and the OS: a 16-vCPU host runs 12 workers. With 16 workers on 16 logical CPUs the spinning
+  threads starved each other and the IQ3_S decoded 61-87 tok/s, against 189-217 with 8 (the
+  startup log notes a reduced team).
 - On Windows the engine opts its process out of power throttling. Windows otherwise slows a
   process it considers in the background (a server whose console is not in front, a job without a
   window) and moves its threads to efficiency cores; a hidden run decoded 37.6 tok/s at 8K throttled
@@ -781,7 +790,9 @@ headroom 256 (auto); expert frames 9300 (23.95 GiB); 380 free after startup
 - **No silent spill.** On Windows the driver can place an allocation that does not fit in shared
   system memory without an error, which slows everything down. The engine checks that every startup
   allocation lowered free VRAM by its size: dense weights or fixed buffers that spilled stop
-  startup; expert frames that spilled are given back once and the cache starts smaller. Setting the
+  startup; expert frames that spilled are given back once and the cache starts smaller. The error
+  prints the readings it compared: free VRAM before and after the allocations and, on Windows and
+  under WSL2, this process's shared system memory use, which a real spill raises. Setting the
   NVIDIA Control Panel's *CUDA - Sysmem Fallback Policy* to *Prefer No Sysmem Fallback* for the
   Infernix executables makes such an allocation fail instead (optional).
 - **At runtime** the cache follows free VRAM. When another program (a browser, a game, the

@@ -213,7 +213,9 @@ The endpoint supports:
   the field is treated as omitted, so the other spelling or `--default-max-tokens` applies;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
 - the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
-- up to four non-empty stop strings, applied to both reasoning and answer output;
+- up to four non-empty stop strings, applied to the answer only: not to reasoning, and not inside a
+  tool call the model opened with its `<tool_call>` token (between it and `</tool_call>`), whose
+  arguments are the tool's data (as on the Responses and Messages endpoints);
 - `n:1`, text-only `modalities`, and `response_format: {"type":"text"}`;
 - non-streaming responses and server-sent event streams;
 - `stream_options.include_usage`, optionally shaped by `--usage-chunk-choice` for strict client
@@ -225,7 +227,9 @@ The endpoint supports:
   callers that dispatch by name keep working;
 - `tool_choice` `auto`/`none`/`required`, named function or `custom` selection, `allowed_tools`, and
   `parallel_tool_calls`; assistant tool-call history, tool-result messages, and legacy
-  function-call history;
+  function-call history (a run of tool results whose `tool_call_id`s name exactly the preceding
+  assistant turn's calls is rendered in call order, as on the Responses and Messages endpoints; any
+  other run keeps the order received);
 - the top-level `reasoning_effort` field, where the `default` and `auto` aliases resolve to the
   server-configured level;
 - `enable_thinking` and `preserve_thinking`, either at top level or in
@@ -338,7 +342,9 @@ The request `model` must equal the public model ID: the artifact `metadata.name`
 `gpt-4o-mini`), on Chat Completions, Responses, Responses input tokens and decide; the response and
 the request log report the public model ID, as OpenAI reports the snapshot an alias resolved to.
 `/v1/models` and `/v1/models/{id}` still list and retrieve only the public model ID.
-Reasoning is returned separately as `reasoning_content`; answer text remains in `content`.
+Reasoning is returned separately, under both `reasoning_content` (SGLang and earlier vLLM) and
+`reasoning` (current vLLM) with the same text, in messages and stream deltas alike; answer text
+remains in `content`.
 
 For non-strict tools, the JSON types a top-level tool-parameter schema admits guide conversion of
 Qwen's untyped parameter text. They are read from its `type`, the values of its `enum` or `const`, a
@@ -348,7 +354,9 @@ local `$ref` (such as Pydantic's `{"$ref": "#/$defs/Status"}`), `allOf` (each br
 call. String-admitting values remain strings, including the empty string, except that the text `null`
 is the null value where `null` is admitted too. An empty block for a
 declared non-string parameter is omitted. Admitted JSON values retain their JSON type;
-case-insensitive boolean text is normalized to `true` or `false`. A nonempty schema mismatch remains
+case-insensitive boolean text is normalized to `true` or `false`. An array or object whose strings
+hold raw control characters (a real line break or tab inside a multi-line edit, which strict JSON
+refuses) is read with them escaped, so it keeps its JSON type. A nonempty schema mismatch remains
 a structured call: valid JSON retains its represented type and other text becomes a JSON string so
 the tool consumer can report the validation error and continue the agent loop. Schemas that name no
 type this way (no type keyword, an invalid type name, a remote, missing or circular reference)
@@ -950,9 +958,12 @@ sends its result back as a `custom_tool_call_output` Item.
 
 Functions and custom tools, top-level or in a namespace, accept `defer_loading:true` together with a
 `tool_search` tool; `tool_search_call`, `tool_search_output` and `additional_tools` Items are accepted
-as input. See [Deferred tools and tool search](#deferred-tools-and-tool-search). Other hosted tools,
-remote MCP tools, output schemas, and caller restrictions that exclude direct invocation remain
-unsupported.
+as input. See [Deferred tools and tool search](#deferred-tools-and-tool-search). A hosted
+`web_search` declaration (`{"type":"web_search", ...}`, which Codex sends on every turn unless its
+configuration sets `web_search = "disabled"`) is accepted and echoed in the response's `tools`, but
+the model is not offered it, since Infernix runs no search; a `tool_choice` naming it is a 400.
+Other hosted tools, remote MCP tools, output schemas, and caller restrictions that exclude direct
+invocation remain unsupported.
 
 ### Response object and usage
 
@@ -1553,7 +1564,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--device N` | CUDA device index | `0` |
 | `--ram-free-mib N` | physical Host RAM in MiB that everything Infernix keeps in RAM (weights, offloaded experts, the n-gram table, the prefix cache's Host tier) leaves free for other programs; startup refuses a lock that would take it, and Qwen3.8-Flash-Next plans every allocation against it in its RAM ledger | `8192` |
 | `--expert-ram-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB on Flash-Next, 60.75 GiB on the 122B) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
-| `--expert-ram-layout exclusive\|full` | Qwen3.8-Flash-Next, when VRAM cannot hold every routed expert: `exclusive` keeps in RAM only the experts VRAM does not hold (plus copies of the ones a prefill borrows), `full` keeps a RAM copy of every expert whenever RAM allows (4-6 GiB more for the Dense8 and IQ3_S experts at 16K on an RTX 5090). Same output bits and decode speed either way. Ignored with `--expert-ram-mib N` | `exclusive` |
+| `--expert-ram-layout exclusive\|full` | Qwen3.8-Flash-Next and the Qwen3.5-122B-A10B, when VRAM cannot hold every routed expert: `exclusive` keeps in RAM only the experts VRAM does not hold (plus copies of the ones a prefill borrows and the KV may take), `full` keeps a RAM copy of every expert whenever RAM allows. Same output bits either way. Flash-Next: `full` takes 4-6 GiB more RAM for the Dense8 and IQ3_S experts at 16K on an RTX 5090, at the same decode speed. 122B: `exclusive` holds 56.9 instead of 60.8 GiB of experts and decodes about 1 % slower after a 32K prompt (equal at short ones), prefill 0.4 % slower. Ignored with `--expert-ram-mib N` | `exclusive` (Flash-Next), `full` (122B) |
 | `--ngram-residency auto\|ram\|volume` | Qwen3.8-Flash-Next: where the PLE n-gram table lives. `ram` reads the whole table into Host RAM at startup, locked for the CPU but not page-locked for the GPU (27.1 GiB for a GGUF import's IQ4_NL table, 48.8 GiB for the FP8 table) and never reads the volume again; `volume` reads rows on demand through a 2^20-row cache; `auto` takes RAM only when the RAM ledger still keeps every expert in RAM beside it ([details](qwen3_8-flash-next.md#n-gram-table-in-ram)) | `auto` |
 | `--expert-pin-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): at most N MiB of the experts' RAM page-locked for the GPU; the rest stays in RAM unpinned and the CPU serves it ([Page-locking limit](qwen3_8-flash-next.md#page-locking-limit)) | `auto` (what Windows lets the GPU page-lock) |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |

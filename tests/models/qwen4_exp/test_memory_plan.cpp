@@ -5,7 +5,10 @@
 // stacking the headroom on it, the graph reserve, fixed allocations that do not fit, the frame
 // clamp, and the spill test with noisy free-memory readings. RT9, the runtime law of the elastic
 // pool: shrink on low free memory or an exceeded budget, hysteresis, the grow delay and per-boundary
-// cap, display hot-plug, and the reserve spent by Infernix's own later allocations.
+// cap, display hot-plug, and the reserve spent by Infernix's own later allocations. The exclusive RAM
+// layout's tier for one record size (the Qwen3.5-122B-A10B's, plan_exclusive_tier): the shadows cover the
+// loan, a sixteenth of the frames and the KV growth, the seeds never take the frames they cover, and RAM holds
+// every other expert.
 
 #include "runtime/expert_offload/memory_plan.h"
 
@@ -321,18 +324,27 @@ void test_sizing() {
             "the sizing line names the headroom's source and the display: " + line);
 }
 
+// Free device memory per query, and optionally this process's shared system memory use (a source
+// with an adapter: Windows, WSL2) in step with it.
 class ScriptedSource final : public VramBudgetSource {
 public:
-    explicit ScriptedSource(std::deque<std::uint64_t> readings) : readings_(std::move(readings)) {}
+    explicit ScriptedSource(std::deque<std::uint64_t> readings, std::deque<std::uint64_t> nonlocal = {})
+        : readings_(std::move(readings)), nonlocal_(std::move(nonlocal)) {}
     VramSnapshot query() override {
         VramSnapshot s;
         s.device_free = readings_.front();
         if (readings_.size() > 1) { readings_.pop_front(); }
+        if (!nonlocal_.empty()) {
+            s.shared_system  = 76 * kGiB;
+            s.nonlocal_usage = nonlocal_.front();
+            if (nonlocal_.size() > 1) { nonlocal_.pop_front(); }
+        }
         return s;
     }
 
 private:
     std::deque<std::uint64_t> readings_;
+    std::deque<std::uint64_t> nonlocal_;
 };
 
 void test_spill() {
@@ -352,6 +364,18 @@ void test_spill() {
     SpillGuard confirm(spilled);
     confirm.begin();
     require(confirm.end(n) == n - 100 * kMiB, "a confirmed shortfall is reported");
+    require(confirm.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations",
+            "the failure names the free-memory readings it compared");
+    // Where the source reads this process's shared system memory use (Windows, WSL2), the readings
+    // carry it: a real sysmem fallback raises it, a misread free-memory figure does not.
+    ScriptedSource shared({10 * kGiB, 10 * kGiB - 100 * kMiB, 10 * kGiB - 100 * kMiB},
+                          {200 * kMiB, 1124 * kMiB, 1124 * kMiB});
+    SpillGuard fallback(shared);
+    fallback.begin();
+    require(fallback.end(n) == n - 100 * kMiB, "a shortfall with shared-memory readings is reported");
+    require(fallback.readings(n) == "free device memory 10240 MiB before and 10140 MiB after 1024 MiB of allocations; "
+                                    "this process's shared system memory use 200 MiB before and 1124 MiB after",
+            "the failure names the shared system memory readings where the source has them");
 
     // The test seam replaces the sources opened afterwards.
     infernix::testing::set_vram_budget_source([] { return card(5 * kGiB, DisplayState::Headless); });
@@ -451,6 +475,24 @@ void test_control_law() {
     require(control.decide(trimmed, pool, frames, 200.0, false).shrink, "an exceeded budget shrinks the pool");
 }
 
+void test_exclusive_tier() {
+    // The 122B: 48 x 256 experts, 4,993 frames, a ring of 2 x 256 + 1 and a 304-frame wide workspace, 57 frames of
+    // KV growth.
+    constexpr std::uint64_t keys = 48 * 256, frames = 4'993, loan = 2 * 256 + 1 + 304, kv = 57;
+    const ExclusiveTier half = plan_exclusive_tier(keys, frames, loan, kv, 0.5);
+    require(half.shadows == loan + frames / 16 + kv, "the shadows cover the loan, a sixteenth of the frames and the KV");
+    require(half.seeded == frames / 2, "half the frames seeded");
+    require(half.slots == keys - half.seeded + half.shadows, "RAM holds every key but the seeds, and the shadows");
+    const ExclusiveTier rest = plan_exclusive_tier(keys, frames, loan, kv, 1.0);
+    require(rest.seeded == frames - rest.shadows, "the seeds never take the frames the shadows cover");
+    require(rest.slots == keys - rest.seeded + rest.shadows && rest.slots < half.slots, "more seeds, fewer slots");
+    require(plan_exclusive_tier(keys, 1'000, 900, 100, 0.5).slots == 0, "shadows taking every frame: no exclusive tier");
+    require(plan_exclusive_tier(keys, 0, loan, kv, 0.5).slots == 0, "no frames: no exclusive tier");
+    // More frames than keys need: the slots never exceed the keys.
+    const ExclusiveTier ample = plan_exclusive_tier(1'000, 100'000, 10, 0, 0.0);
+    require(ample.seeded == 0 && ample.slots == 1'000, "no seeds: RAM holds every key, never more");
+}
+
 } // namespace
 
 int main() {
@@ -468,6 +510,7 @@ int main() {
         test_sizing();
         test_spill();
         test_control_law();
+        test_exclusive_tier();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;
