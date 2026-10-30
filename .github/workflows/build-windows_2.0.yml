@@ -23,11 +23,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Setup MSVC (Visual Studio 2026)
-        uses: ilammy/msvc-dev-cmd@v1
-        with:
-          # Явно запрашиваем VS 2026 (версия 18.0), чтобы не зависеть от дефолта образа
-          vsversion: '18.0'
+      - name: Setup MSVC (Visual Studio 2026 via vcvars64)
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
+          if errorlevel 1 exit /b 1
 
       - name: Setup CUDA 13.4
         uses: mjun0812/setup-cuda@v1
