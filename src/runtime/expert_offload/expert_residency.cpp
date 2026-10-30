@@ -348,10 +348,19 @@ void ExpertResidency::demote_or_drop(Pool& pool, const std::vector<Command>& com
         pool.controller->hold(frame); // T4: the frame stays readable in the table until the record lands
         demoting_[key] = 1;
         ++stats_.demotions;
-        if (const std::uint32_t id = tier_->refill(key, slot); id != HostExpertTier::kNoRefill) {
-            demotions_.push_back({key, frame, slot, nullptr, id});
-            continue;
+        // A refill that would land later than kRefillBudget behind those in flight (at the rate the startup fill read
+        // the artifact) copies the frame instead: a slow drive's refills held their frames and the promotions waited.
+        // With the artifact read at 800 MB/s (INFERNIX_TMP_SSD_MBPS), refills only: Dense8 16K MTP 3 236.8 tok/s, IQ3_S
+        // struct 451.3; with the budget 243.4 and 463.1, the fast drive's speed (2026-10-29, one run each). Since shadows
+        // leave RAM most-used first (HostTier::victim_value), demotions are few enough that the copies cost nothing
+        // measurable on the fast drive either (IQ3_S struct 465.8 with 996 of 2,268 copied, 462.3 with none).
+        if (tier_->refill_within(kRefillBudget)) {
+            if (const std::uint32_t id = tier_->refill(key, slot); id != HostExpertTier::kNoRefill) {
+                demotions_.push_back({key, frame, slot, nullptr, id});
+                continue;
+            }
         }
+        ++stats_.d2h_demotions;
         CUDA_CHECK(cudaMemcpyAsync(const_cast<std::uint8_t*>(tier_->slot_bytes(slot)),
                                    pool.base() + static_cast<std::size_t>(frame) * pool.pitch, pool.pitch,
                                    cudaMemcpyDeviceToHost, d2h_stream_));
@@ -807,6 +816,9 @@ void ExpertResidency::adaptive_round(const std::int32_t* routes, std::size_t use
     const auto by_count_desc = [&a](std::uint32_t x, std::uint32_t y) {
         return a.count[x] != a.count[y] ? a.count[x] > a.count[y] : x < y;
     };
+    // A victim's cost is its count. Adding a demotion's cost for the exclusive layout's victims without a RAM copy
+    // made the shadows (the experts just promoted) the victims: IQ3_S struct 28,470 promotions a request against
+    // 9,621, decode 270 against 361 tok/s (2026-10-28).
     const auto by_count_asc = [&a](std::uint32_t x, std::uint32_t y) {
         return a.count[x] != a.count[y] ? a.count[x] < a.count[y] : x < y;
     };
@@ -821,13 +833,15 @@ void ExpertResidency::adaptive_round(const std::int32_t* routes, std::size_t use
         const expert_cache::LfruPolicy& policy = pools_[pool_of_layer_[layer]].controller->policy();
         const std::uint32_t first = layer * experts_;
         for (std::uint32_t k = first; k < first + experts_; ++k) {
-            if (policy.resident(k)) {
-                a.residents.push_back(k);
-            } else if (a.count[k] >= a.floor && (tier_ == nullptr || admissible_(k))) { // with the tier: a host copy
+            if (a.count[k] >= a.floor && !policy.resident(k) && (tier_ == nullptr || admissible_(k))) { // tier: a host copy
                 a.candidates.push_back(k);
             }
         }
         if (a.candidates.empty()) { continue; }
+        // The residents only of a layer with candidates (listing every layer's cost 115 us a round, IQ3_S struct).
+        for (std::uint32_t k = first; k < first + experts_; ++k) {
+            if (policy.resident(k)) { a.residents.push_back(k); }
+        }
         candidates += a.candidates.size();
         std::sort(a.candidates.begin(), a.candidates.end(), by_count_desc);
         a.ranked.insert(a.ranked.end(), a.candidates.begin(), a.candidates.end());

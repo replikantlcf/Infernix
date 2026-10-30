@@ -174,11 +174,14 @@ is 56.8 GB, of which the routed experts are 46.9 GiB.
 - **Expert cache.** The records come in five sizes (mean 1.95 MiB, largest 2.54 MiB). The cache
   keeps one frame pool per size, each with its own frames and LFRU counters, so it holds 13,008
   experts where frames of the largest size held about 10,200. A GGUF import's cache uses the adaptive
-  policy (Basalt's: per-window decayed route counts, decay 0.85, a candidate floor of 2 and a 1.5x
-  margin, at most 96 swaps a round, planned off the decode path) instead of LFRU: DFlash2 decode after
-  an 8K prompt 1.070-1.076x at the median in three A/Bs (2026-10-27, ABBA 3 pairs each; pooled
-  1.051-1.052x, worst pair 1.002-1.005x, the first block's cold cache). The NVFP4 conversions keep LFRU,
-  where the adaptive policy decoded 0.970x (Dense8, MTP). Same bits either way.
+  policy (Basalt's: per-window decayed route counts, decay 0.85, a 1.5x margin, at most 96 swaps a
+  round, planned off the decode path) instead of LFRU: DFlash2 decode after an 8K prompt 1.070-1.076x
+  at the median in three A/Bs (2026-10-27, ABBA 3 pairs each; pooled 1.051-1.052x, worst pair
+  1.002-1.005x, the first block's cold cache). Its candidate floor is 1 where Basalt's is 2, so any
+  expert a round routes may be promoted: decode +1.5 % after a 16K prompt, +5.4 % on the community
+  struct fixture and +2.7-4.2 % on its conv and prose fixtures (2026-10-29), for about 70 % more
+  promotions. The NVFP4 conversions keep LFRU, where the adaptive policy decoded 0.970x (Dense8, MTP).
+  Same bits either way.
 
 **Speed and quality** (RTX 5090 on PCIe 5.0 x8, i9-13900K, INT8 KV, one request, against recipe B
 in the same session on 2026-10-16; the n-gram table in RAM, `auto`; one run of `-r 3`, or `-r 1`
@@ -681,17 +684,19 @@ of life, and fails only when one has been silent for 10 s ("the CPU expert servi
 answering" or "the SSD expert tier's read agent stopped answering"); until 2026-10-17 that was 1 s,
 which RAM pressure alone could exceed (FP8 runs at the default headroom failed 8 times in 34).
 
-**Expert RAM layout (`--expert-ram-layout exclusive|full`, default `full`).** When VRAM cannot hold
-every routed expert, `full` keeps a RAM copy of every expert whenever RAM allows it (the banks above),
-and `exclusive` keeps in RAM only the experts VRAM does not hold, plus copies of the ones a prefill
-borrows from VRAM and the KV cache's growth may take. The tier then serves the RAM experts. The exclusive
-layout needs about 15 GiB less RAM on the NVFP4 artifacts (49.1 against 64.4 GiB on Dense8) and 7 GiB
-less on the IQ3_S import (41.1 against 48.0 GiB); a VRAM eviction of an expert without a RAM copy
-reads its record back from the artifact into RAM (it stays readable in VRAM until the read lands).
-Outputs are the same bits in both layouts. Decode costs more in `exclusive` (2026-10-28, ABBA 3 pairs, decode
-after an 8K prompt): Dense8 MTP 0.983-0.987x of `full`, IQ3_S DFlash2 0.88x, so `full` stays the default
-and `exclusive` suits a machine whose RAM is otherwise short. `--expert-ram-mib N` overrides either with an
-explicit cap.
+**Expert RAM layout (`--expert-ram-layout exclusive|full`, default `exclusive`).** When VRAM cannot hold
+every routed expert, `exclusive` keeps in RAM only the experts VRAM does not hold, plus copies of the ones a
+prefill borrows from VRAM and the KV cache's growth may take, and the tier serves them; `full` keeps a RAM
+copy of every expert whenever RAM allows it (the banks above). On an RTX 5090 at 16K the experts' RAM plan
+is 42.4 against 48.0 GiB on the IQ3_S import and 60.3 against 64.4 GiB on Dense8 (resident 47.4 against
+51.9 and 67.2 against 70.3 GiB). A VRAM eviction of an expert without a RAM copy reads its record back
+from the artifact into RAM (it stays readable in VRAM until the read lands), or copies it over the link
+when that read would land more than 4 ms late (a slower drive); RAM drops the copies of the most-used
+VRAM experts first, so such evictions are few. Outputs are the same bits in both layouts. Speed
+(2026-10-29): decode within run-to-run spread of `full` on IQ3_S and Dense8 (16K steady state, the struct
+fixture, also with the artifact read at 800 MB/s), the community suite 0.993x; a 16K prefill equal on
+IQ3_S (6,832-6,833 against 6,787-6,809 tok/s) and on Dense8.
+`--expert-ram-mib N` overrides either with an explicit cap.
 
 **A second drive (`--expert-stripe FILE`).** One drive bounds the tier's reads, most of all in
 prefill, which reads every expert missing from RAM (about 38 GiB for a 4K-token prompt with the FP8

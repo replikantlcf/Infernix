@@ -7425,14 +7425,14 @@ measured results are under "Status" at the end of this section.
     borrow 2,901-3,098 of IQ3_S's 12,576 frames at 8K (a quarter), and a loan's victims, the
     lowest-score experts, were released at once with no copy back (R10.1), so the ones without a RAM copy
     left both tiers and came back by synchronous reads when next routed. The joint plan was removed.
-- **Exclusive layout (2026-10-27, `--expert-ram-layout exclusive`; the default stays `full`).** Same bits.
+- **Exclusive layout (2026-10-27, `--expert-ram-layout exclusive`; the default since 2026-10-29, below).** Same bits.
   - A loan or a shrink (`ExpertResidency::lend`, the KV pool taking frames) evicts the lowest-score
     experts that keep a RAM copy first, then the others (`LfruPolicy::set_capacity` first_choice; the old
     choice, the lowest scores whatever their copies, decoded IQ3_S 0.978x, worst pair 0.764x). This applies to
     every SSD-tier configuration.
-  - RAM slots (each the largest record) hold every expert VRAM does not plus 5/16 of the frames and
-    the KV growth's frames as shadows; the warm start seeds the rest of the frames
-    (`ProgramOptions::expert_seed_share`), the fill phase's landings keep their RAM copies, and the warm
+  - RAM slots (pooled by record size, below) hold every expert VRAM does not plus 5/16 of the frames and
+    the KV growth's frames as shadows; the warm start seeds the full layout's share of the frames, never the
+    reserve (`ProgramOptions::expert_seed_share`; 2026-10-29, below), the fill phase's landings keep their RAM copies, and the warm
     start's spare slots hold shadows of the least-used seeds. A prefill's loan then takes shadowed
     experts, and give-back leaves the returned frames free for decode's landings (the SSD tier's
     refill of the victims left Dense8 none: 0 landings a request against ~1,000 in the full layout).
@@ -7466,6 +7466,67 @@ measured results are under "Status" at the end of this section.
       `.local/slot-2026-10-27/rejected/`.
     - Remaining cost on IQ3_S: the CPU team runs 10 % slower a job in tier mode with identical record bytes
       (Dense8 4 %), unattributed; candidates §26.3 EX-01.
+  - Built 2026-10-28 (owner's goal: exclusive at no speed cost, then the default as in Basalt; plan
+    `.local/redesign-2026-10-28/REDESIGN-PROPOSAL.md` §6.4a). Measured on IQ3_S, 16,413-token prompt then 1,024 tokens
+    greedy, DFlash2 auto, 3 unprofiled runs each, against the same day's main (b36f35ae); ids equal in every run
+    (identical speculative statistics in all 18 runs):
+    - **Slots per record size** (`HostTier` classes, `HostExpertTier` regions): a GGUF import's 7 record sizes
+      (1.49-2.54 MiB, mean 1.96) each get a pool of slots of their own size, every layer the same share; the ring,
+      prefetch and bounce slots (any record) keep the largest size, and a landing admitted into a smaller class is
+      copied there at the boundary (a class of the largest size swaps as before; one-size banks are unchanged). The
+      RAM plan prices the experts' slots at the mean record and budgets the prefill stream's 1,280 lent slots, which
+      before evicted that many RAM-only experts a span (2,563 stream reads from the SSD a 16K request). Stream loans
+      are shared by class (each layer's reads fit its class's slots, `stream_layer_cap`).
+    - **A shadow floor** (the frames the warm start leaves unseeded, shared by class): shadows up to it are not RAM's
+      first victims and a stream loan takes free slots and spare shadows only; a demotion takes a free class slot when
+      its class's list (a few slots per record size) is empty.
+    - Exclusive with the n-gram table on the volume: decode 225.2-226.3 -> 231.6-234.7 tok/s, prefill 5,652-5,722 ->
+      6,354-6,406; with the table in RAM 226.7-227.7 -> 233.2-236.1 and 6,018-6,098 -> 6,398-6,432; the full layout
+      249.1-254.5 (before 252.7-254.1), 6,786. Resident RAM 46.1 -> 39.5 GiB (table on the volume), 73.2 -> 66.0 GiB
+      (table in RAM); the full layout 51.9. Exclusive is still 0.92x of full on decode and 0.94x on prefill; on
+      `basalt_parity.py --suite community` (DFlash2, one run) 302.9-306.4 against the full layout's 346.1 (struct 363
+      against 437).
+    - Remaining cost, from the counters: decode churn (struct: 9,621 promotions and 6,212 demotions, each a refill read
+      of ~2 MiB holding its frame until it lands; the full layout discards its victims), and loans early in a session
+      (the warm start leaves RAM full of RAM-only experts, so only ~1,100 shadows fit where a 16K prefill's loan
+      evicts ~1,000 experts: 208 a request still left without a copy and were read back).
+  - 2026-10-29 (with the tensor-core expert kernels, main 0689e1bb, then): **the warm start seeds half the frames**,
+    as the full layout does, instead of all but the loan reserve (68 % on IQ3_S). The free frames take the fill
+    phase's landings: a 16K request landed 4,281 misses against 2,878 and CPU-served 12,407 against 13,990, the full
+    layout's counts (4,255 and 12,445); RAM unchanged (47.4 GiB resident against the full layout's 51.9). IQ3_S, 2
+    runs each: 16K decode 258.2 / 258.8 -> 264.2 / 264.6 tok/s (full 266.5 / 266.4), struct 455.0 / 455.5 ->
+    457.7 / 457.4 (full 463.1 / 462.9); with this session's later route changes exclusive is 0.993x of full at 16K
+    (266.2 / 266.1 against 267.7 / 268.4) and 0.987x on struct. Prefill stays 0.96x (6,521 against 6,801 at 16K).
+    Dense8 (seeds 4,554 of 9,109 frames, 6,217 before) against main 0689e1bb: struct exclusive 307.7 / 309.2 ->
+    327.0 / 326.9 (full 354.3 / 354.5: still 0.92x, ~24,000 demotions a request, each a refill read of the artifact);
+    16K MTP 3, 2 runs, 241.0 / 241.1 -> 242.7 / 242.6 (full 242.7 / 244.3). The prefill streams the same 34.2 GiB
+    through the same lent frames in both layouts; full merges 277 adjacent records into fewer copies, exclusive copies
+    each from its slot (cause of its 4 % unconfirmed).
+  - 2026-10-29: **shadows leave RAM most-used first** (`HostTier::victim_value`; a use re-ranks the shadow's heap entry,
+    since the heap's lazy re-rank only catches entries that fell). A shadow saves a demotion only when VRAM evicts its
+    expert, and VRAM evicts the least-used first, so dropping the least-used experts' shadows (the residents' order)
+    left nearly every VRAM victim without a copy. Demotions a request: Dense8 struct 24,318 -> 2,057, Dense8 16K 2,179
+    -> 903, IQ3_S struct 4,354 -> 2,268 (demand SSD reads 78 -> 20). One run each: Dense8 struct exclusive 327.2 ->
+    345.8 tok/s (full 346.0 in the same run, 355.1 in another), Dense8 16K MTP 3 243.5 (full 244.2), IQ3_S 16K 265.1
+    (full 267.5), IQ3_S struct 462.3.
+  - **A slower SSD** (`INFERNIX_TMP_SSD_MBPS`: the artifact read queue holds each read until a device of that rate
+    would have delivered it): demotions are refill reads of the artifact, so before the shadow order, at 800 MB/s,
+    exclusive fell to IQ3_S struct 409.0 (0.876x), Dense8 16K 220.3 (0.902x), Dense8 struct 318.9 (0.898x); after
+    it, 453.1, 236.8 and 346.1 (0.97x, 0.97x, 1.00x).
+  - **A demotion copies its frame over the link when its refill would land late** (`ExpertResidency::kRefillBudget`,
+    4 ms behind the refills in flight at the startup fill's measured read rate, `HostExpertTier::refill_within`), as
+    Basalt demotes every victim. The earlier D2H demotions (0.958x on Dense8, x_ab11) queued thousands of copies ahead
+    of the promotions on this GPU's one copy engine; with shadows leaving most-used first the copies are few. At 800
+    MB/s: Dense8 16K 236.8 -> 243.4 tok/s (723 of 903 demotions copied), IQ3_S struct 451.3 -> 463.1 (1,650 of
+    2,268), the fast drive's speed; on the fast drive (copies only past the budget) Dense8 16K 243.3, IQ3_S struct
+    465.8 (one run each, 2026-10-29).
+  - **Prefill: a complete stream layer runs one pass in tier mode** while the tier lost no expert since the span began
+    (`ForwardBatch::stream_whole`; a call then has no fetch channel). Every layer call of the exclusive layout's walk
+    ran 13 staging passes (`ggml_gate_up_decode` 624 launches against 48 in a 16K prefill); IQ3_S 16K prefill 6,500
+    -> 6,724 tok/s (full 6,805), Dense8 7,039 (full 6,993). The remaining 1.2 % on IQ3_S: the warm start leaves 17
+    experts SSD-only (a few record-size pools short while others hold shadows), and with the shadows below their floor
+    no pool lends the stream a slot, so 15 calls of the first prefill fetch them in 13 passes (~30 ms once a session).
+    The stream's SSD read cap is now per layer by its pool (`stream_layer_cap(layer)`), not the least over pools.
 - **Storage** (§4.4): `artifact::Residency::Streamed` and a long-lived `StreamSource` (per-part
   direct, deny-write handles); `ExpertStore` (Model data) holds each record's ≤ 2 aligned file
   segments (two records straddle part files: L22 E305, L45 E103). Core `DirectReadQueue` (IOCP on
@@ -7485,7 +7546,11 @@ measured results are under "Status" at the end of this section.
   2 s `cpu_wait` trap becomes the same wait, and both channel sequences become wrap-safe. Exposed
   cost per SSD read ≈ 0.6-0.7 ms (estimated).
 - **RAM policy** (§4.7): decayed LFU, score `Σ w · 2^−(t − t_use)/h`, kept as the time-invariant key
-  `v = log2 s + t/h` (O(1) per use) with lazy min-heaps for victims. Clock: +1 per decode token
+  `v = Σ w · 2^((t_use − base)/h)` (one multiply-add per use; a rebase divides every v by the same power of
+  two once t is 256 half-lives past the base) with indexed min-heaps for victims (each eligible slot once;
+  a resident's entry re-ranked lazily, a shadow's at each use; 2026-10-29: the `log2` key cost two
+  transcendentals a use, and re-ranks that pushed copies grew the heaps by ~2,000 entries a decode round).
+  Clock: +1 per decode token
   (verification: + accepted tokens, live columns only); a prefill chunk of T tokens advances
   min(T, 16) with weight Δ/T per use. Default h = 64 until RM0f; LRU or CLOCK replaces it only with
   ≥ 5 % fewer SSD reads (Q13). Demand landings are admitted if they outrank the RAM victim, prefetches
@@ -10562,14 +10627,32 @@ bytes and frame pitch, or `FP8_E4M3FN_B128`); the NVFP4 family is unchanged and 
 dispatches per format (`cuda/ggml_expert.cuh`, `cuda/fp8_expert.cuh`, `cpu/ggml_expert.cpp`,
 `cpu/fp8_expert.cpp`).
 
-- **GPU narrow (≤ 8 columns).** dp4a kernels decode each slice's codes once for every column; IQ4
-  values by two `__byte_perm` lookups; grid signs and Q2_0/Q6_K offsets in native arithmetic (IQ3_S,
-  IQ3_XXS and IQ2_S grid bytes are never zero, so m = (s4 · 0x00204081) & 0x01010101 and
-  (v ^ m · 0xFF) + m negate without borrows: five instructions where `__vcmpne4`/`__vsub4` compiled
-  to about ten per word); 2-byte-aligned GGUF words through N + 1 aligned 4-byte loads and funnel
-  shifts (`ld_words_a2`: op at one column −10 % to +5 %, tg512 ~+1 %). The FP8 kernels decode a
-  word's three base-64 digits from a 256-entry shared table and byte permutes (~11 instructions per
-  code word instead of ~60), once per slice for all of a pass's columns.
+- **GPU narrow (≤ 8 columns), int8 tensor cores since 2026-10-29** (`ops/ggml/ggml_narrow_mma.cuh`,
+  `cuda/ggml_expert.cuh`). A warp owns 8 weight rows (gate/up: 4 intermediates' gate rows then their up
+  rows; down: 8 output rows) and streams them through a private `cp.async` ring of one-block stages
+  (gate/up, 3 deep) or holds the whole 640-element down row (copied before the PDL wait). Per
+  `mma.m16n8k32.s8`, thread (g, t) decodes chunk t of its row for both slots: slot g holds slice 2p and
+  slot g + 8 slice 2p + 1 of the same row, with B columns n = 2 l + s (limb plane l of slice 2p + s), so
+  thread t < 3 receives limb plane t of both slices (IQ2_S, whose sub-scale covers 16 elements, puts the
+  two halves of one slice in the two slots); each thread sums sub · C per block and adds one int128 term
+  per block, and the three limb planes combine once per output. Down rows accumulate in int64 units of
+  the row's smallest scale shift (one IMAD.WIDE a block; int128 when a row's span exceeds 20). The x of a
+  job of ≤ 2 columns is copied to shared memory; row pieces are an odd number of 16-byte chunks (an even
+  count put the warp's 8 rows in one bank); codebooks live in shared memory. The job's last gate/up CTA
+  (a per-job count in the workspace, cleared by the x encoder) encodes its h once; the down CTAs copy
+  it to shared memory. The dp4a kernels before this issued 9.5 thread instructions per weight at one
+  column (24 dp4a of 229 a lane-slice, the rest decode and per-slice int128 terms, plus a 364-instruction
+  per-pass shuffle reduction) at 1.15 IPC with long-scoreboard stalls on their own weight loads.
+  Measured (op bench, cold L2, all 7 format pairs bit-identical; RTX 5090; bench wall per call, ~40 µs of
+  it host gaps): T = 4 −11 % to +1 % (IQ4_XS +1 %), T = 8 −13 % to −2.5 %, T = 1 +5 % to +18 % (IQ4_XS
+  37.4 → 44.1 µs; IQ3_S kernel time 33.3 against 33.0 µs); in the model (IQ3_S, full layout) struct decode
+  437.2 → 462.9 tok/s (+5.9 %), 16K steady state 252.4 → 261.1 (+3.5 %), prefill flat. Rejected:
+  x fragments a stage ahead in registers (156 registers), int64 base accumulation for gate/up (its
+  scale-word loads stalled; six K-loop copies), a persistent gate/up tile stream with bulk copies of
+  whole 4-row runs (slots held shared memory while computing: −6 %), persistent down tiles with h
+  through L1 (−20 % on the down pass), 4-warp gate/up CTAs for 1-2 column calls (no gain). The FP8
+  kernels (dp4a) decode a word's three base-64 digits from a 256-entry shared table and byte permutes
+  (~11 instructions per code word instead of ~60), once per slice for all of a pass's columns.
 - **GPU wide (prefill).** Exact int8 tensor-core tiles, 64 × 64, decode-then-MMA: sixteen warps of
   16 × 16 outputs within 128 registers (eight warps of 32 × 16 needed 253 for one CTA per SM); codes
   and sub-scales in A-fragment order; `ldmatrix.x4` limb fragments; int64 accumulators relative to a
@@ -11380,6 +11463,25 @@ run); Dense8 MTP decode, bits 7 0.997x (worse in 5 of 5). No bit is a consistent
 switch are removed. The chain's PDL boundaries were not its cost (the trivial dependents above), and the fused
 HC + router + top-k megakernel already lost on 2026-10-15 (above), so no further form is pending.
 
+**2026-10-29: inside the route kernel (built, exact).** `clock64` stamps in `route_dispatch_plan_kernel` (IQ3_S,
+DFlash2 auto, struct fixture, 40,000 calls, after the tensor-core expert kernels): of ~23,700 cycles, the routing took
+10,200 (its ten selections' 16-step compare chains 7,400), the dispatch 2,200, the CPU plan's classification,
+decision and job list 5,900, the compacted x publication 4,300 and the fence and sequence 2,300. Three changes:
+- `route_column` takes each lane's arg-max as a depth-4 tree over its 16 candidates' keys (NaN and absent experts
+  key 0; ties to the lower index, so the lower id) and each lane computes its own softmax term once, summed in
+  selection order as before: the selections 7,400 -> 3,500 cycles, the same ids and weights (the tie-heavy route
+  oracle, `offloaded_moe_layer`).
+- The warps that route no column publish every x column to the CPU channel at its own index right after the
+  programmatic wait (a 32-column call: every thread, after the routing), and the plan names columns by index: the
+  publication 4,300 -> 400 cycles, the request out ~2.5 µs sooner. Unlike step 1(b)'s helper CTAs (a cluster and
+  its barrier), the copy uses the one CTA's idle warps. Kernel total 23,700 -> 17,300 cycles.
+- `moe_experts_prepare`: a call with an activation encoding (GGUF banks, 8-bit NVFP4 calls, the 122B ring) runs it
+  on the shared-expert stream from the MoE input beside the router and the route; the passes wait on its event. A
+  call without one forks nothing: the empty fork and join alone cost Dense8 MTP decode 1.4 % (243.9 -> 240.3).
+Measured against main `0689e1bb` built the same session (3 runs each, 16K steady state): IQ3_S full layout
+264.1 -> 267.7 tok/s (+1.4 %; 265.5 without the forked encode), Dense8 MTP 3 242.9 -> 243.9 (+0.4 %); 2 runs:
+IQ3_S struct full 463.4 / 461.8 -> 468.6 / 468.1, Dense8 struct full 352.1 / 353.6 -> 354.3 / 354.5. Ids equal.
+
 **Split staging is the default** (the 2026-10-27 window's ABBA, three blocks each): a forked call stages its
 misses' gate/up bytes, then their down rows, computing the gate/up pass on the split stream beside the second
 copy; Dense8 MTP decode +6.7 / +1.3 / +10.3 %, Ornith two-request MTP +1.6 / +8.0 / +4.6 %, IQ3_S DFlash2
@@ -11565,6 +11667,85 @@ and sampled state of lanes that never ran. This capture launches nothing, so it 
 (each prompt alone, then two together) and no graph captured after startup on either route, plain, MTP and DFlash2.
 A/B (pending): a fresh process per run, the first requests' TTFT and round times, startup time and idle VRAM, and
 reproducible ids on IQ3_S, Dense8 MTP and Dense8 DFlash2 auto.
+
+### 19.3.38 The verification GDN middle in one kernel (2026-10-29; exact, same bits; default)
+
+A verification round's GDN layer ran four kernels between its projections:
+1. `causal_conv1d_silu_from_states_split` into q, k, v;
+2. `gdn_gating(_direct)` into g, beta;
+3. `gated_delta_net_replay_record`;
+4. the gated norm.
+
+The first two were short (1.1 and 4.2 µs of a ~13 µs middle, the recurrence 10.4) and already overlapped by PDL.
+`gated_delta_net_replay_record_conv` evaluates the convolution and the gates inside the record kernel:
+- *Before the PDL wait:* each CTA loads its state tile, the convolution weights and the history of its channels.
+- *After it:* the CTA computes into shared memory its Q/K head's 256 channels, its state tile's 16 value channels and
+  its head's gates over the row's columns, with `causal_conv1d_from_states_kernel`'s and `gdn_gate_values`' arithmetic.
+- *Then* the recurrence runs from shared memory as the record kernel's does.
+- q, k, v, g and beta are never materialized.
+
+Domain: gdn_gating's 16/48 heads, 2-16 columns, 1-8 rows, dense rows. Wider verifications keep the composed
+kernels.
+
+**Test.** `infernix_gated_delta_net_replay_record_conv_test`: output and the three records bit-equal to the composed
+kernels at every width 2-16, rows 1-8, FP32 and FP16 states, both gate forms. Run eagerly and as a captured
+programmatic dependent of the kernel that writes its input, which is poisoned before the replay.
+
+**A/B** (RTX 5090, exclusive layout, `phase1b/ab2.ps1`, two interleaved runs each, one build with a temporary switch).
+
+| Workload | Session 1: fused vs composed (tok/s) | Change | Session 2: fused vs composed (tok/s) | Change |
+|---|---|---|---|---|
+| IQ3_S 16K | 269.1 / 268.7 vs 269.2 / 267.7 | +0.2 % | 268.5 / 269.3 vs 268.9 / 267.3 | +0.3 % |
+| IQ3_S struct | 491.5 / 491.3 vs 488.0 / 487.2 | +0.7 % | 487.8 / 487.3 vs 485.8 / 484.8 | +0.5 % |
+
+- Acceptance per position is identical in every pair.
+- Dense8 with automatic draft lengths is too noisy to read: 138.8-160.6 within an arm.
+- Dense8 with 3 drafts is bimodal at 16K whatever the arm (about 231 or 243 tok/s, set by the startup CPU-tier probe).
+  The pair in the same mode reads 231.5 against 230.5 (+0.4 %).
+
+### 19.3.39 GGUF output projections take their input encoded by its producer (2026-10-29; exact, same bits; default)
+
+**What.** A GGUF projection encodes x itself (`encode_kernel`, one CTA a column, then the projection kernels): one
+launch between the producer and the projection, on the critical path of every mixer output. Now the GDN gated norm
+and QSA's output gate write the output projection's input already encoded (`include/infernix/ops/ggml_encode.h`:
+`gated_rmsnorm_ggml_encoded`, `sigmoid_mul_ggml_encoded`), and the projection runs from those words
+(`ggml_linear_encoded`, the same narrow launches). This applies to decode and verification calls on the exact narrow
+route; prefill widths, `--a8-activations` and the activation scan keep the composed kernels.
+
+**How.**
+- A cluster of K / 2,048 CTAs takes a column (three at K = 6,144). Each CTA computes 2,048 of the column's outputs into
+  shared memory with its Op's arithmetic: the gated norm's rows of 128, one per warp as `rmsnorm_warp_bf16x2_kernel`
+  has them, or `sigmoid_gate_mul_pair`'s packs.
+- The cluster takes the column exponent from every CTA's largest key through distributed shared memory.
+- Each CTA encodes a 2,048-element share of the column's chunks, reading each chunk's permuted source from the CTA that
+  holds it (the GDN output's head permutation crosses CTAs). The per-chunk encoding is `encode_kernel`'s
+  (`ops/ggml/ggml_encode.cuh`), so the words are the same.
+
+**Rejected forms** (traced: record or merge end to output projection end, IQ3_S 16K; and A/B):
+- *One CTA a column, rows in a loop:* GDN +0.45 µs, QSA +0.22 µs; A/B −0.4 % (16K) and −0.6 % (struct) in every pair.
+- *The same with every row's loads issued first:* GDN median −0.6 µs but the mean only −0.08 µs (a tail that grows with
+  the width); QSA worse; per-round wall +0.1 %.
+- Cause: a column's rows and its encode wait in one CTA, and the slowest column sets the projection's start.
+
+**Test.** `infernix_ggml_encode_test`: projection outputs bit-equal to gated_rmsnorm or sigmoid_mul followed by
+ggml_linear, covering:
+- widths 1-31;
+- two, three and four parts;
+- with and without the permutation;
+- formats with and without slice-sum terms, and a mixed two-format projection;
+- non-finite columns;
+- the producer captured as a programmatic dependent of a kernel that rewrites its input.
+
+**Measured** (cluster form):
+- Same-session 16K trace: GDN span 18.03 → 16.74 µs (mean), QSA 16.39 → 15.70; wall per round 11,098 → 10,946 µs.
+  Node tracing inflates kernel boundaries, so this overstates the untraced gain.
+- A/B (RTX 5090, exclusive layout, `phase1b/ab2.ps1`, two interleaved runs each in opposite orders, one build with a
+  temporary switch):
+  - IQ3_S struct: 492.3 / 492.5 against 490.6 / 490.5 tok/s (+0.4 %, both pairs);
+  - IQ3_S 16K: 268.2 / 271.9 against 270.2 / 267.3 (means +0.5 %; the pairs −0.7 % and +1.7 %, within this
+    workload's spread);
+  - identical acceptance per position.
+- Dense8 runs no GGUF projection and is unchanged.
 
 ---
 

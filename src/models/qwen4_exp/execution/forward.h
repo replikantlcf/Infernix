@@ -88,7 +88,7 @@ struct ForwardExperts {
     // Decode and verification calls run the shared expert on this stream (forked at the layer's
     // input, joined before the combine) while the routed experts compute. Null: in order.
     cudaStream_t shared_stream = nullptr;
-    std::array<cudaEvent_t, 2> shared_events{};
+    std::array<cudaEvent_t, 4> shared_events{};
     // Decode and verification calls compute their staged misses on this stream while the overlap stream
     // stages their down rows (ops::MoeExpertSource::split_stream). Null: not split.
     cudaStream_t split_stream = nullptr;
@@ -209,6 +209,9 @@ struct ForwardBatch {
     // release_stream on the span's last chunk only (every chunk reads the same layer copies).
     bool stream         = false;
     bool release_stream = true;
+    // The SSD tier lost no expert (left both tiers) since the stream's span began: a complete layer's experts are
+    // all in VRAM, the ring, a held frame or RAM, so its call runs as one pass, as without the tier.
+    bool stream_whole   = false;
     // With a gated stream (ExpertStream::gated): each layer's routing decides, through
     // ForwardExperts::split, which experts the stream copies and which the CPU serves.
     bool split          = false;

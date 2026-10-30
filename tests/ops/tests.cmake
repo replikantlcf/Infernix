@@ -128,6 +128,11 @@ infernix_add_family_op_test(infernix_rg16_linear_test FAMILY projection
 infernix_add_family_op_test(infernix_ggml_linear_test FAMILY projection
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_linear.cpp"
   LIBRARIES infernix_ops)
+# The producers that write a GGUF projection's input encoded (gated_rmsnorm, sigmoid_mul) against the Ops
+# followed by ggml_linear, bit for bit.
+infernix_add_family_op_test(infernix_ggml_encode_test FAMILY projection
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_ggml_encode.cpp"
+  LIBRARIES infernix_ops)
 # The 8-bit activation route of GGUF projections (--a8-activations) against a binary64 oracle of the
 # quantized activations, every narrow route and width.
 infernix_add_family_op_test(infernix_ggml_linear_a8_test FAMILY projection
@@ -315,6 +320,10 @@ infernix_add_family_op_test(infernix_gdn_input_proj_conv_record_test FAMILY recu
 
 infernix_add_family_op_test(infernix_gated_delta_net_replay_record_test FAMILY recurrent
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gated_delta_net_replay_record.cpp"
+  LIBRARIES infernix_ops)
+
+infernix_add_family_op_test(infernix_gated_delta_net_replay_record_conv_test FAMILY recurrent
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_gated_delta_net_replay_record_conv.cpp"
   LIBRARIES infernix_ops)
 
 infernix_add_family_op_test(infernix_gdn_replay_fold_test FAMILY recurrent
