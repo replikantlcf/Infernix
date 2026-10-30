@@ -7,7 +7,6 @@ permissions:
   contents: read
 
 env:
-  # VCPKG_ROOT намеренно НЕ задаём здесь: его перезапишет ilammy/msvc-dev-cmd.
   VCPKG_TARGET_TRIPLET: x64-windows
   CUDA_PATH: "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v13.4"
   BUILD_DIR: build-windows
@@ -15,15 +14,20 @@ env:
 
 jobs:
   build:
-    runs-on: windows-2022
+    # windows-2025 теперь предоставляет Visual Studio 2026 (VS 18.x)
+    # Это необходимо для совместимости с CUDA 13.4 и решения ошибки C2326
+    runs-on: windows-2025
     timeout-minutes: 240
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
-      - name: Setup MSVC (Visual Studio 2022)
+      - name: Setup MSVC (Visual Studio 2026)
         uses: ilammy/msvc-dev-cmd@v1
+        with:
+          # Явно запрашиваем VS 2026 (версия 18.0), чтобы не зависеть от дефолта образа
+          vsversion: '18.0'
 
       - name: Setup CUDA 13.4
         uses: mjun0812/setup-cuda@v1
@@ -38,7 +42,7 @@ jobs:
           echo "VCPKG_BINARY_SOURCES=clear;files,$env:VCPKG_BINARY_CACHE,readwrite" >> $env:GITHUB_ENV
 
       - name: Cache vcpkg binaries
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ env.VCPKG_BINARY_CACHE }}
           key: vcpkg-${{ runner.os }}-x64-windows-${{ hashFiles('**/vcpkg.json', '**/CMakeLists.txt', '**/vcpkg-configuration.json') }}
@@ -48,7 +52,7 @@ jobs:
       - name: Bootstrap vcpkg and install dependencies
         shell: pwsh
         run: |
-          # КРИТИЧНО: переопределяем VCPKG_ROOT, который только что перезаписал msvc-dev-cmd
+          # КРИТИЧНО: переопределяем VCPKG_ROOT, который перезаписывает msvc-dev-cmd
           $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
 
           if (Test-Path $env:VCPKG_ROOT) {
@@ -58,7 +62,6 @@ jobs:
           git clone https://github.com/microsoft/vcpkg.git $env:VCPKG_ROOT
           & "$env:VCPKG_ROOT\bootstrap-vcpkg.bat" -disableMetrics
 
-          # Без --only-binarycaching: первый запуск соберёт пакеты и наполнит кэш
           & "$env:VCPKG_ROOT\vcpkg.exe" install `
             ffmpeg:x64-windows `
             curl:x64-windows `
@@ -68,7 +71,6 @@ jobs:
       - name: Configure CMake
         shell: pwsh
         run: |
-          # Здесь VCPKG_ROOT снова переопределяем на всякий случай
           $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
 
           cmake -S . -B $env:BUILD_DIR -G "Ninja Multi-Config" `
@@ -91,7 +93,7 @@ jobs:
           ctest --test-dir $env:BUILD_DIR -C Release --output-on-failure
 
       - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: infernix-windows-release
           path: |
