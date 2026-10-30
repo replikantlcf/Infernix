@@ -93,22 +93,7 @@ jobs:
         run: |
           cmake --build $env:BUILD_DIR --config Release --parallel
 
-      - name: Stage vcpkg runtime DLLs
-        continue-on-error: true
-        shell: pwsh
-        run: |
-          $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
-          $src = "$env:VCPKG_ROOT\installed\x64-windows\bin"
-          if (-not (Test-Path $src)) { throw "vcpkg bin not found: $src" }
-          $dlls = Get-ChildItem "$src\*.dll"
-          if ($dlls.Count -eq 0) { throw "No DLLs in $src" }
-          foreach ($dst in @("$env:BUILD_DIR\apps\Release\dll_backup", "$env:BUILD_DIR\bin\Release\dll_backup")) {
-            New-Item -ItemType Directory -Force -Path $dst | Out-Null
-            Copy-Item $dlls.FullName $dst -Force
-            Write-Host "Copied $($dlls.Count) DLLs to $dst"
-          }
-
-      - name: Smoke test (--version, with timeout)
+      - name: Smoke test (--help, with timeout)
         continue-on-error: true
         shell: pwsh
         run: |
@@ -116,7 +101,7 @@ jobs:
             $exe = Get-Item "$env:BUILD_DIR\apps\Release\infernix.exe" -ErrorAction SilentlyContinue
             if (-not $exe) { throw "infernix.exe not found in apps\Release" }
             Write-Host "Running: $($exe.FullName)"
-            $proc = Start-Process -FilePath $exe.FullName -ArgumentList '--version' `
+            $proc = Start-Process -FilePath $exe.FullName -ArgumentList '--help' `
                     -NoNewWindow -PassThru
             if (-not $proc.WaitForExit(60000)) {
               $proc.Kill()
