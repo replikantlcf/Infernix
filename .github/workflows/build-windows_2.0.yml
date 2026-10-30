@@ -14,20 +14,24 @@ env:
 
 jobs:
   build:
-    # windows-2025 теперь предоставляет Visual Studio 2026 (VS 18.x)
-    # Это необходимо для совместимости с CUDA 13.4 и решения ошибки C2326
-    runs-on: windows-2025
+    runs-on: windows-2025-vs2026
     timeout-minutes: 240
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
 
-      - name: Setup MSVC (Visual Studio 2026 via vcvars64)
-        shell: cmd
+      - name: Setup MSVC (Visual Studio 2026)
+        uses: mlocati/setup-msvc@v1
+        with:
+          vs-version: latest
+          architecture: x64
+          
+      - name: Verify MSVC in PATH
+        shell: pwsh
         run: |
-          call "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Auxiliary\Build\vcvars64.bat"
-          if errorlevel 1 exit /b 1
+          where.exe cl
+          cl 2>&1 | Select-Object -First 1
 
       - name: Setup CUDA 13.4
         uses: mjun0812/setup-cuda@v1
@@ -52,7 +56,6 @@ jobs:
       - name: Bootstrap vcpkg and install dependencies
         shell: pwsh
         run: |
-          # КРИТИЧНО: переопределяем VCPKG_ROOT, который перезаписывает msvc-dev-cmd
           $env:VCPKG_ROOT = "${{ github.workspace }}\vcpkg"
 
           if (Test-Path $env:VCPKG_ROOT) {
@@ -75,6 +78,8 @@ jobs:
 
           cmake -S . -B $env:BUILD_DIR -G "Ninja Multi-Config" `
             -DCMAKE_CONFIGURATION_TYPES=Release `
+            -DCMAKE_C_COMPILER=cl `
+            -DCMAKE_CXX_COMPILER=cl `
             -DCMAKE_CUDA_COMPILER="$env:CUDA_PATH\bin\nvcc.exe" `
             -DVCPKG_TARGET_TRIPLET=$env:VCPKG_TARGET_TRIPLET `
             -DCMAKE_PREFIX_PATH="$env:VCPKG_ROOT\installed\x64-windows" `
