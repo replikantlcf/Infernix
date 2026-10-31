@@ -154,6 +154,8 @@ OffloadSwitches read_offload() {
         double share = 0.0;
         if (*v == "auto") {
             s.link_share = OffloadSwitches::LinkShare::kAuto;
+        } else if (*v == "divisor") {
+            s.link_share = OffloadSwitches::LinkShare::kForcedDivisor;
         } else if (parse_double(*v, share) && share > 0.0 && share <= 1.0) {
             s.link_share       = OffloadSwitches::LinkShare::kFixed;
             s.link_share_fixed = share;

@@ -11769,6 +11769,110 @@ ggml_linear, covering:
   - identical acceptance per position.
 - Dense8 runs no GGUF projection and is unchanged.
 
+### 19.3.40 NVFP4 W4A16 narrow experts on int8 tensor cores (2026-10-30; exact, same bits; default)
+
+**What.** The narrow jobs (at most eight columns) of decode and verification calls of NVFP4 W4A16 experts at
+Flash-Next's geometry (NVIDIA FP4-Local at its 16-bit expert activations, recipe C, the uncensored NVFP4) ran the dp4a
+narrow kernels: a
+gate/up CTA per 16 intermediates that staged its whole 46 KB slice before its first product (one CTA an SM), encoded
+the call's x itself, and made one pass over the staged weights per column (the one-column kernels up to four
+columns). A 16K trace of FP4-Local (DFlash2 auto) had those kernels at 3.48 of 11.56 ms a round, about 27 % of the
+DRAM bandwidth their resident records need. They now run `ops/offloaded_sparse_moe/cuda/narrow_a16_mma.cuh`:
+
+- The call's x is encoded once (`a16_nmma_prepare_kernel`) into the limb rows the wide route reads
+  (`a16_limbs.cuh`: X = 2^14 H1 + 2^11 H0 + 8 L1 + L0), and its jobs' gate/up CTA counts are cleared.
+- Rows g and g + 8 of a 16-row group are one `mma.m16n8k32` A fragment with K the block twice, A = [8 c | c] (one
+  record word gives both rows' codes). Against B = [H1 | H0] (s8) the MMA gives c . (X >> 11), against
+  [L1 | L0] (u8) c . (X & 2047), so P_b = 2048 hi + lo is the narrow route's exact int32, and S = sum of
+  e4m3_scaled(s) P_b its int64, for all of a job's columns in one MMA's n. The outputs are the dp4a kernels' and the
+  CPU engine's bits.
+- Gate/up: four warps a CTA, a warp a row group, streamed through a private four-stage cp.async ring of eight units; a
+  gate row's thread pairs with its up row's (lane + 4) for SwiGLU. x comes from shared memory for jobs of at most two
+  columns, else from L2. The job's last CTA rewrites every entry's h in place as limbs, with h_emax.
+- Down: a warp a row group of 40 units, copied before the PDL wait; the job's h limbs then come to shared memory.
+- Calls of up to 64 columns take them (`kA16NmmaCallColumns`: eight lanes of eight columns), their jobs of more than
+  eight columns the wide route as before; the workspace of the A4 residual wide routes (FP4-Local's default
+  `expert-a4-residual`) then holds the x limbs, exponents and counts too. Wider calls' (prefill's) narrow jobs keep
+  the dp4a kernels.
+
+**Test.** `infernix_offloaded_moe_layer_test`: the W4A16 calls of one, four, five and eight columns, every placement,
+staging pass, CPU share and SSD-tier read against `expert_forward_a16`'s bits, with exact and (new) A4 residual
+workspaces. Op bench output hashes equal the dp4a kernels' at every point below.
+
+**Measured** (RTX 5090, PCIe 5.0 x8, one build with the temporary switch `INFERNIX_TMP_A16_DP4A`, removed since,
+2026-10-30):
+- `infernix_offloaded_moe_wide_bench --cold --placement frames`, median moe_experts call, dp4a against tensor cores
+  (two runs each, exact and A4 residual workspaces alike): T = 1 49.8 → 43.6 µs (0.87x), T = 3 96.9 → 74.2 (0.76x),
+  T = 8 309 → 203 (0.66x); eight columns as 80 one-column experts 0.67-0.68x, as 10 of eight 0.59x.
+- FP4-Local end to end (`infernix_bench`, DFlash2 auto, INT8 KV, exclusive layout, three interleaved runs each, every
+  pair ahead, identical rounds and acceptance): short context (38-token prompt, 1,024 new) 199.2 → 213.2 tok/s
+  (+7.0 %), after a 16,413-token prompt 208.8 → 247.6 (+18.6 %), the community struct fixture 365.9 → 419.8 (+14.7 %).
+  Recipe C and the uncensored NVFP4 run the same kernels (same bits) and were not timed.
+- Schedule sweep (warps a CTA, ring stages, units a stage; the same op bench at T = 1-64, A4 residual workspace, two
+  runs each): 4 / 4 / 8 was fastest or level at every T; 4 / 3 / 16 level (0.99-1.03x), 4 / 6 / 8 1.00-1.03x,
+  8 / 4 / 8 1.00-1.06x, 2 / 4 / 8 1.00-1.06x, 4 / 6 / 4 0.97-1.14x. Same hashes on every schedule.
+- Calls of 9-64 columns (several lanes' rounds): two requests decoding together (4,096-token prompts, distinct rows,
+  DFlash2 auto) 82.7 -> 83.5 tok/s (+1.05 %, three pairs ahead), four requests 34.38 -> 34.38 (flat): their misses
+  (about 70 % of routed experts hit) bound those rounds.
+
+### 19.3.41 A streamed prefill call reads its n-gram rows behind the gate (2026-10-30; same bits; default)
+
+**What.** A chunk-major prefill call read its n-gram rows (`stage_sequence`) before anything was enqueued, so the GPU
+and the link idled for the read: FP4-Local's 16K trace (rows from a volume at ~14K reads/s) had its first expert
+copy 83.5 ms after the call began, 74 ms of it in `prefill.ple_rows`. A call wide enough to stream
+(`kStreamMinColumns`) now stages everything but its rows, and `run_rows_behind` enqueues it with an `NgramRowGate`
+(the decode rounds' gate, §12.3): the layout uploads around the row region, and `ple.layer`'s upload waits for the
+gate's word. A helper thread reads the rows into the io layout and publishes the word while the engine thread enqueues
+the call, so the GPU embeds and runs the layers before `ple.layer` while the expert stream copies.
+
+**Why a thread.** The engine thread can wait on the device while it enqueues a prefill call: a split call's routing
+(`cudaEventSynchronize(split_ready_)` per layer), the expert stream's bounce for unpinned records, a kernel's first
+load. With the read on the engine thread after the enqueue, any of these past `ple.layer` would wait on a word only
+that thread can publish. The helper owns the row scratch (window_, row_ids_), the n-gram volume and the lane's n-gram
+counters until it is joined; a failed read publishes zero rows and rethrows after the join.
+
+**Measured** (FP4-Local, rows from the IQ3_S import's IQ4_NL volume on E:, three interleaved runs, every pair ahead):
+pp16413 6,829 -> 6,999 tok/s (+2.5 %), pp4096 2,727 -> 2,802 (+2.7 %). A walk's first chunk still reads its rows
+before its first launch, but the stream's `begin` has enqueued two layers' copies by then: submitting them before
+the read (`device_.flush()`) measured pp16413 0.998x and pp65565 1.000x, so the walk is unchanged.
+
+### 19.3.42 One streamed call and the prompt's narrow last call walk (2026-10-30; same bits; default)
+
+**What.** A prompt of one streamed call and a last call narrower than `kStreamMinColumns` (16,385-16,639 tokens at
+FP4-Local's 16,384-token chunk) ran the two chunk-major, and the last call staged its misses again right after the
+streamed call: FP4-Local's 16K trace had the 29-token last call at 299 ms (12 % of the prompt), mostly CPU-served
+misses at 5-7 ms a layer. `walk_span_end` now walks the two (the last call as its own MoE group), as it already did
+after two or more streamed calls.
+
+**Measured** (FP4-Local, the same runs as §19.3.41): pp16413 6,999 -> 7,684 tok/s (+9.8 %); pp4096 (one call)
+unchanged; the decode after pp16413 unchanged (249.2 -> 249.8 tok/s, three pairs within +0.3 %). 2026-10-27's
+"walking measured no faster" was pp4125 on IQ3_S and Dense8 at 4,096-token chunks (0.999x, 1.000x).
+
+**Trade-off.** As for two or more streamed calls, a /v1/decide fan-out whose questions diverge in that last call
+cannot coalesce while the span runs (a running span's inner positions are not realizable taps,
+`prefix_await_sibling`). `infernix_qwen4_exp_decide_real_test`'s coalescing case (1,064-token prompts, one call, no
+walk) fails on FP4-Local with and without this change and on main 75e25b5c alike (leader 0, follower 0 reused
+tokens; not investigated here).
+
+### 19.3.43 NVFP4 W4A16 banks split decode misses by the share form (2026-10-30; placement only; default)
+
+**What.** Flash-Next's Program kept a decode call's host-memory misses on the link by the divisor rule, M / d with
+d = floor(1.65 + C t) (§19.3.12; FP4-Local: C 19,100 experts/s, t 0.10 ms a 2.64 MiB record, d = 3). Its NVFP4 W4A16
+banks now take the share form the Qwen3.5-122B's split took (`placement.h` `decode_link_share_256`: the link keeps
+(M s) >> 8 with s = 256 / (1 + 1.46 C t), 67/256 on FP4-Local), so a call's three misses all go to the CPU where the
+rule sent one over the link. `INFERNIX_TMP_LINK_SHARE=divisor` keeps the rule; GGUF and W4A4 banks keep it (not
+measured).
+
+**Measured** (FP4-Local, DFlash2 auto, the share form against `divisor`, three interleaved runs each):
+- with the tensor-core narrow experts (§19.3.40): short context 214.9 -> 226.5 tok/s (+5.4 %), after a 16K prompt
+  249.2 -> 249.5 (+0.1 %), the struct fixture 422.9 -> 449.5 (+6.3 %); every short-context and struct pair ahead;
+- with the dp4a narrow experts (the same day, 1-2 runs a share, before §19.3.40): after a 16K prompt the rule led
+  every share below it (67/256 0.988x), short context 77/256 +1.1 % and 67/256 +0.7 %: the faster GPU legs moved the
+  balance toward the CPU.
+- Other shares on the tensor-core build: 77/256 struct +3.6 % and short context +1.3 %; 107/256 struct -4.6 %.
+- More CPU workers did not help: 8, 11 and 14 against 6 (dp4a build) 0.999, 0.994 and 0.995x after a 16K prompt,
+  8 workers 1.019x at short context and 0.982x on the struct fixture.
+
 ---
 
 ## 20. Documentation and authority changes
