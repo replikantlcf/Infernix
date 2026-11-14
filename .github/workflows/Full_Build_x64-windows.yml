@@ -72,6 +72,24 @@ jobs:
             libjpeg-turbo:x64-windows `
             --triplet x64-windows
 
+#####
+      - name: Fix zlib library name mismatch (z.lib vs zlib.lib)
+        shell: pwsh
+        run: |
+          $zlibPath = "${{ env.VCPKG_ROOT }}\installed\x64-windows\lib\zlib.lib"
+          $targetPath = "${{ env.VCPKG_ROOT }}\installed\x64-windows\lib\z.lib"
+
+          if (Test-Path $zlibPath) {
+            if (-not (Test-Path $targetPath)) {
+              Copy-Item -Path $zlibPath -Destination $targetPath
+              Write-Host "Copied 'zlib.lib' to 'z.lib' to satisfy FFmpeg's linker requirements."
+            } else {
+              Write-Host "'z.lib' already exists. No action needed."
+            }
+          } else {
+            Write-Host "Warning: Source file '$zlibPath' not found. Skipping copy."
+          }
+#####
       - name: Configure CMake
         shell: pwsh
         run: |
