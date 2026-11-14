@@ -73,29 +73,34 @@ jobs:
             --triplet x64-windows
 
 #####
-      - name: Temp fix zlib library name mismatch (z.lib vs zlib.lib)
+      - name: Fix zlib library name mismatch (z.lib vs zlib.lib)
         shell: pwsh
         run: |
-          $vcpkgLibDir = "${{ github.workspace }}\vcpkg\installed\x64-windows\lib"
-          $zlibPath = Join-Path $vcpkgLibDir "zlib.lib"
-          $targetPath = Join-Path $vcpkgLibDir "z.lib"
+          $vcpkgRoot = "${{ github.workspace }}\vcpkg"
+          $installedDir = Join-Path $vcpkgRoot "installed\x64-windows"
+          $libDir = Join-Path $installedDir "lib"
 
-          Write-Host "Looking for zlib.lib at: $zlibPath"
-          Write-Host "Will create z.lib at: $targetPath"
+          Write-Host "Searching for zlib.lib under: $installedDir"
 
-          if (Test-Path $zlibPath) {
+          # Ищем zlib.lib рекурсивно по всему дереву installed/x64-windows
+          $zlibFile = Get-ChildItem -Path $installedDir -Recurse -Filter "zlib.lib" -ErrorAction SilentlyContinue | Select-Object -First 1
+
+          if ($zlibFile) {
+            $zlibPath = $zlibFile.FullName
+            $targetPath = Join-Path $libDir "z.lib"
+            Write-Host "Found zlib.lib at: $zlibPath"
+
             if (-not (Test-Path $targetPath)) {
               Copy-Item -Path $zlibPath -Destination $targetPath
-              Write-Host "Successfully copied 'zlib.lib' to 'z.lib'."
+              Write-Host "Copied to: $targetPath"
             } else {
-              Write-Host "'z.lib' already exists. No action needed."
+              Write-Host "z.lib already exists at: $targetPath"
             }
           } else {
-            # Если файл не найден, показываем содержимое папки для диагностики
-            Write-Host "ERROR: Source file '$zlibPath' not found."
-            Write-Host "Contents of lib directory:"
-            Get-ChildItem -Path $vcpkgLibDir -Filter "z*" | Format-Table Name, Length
-            exit 1 # Завершаем с ошибкой, чтобы не продолжать заведомо провальную сборку
+            Write-Host "zlib.lib NOT FOUND anywhere under $installedDir"
+            Write-Host "Full contents of lib directory:"
+            Get-ChildItem -Path $libDir -Recurse | Format-Table FullName, Length
+            exit 1
           }
 #####
       - name: Configure CMake
