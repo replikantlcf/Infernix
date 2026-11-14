@@ -24,9 +24,11 @@ concept EngineProgramContract = requires(typename Types::Program& program, const
     // Recovery from a RecoverableExecutionError (or a stall, YJ-02): the Program discards the failed
     // requests' state and keeps serving; false when it could not.
     { program.recover_after_failure() } -> std::same_as<bool>;
-    // The resize of resources outside rounds: the Program asks for maintain() through the waker and the
-    // idle worker runs it under the execution lock.
+    // The resize of resources outside rounds: the Program asks for maintenance through the waker and the
+    // worker runs it under the execution lock, maintain() while idle and maintain_busy() between rounds
+    // while requests run (the RAM tiers' resize, which must not wait for an idle moment).
     program.maintain();
+    program.maintain_busy();
     program.set_maintenance_waker(std::function<void()>{});
     // The logical CPUs the round thread runs on (0: unpinned).
     { view.engine_thread_cpus() } -> std::convertible_to<std::uint64_t>;
@@ -40,6 +42,8 @@ concept EngineProgramContract = requires(typename Types::Program& program, const
     program.save_prefix_cache_now(CancellationView{});
     // The expert cache's cumulative counters (RuntimeStats::expert_cache; empty without one).
     { view.expert_cache_totals() } -> std::convertible_to<std::optional<ExpertCacheTotals>>;
+    // What the Program holds now, by category (RuntimeStats::memory): read with every stats publication, so cheap.
+    { view.memory_usage() } -> std::same_as<MemoryUsage>;
     // A finished request's expert cache counters and the prompt tokens its snapshots made reusable.
     { finished.expert_cache } -> std::convertible_to<std::optional<ExpertCacheStats>>;
     { finished.cache_created_prompt_tokens } -> std::convertible_to<std::optional<std::uint32_t>>;

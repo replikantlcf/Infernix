@@ -81,7 +81,7 @@ struct HybridPrefixCacheStats {
     std::uint32_t snapshots               = 0;
     std::uint32_t device_resident_blocks  = 0;
     std::uint32_t device_evictable_blocks = 0;
-    std::uint32_t host_slabs              = 0;
+    std::uint32_t host_slabs              = 0; // Host-tier slabs in service now (a RAM release or growth moves it)
     std::uint32_t host_free_slabs         = 0;
     std::uint64_t host_slab_bytes         = 0;
     std::uint64_t snapshot_hits           = 0;
@@ -321,6 +321,7 @@ struct ProgramDevicePlan {
     std::uint64_t staging   = 0; // the expert miss staging slots
     std::uint64_t state     = 0; // GDN, PLE and QSA tail state, verification records, MTP columns
     std::uint64_t io        = 0; // per-call inputs, logits, sampling and round arrays
+    std::uint64_t drafter   = 0; // of state and io: the drafters' (MTP columns and io, DFlash2 features, rings and io, the drafter pool)
     std::uint64_t residency = 0; // the expert frame tables and route log
     std::uint64_t expert_record_stride = 0; // the largest expert record (staging and stream-ring slots)
     std::uint32_t expert_tier_list_slots = 0; // the SSD tier's slots that hold no expert (ring, prefetch, demotion)
@@ -576,6 +577,10 @@ public:
     // The expert cache's cumulative counters and current size (RuntimeStats::expert_cache); nothing
     // without an expert cache. Engine thread, between rounds.
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept;
+    // What the device, host and SSD hold now, by use, and the headroom the expert frames' sizing kept free
+    // (RuntimeStats::memory; the prefix cache's Host and SSD tiers are the Engine's to fill). Engine thread, between
+    // rounds; with every stats publication, so O(1).
+    [[nodiscard]] MemoryUsage memory_usage() const noexcept;
     // The SSD expert tier's startup fill (LoadSummary::expert_ram_records_*): zeros without the tier.
     [[nodiscard]] ExpertRamFill expert_ram_fill() const noexcept;
 
@@ -584,13 +589,18 @@ public:
     // worker, between rounds and under its execution lock. An empty waker detaches the engine.
     void set_maintenance_waker(std::function<void()> waker);
     void maintain();
+    // Between rounds while requests run, when a waker asked (runtime/contract/program.h): the RAM tiers' resize
+    // advances or starts (--ram-resize auto); nothing else outside rounds runs here.
+    void maintain_busy();
     // The Engine's round thread runs unpinned: Flash-Next's CPU expert team leaves it no core of its own
     // (runtime/contract/program.h; Qwen3.5's offloaded experts do).
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept { return 0; }
     // RAM pressure (EngineOptions::ram_resize, runtime::expert_offload::RamMonitor): starts the monitor under which
-    // maintain() shrinks the prefix cache's Host tier while the OS runs short and grows it back once more than
-    // `reserve_bytes` plus a step stays free.
-    void start_ram_resize(std::uint64_t reserve_bytes);
+    // maintain() and maintain_busy() shrink the prefix cache's Host tier and the SSD tier's RAM while the OS runs short
+    // (less than max(reserve_bytes / 2, 2 GiB) available) and grow them back once more than the reserve plus a step
+    // stays free. `trim_host_tier` (an automatic Host tier): the first maintenance after the start gives back what
+    // keeps less than the reserve available.
+    void start_ram_resize(std::uint64_t reserve_bytes, bool trim_host_tier);
     Program(const Program&)            = delete;
     Program& operator=(const Program&) = delete;
 

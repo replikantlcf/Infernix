@@ -486,6 +486,14 @@ struct ResumeStateImpl {
     GateTraffic gate;
 };
 
+// A pair call's head (ProgramImpl::pair_step): its columns and the promotions its own call starts. Outside the class
+// so that it is complete where ProgramImpl's members take it by default (GCC rejects a defaulted argument of a nested
+// type with default member initializers while the enclosing class is incomplete).
+struct PairHead {
+    std::int32_t columns   = 0;
+    std::size_t promotions = 0;
+};
+
 class ProgramImpl {
 public:
     enum class Phase : std::uint8_t { Free, Prefill, Decode, Finishable };
@@ -895,9 +903,10 @@ public:
         b.kv_max    = d.kv;
         b.workspace = d.work;
         b.staging   = d.staging;
-        b.state     = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records +
-                  (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0) + d.dflash_features +
-                  d.dflash_ring + d.drafter_pool;
+        const std::uint64_t drafter_state = (d.mtp ? d.mtp_column_bytes * lanes * (W + 2) + 2ULL * di * W * lanes : 0) +
+                                            d.dflash_features + d.dflash_ring + d.drafter_pool;
+        b.state   = d.gdn_bytes + d.ple + d.tails + d.window + d.records_bytes + d.ple_records + d.qsa_records + drafter_state;
+        b.drafter = drafter_state + d.mtp_ones + 4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words;
         b.io = d.io.bytes + d.pair_io + d.logits32 + d.logits16 + 4ULL * d.tree_io.words + 4ULL * lanes + 4ULL * lanes +
                sizeof(ops::SamplingConfig) * lanes + d.token_counts + 4ULL * d.spec.words + d.mtp_ones +
                4ULL * d.mtp_io.words + 4ULL * d.dflash_io.words + kGateStatsBytes * lanes +
@@ -1624,10 +1633,11 @@ public:
         // executables and the display headroom leave (design §19.3.7). Its frames are the one
         // elastic allocation: a chunk the driver places in system memory (another program took
         // memory since the reading) is given back and the cache stops growing there.
+        std::optional<std::uint64_t> free_after_frames; // the debug line before the graphs' capture
         if (options_.expert_cache) {
             const VramDemand demand = expert_frame_demand(residency_->frame_bytes());
             sizing_                 = size_expert_frames(vram_->query(), demand);
-            // Each pool maps whole chunks: one chunk of slack per pool beyond the first (Engine::plan's too).
+            // Each pool maps whole chunks: one chunk of slack per pool (Engine::plan's too).
             const std::uint32_t slack =
                 pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
             sizing_.frames = sizing_.frames > slack ? sizing_.frames - slack : 0U;
@@ -1642,6 +1652,7 @@ public:
                                                      std::to_string(sizing_.frames) + " frames", DiagnosticLevel::Warning);
             }
             sizing_.frames = grown.frames;
+            free_after_frames = vram_->query().device_free;
             start_vram_monitor(demand);
             const std::uint32_t nominal = size_expert_frames(nominal_snapshot(sizing_.snapshot), demand).frames;
             const std::uint64_t lends   = fit_wide_work_to_cache(grown.frames, nominal > slack ? nominal - slack : 0U);
@@ -1718,6 +1729,14 @@ public:
         forward_ = std::make_unique<execution::Forward>(parameters_, device_, *work_, std::move(state), std::move(kv),
                                                         std::move(experts), dim(options_.max_context), options_.fast_paths);
         if (dflash2_) { create_dflash2_drafter(); }
+        if (free_after_frames) {
+            // What startup takes from the device after the frames' sizing, before the graphs (the sizing planned for
+            // the graphs' reserve and the headroom only).
+            device_.synchronize();
+            diagnostic("VRAM after the expert frames: " + std::to_string(*free_after_frames >> 20) + " MiB free; " +
+                           std::to_string(vram_->query().device_free >> 20) + " MiB before the CUDA graphs' capture",
+                       DiagnosticLevel::Debug);
+        }
         capture_graph_set();
         device_.synchronize();
         report_lane_cost(lanes, residency_->frame_bytes());
@@ -2604,12 +2623,6 @@ public:
         return prefill_progress(lane, index, begin, width, static_cast<std::uint32_t>(width), last, promotions, start);
     }
 
-    // A pair call's head (pair_step): its columns and the promotions its own call starts.
-    struct PairHead {
-        std::int32_t columns   = 0;
-        std::size_t promotions = 0;
-    };
-
     // A prefill call's routes into the residency: the lane's prompt uses (note_prompt_routes), then the
     // round's policies. TEMPORARY (INFERNIX_TMP_CONTINUING_PROMPT=<fraction>, candidates CF-01): a prompt
     // whose reused prefix covers at least that fraction of it is a continuing conversation turn. Its
@@ -3266,6 +3279,13 @@ public:
         out.kv_cache                = options_.kv_cache;
         out.kv_payload_bytes        = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
         out.workspace_logical_peak_bytes = work_capacity_;
+        const std::uint64_t weights = parameters_.model.device_weight_bytes();
+        out.weights                 = ArenaMemorySummary{weights, weights, weights};
+        out.workspace               = ArenaMemorySummary{work_capacity_, work_capacity_, work_capacity_};
+        // The graphs' share of the frames' sizing reserve, and what their startup capture took (serve warns when it
+        // took more).
+        out.cuda_graph_allowance_bytes = sizing_.reserve;
+        out.cuda_graph_measured_bytes  = graph_set_.bytes > 0 ? static_cast<std::size_t>(graph_set_.bytes) : 0;
         if (residency_) {
             // As the 122B's ExpertOffload::memory_summary reports its cache; the cache only resizes
             // under the VRAM monitor, so without it the startup frames are today's.
@@ -3287,9 +3307,75 @@ public:
         return out;
     }
 
+    // RuntimeStats::memory (the prefix cache's Host and SSD tiers are the Engine's to fill).
+    MemoryUsage memory_usage() const noexcept {
+        MemoryUsage out;
+        const auto& model           = parameters_.model;
+        const std::uint64_t draft   = model.draft_device_bytes();
+        out.device.weights          = model.device_weight_bytes() - draft;
+        out.device.drafter          = draft + plan_.bytes.drafter;
+        out.device.state            = plan_.bytes.state + plan_.bytes.io - plan_.bytes.drafter;
+        out.device.workspace        = work_capacity_;
+        out.device.staging          = plan_.bytes.staging + plan_.bytes.residency;
+        out.device.cuda_graphs      = graph_set_.bytes > 0 ? static_cast<std::uint64_t>(graph_set_.bytes) : 0;
+        out.device.kv               = kv_vmm_ ? kv_vmm_->mapped_bytes() : kv_backing_.bytes;
+        if (const std::uint32_t backed = kv_vmm_ ? pool_->backed_pages() : pool_->capacity_pages(); backed != 0) {
+            // The pages only the prefix cache holds are its part (each page's share of the pool with its tables).
+            const std::uint64_t page      = out.device.kv / backed;
+            const std::uint32_t allocated = std::min(pool_->allocated_pages(), backed);
+            const std::uint32_t cached    = prefix_ ? std::min(prefix_->index().device_evictable_blocks(), allocated) : 0;
+            out.device.prefix  = page * cached;
+            out.device.kv     -= out.device.prefix;
+            out.device.kv_used = page * (allocated - cached);
+        }
+        if (residency_) {
+            // Frames lent to a prompt's wide arena, its stream ring or a vision window are workspace while lent.
+            const std::uint64_t lent  = std::min<std::uint64_t>(residency_->stats().lent_frames, residency_->frames());
+            const std::uint64_t pools = residency_->pool_bytes();
+            const std::uint64_t lent_bytes = std::min(pools, lent * residency_->frame_bytes());
+            out.device.experts       = pools - lent_bytes;
+            out.device.expert_frames = residency_->frames() - static_cast<std::uint32_t>(lent);
+            out.device.workspace += lent_bytes;
+            const std::uint64_t keys = static_cast<std::uint64_t>(c_.num_hidden_layers) * c_.moe.experts;
+            if (tier_) {
+                // The pinned slots and the committed unpinned records; the keys they hold (a slot's resident or shadow,
+                // a record's) are disjoint. The rest are read from the artifact on the SSD (at the largest record).
+                const std::uint64_t record = tier_->record_bytes();
+                out.host.experts           = tier_->pinned_bytes() + static_cast<std::uint64_t>(tier_->unpinned_committed()) * record;
+                const std::uint64_t held =
+                    std::min<std::uint64_t>(keys, tier_->controller().resident_count() + tier_->unpinned_held());
+                out.host.expert_records = held;
+                out.ssd.expert_records  = keys - held;
+                out.ssd.experts         = out.ssd.expert_records * record;
+            } else {
+                out.host.experts        = bank_host_bytes_;
+                out.host.expert_records = keys;
+            }
+        }
+        // The banks' records are among the model's host objects when every expert is loaded into RAM.
+        const std::uint64_t host_weights = model.host_weight_bytes();
+        out.host.weights = tier_ || !residency_ ? host_weights : host_weights - std::min(host_weights, bank_host_bytes_);
+        out.host.ngram   = volume_.resident() ? NgramVolume::resident_bytes(volume_.table()) : NgramVolume::cache_bytes(volume_.table());
+        out.host.staging = kUploadStagingRingBytes + pinned_buffer_bytes();
+        out.vram_headroom = sizing_.headroom; // the frames' sizing kept it free
+        return out;
+    }
+
     std::uint64_t revision() const noexcept { return revision_; }
 
 private:
+    // The Program's own pinned host buffers (memory_usage's staging).
+    std::uint64_t pinned_buffer_bytes() const noexcept {
+        std::uint64_t bytes = 0;
+        for (const PinnedHostBuffer* buffer :
+             {&score_host_, &nonfinite_flags_, &unpackable_flags_, &grammar_host_, &io_host_, &host_sampled_, &host_configs_,
+              &pair_host_, &penalty_host_, &constraint_pinned_, &tree_host_, &device_error_, &walk_host_, &mtp_host_,
+              &dflash_host_, &spec_host_, &gate_host_, &commit_gate_host_, &flush_host_}) {
+            bytes += buffer->size();
+        }
+        return bytes;
+    }
+
     // Promotions per layer call (design section 19.2): one per decode round measured fastest; a
     // promotion moves as many PCIe bytes as serving the expert once zero-copy.
     static constexpr std::size_t kDecodePromotionsPerLayer  = 1;
@@ -3485,10 +3571,13 @@ public:
     }
 
     // ---- RAM pressure (Program::start_ram_resize, runtime::expert_offload::RamMonitor) ----
-    void start_ram_resize(std::uint64_t reserve_bytes) {
+    void start_ram_resize(std::uint64_t reserve_bytes, bool trim_host_tier) {
         if (!(prefix_ && prefix_->host_tier()) && !tier_) { return; }
-        ram_ = std::make_unique<runtime::expert_offload::RamMonitor>(reserve_bytes);
+        ram_ = std::make_unique<runtime::expert_offload::RamMonitor>(reserve_bytes, device_.device);
         ram_->set_room(ram_shrinkable(), ram_growable());
+        ram_reserve_ = reserve_bytes;
+        ram_trim_    = trim_host_tier && prefix_ && prefix_->host_tier();
+        ram_->set_busy(ram_trim_); // the first maintenance trims
         const std::lock_guard<std::mutex> lock(vram_mutex_);
         if (waker_) { ram_->set_waker(waker_); }
     }
@@ -3499,78 +3588,160 @@ public:
         return (prefix_ ? prefix_->host_tier_shrinkable_bytes() : 0U) + (tier_ ? tier_->shrinkable_bytes() : 0U);
     }
     [[nodiscard]] std::uint64_t ram_growable() const {
-        return (prefix_ ? prefix_->host_tier_growable_bytes() : 0U) + (tier_ ? tier_->growable_bytes() : 0U);
+        return (prefix_ ? prefix_->host_tier_growable_bytes() : 0U) +
+               (tier_ && !tier_->growth_pending() ? tier_->growable_bytes() : 0U);
     }
 
-    // Between requests, every lane free and no transaction open: the resize the monitor finds due for the room
-    // measured now, applied to the prefix cache's Host tier, then (a release past it, a growth before it) to the SSD
-    // tier, which resizes only with no promotion queued; the promotions that have landed are published first, which
-    // drops their slots' H2D pins (the device's record table is uploaded from its dirty keys before the next round).
-    // A growth takes one piece per call (a step, or the SSD tier's largest chunk), so a request that arrives meanwhile
-    // waits for one piece's pin and reads at most; the monitor asks for the next at once, and the pieces are logged
-    // together once they stop.
-    void maintain_ram() {
-        if (!ram_ || in_transaction() ||
-            !std::all_of(lanes_.begin(), lanes_.begin() + static_cast<std::ptrdiff_t>(options_.max_concurrency),
-                         [](const Lane& lane) { return lane.phase == Phase::Free; })) {
-            return;
+    // The SSD tier when it may resize now: no binding open, the deferred round settled (no round open), no prompt
+    // stream holding its slots, and the promotions that have landed published, which drops their slots' H2D pins, with
+    // none queued (the device's record table is uploaded from the dirty keys before the next round).
+    HostExpertTier* quiet_expert_tier() {
+        if (!tier_ || !residency_ || in_transaction()) { return nullptr; }
+        settle_deferred();
+        if (tier_->round_open() || tier_->stream_slots() != 0 || residency_->loads_pending()) { return nullptr; }
+        residency_->publish_promotions();
+        return tier_.get();
+    }
+    // The SSD tier when a landed growth may be linked: no binding open and no round open (the deferred round settled).
+    // Linking only adds empty slots and records, which no promotion, stream or transfer in flight touches.
+    HostExpertTier* closed_expert_tier() {
+        if (!tier_ || in_transaction()) { return nullptr; }
+        settle_deferred();
+        return tier_->round_open() ? nullptr : tier_.get();
+    }
+
+    // The RAM tiers' resize (--ram-resize auto), idle (maintain) and between rounds while requests run (maintain_busy:
+    // the Engine calls it when the monitor or the worker woke it). It advances the resize under way: the prefix
+    // cache's Host tier commits its moves and links or releases its chunks as the worker finishes them
+    // (PrefixCache::step_host_resize), and the SSD tier links a landed growth where it is quiet; rounds then fill the
+    // slots (admissions) and records (record fills, HostExpertTier::begin_round) it took back with the experts they
+    // read, and what is still empty is filled from the artifact once the Engine is idle. With none under way, a resize
+    // the monitor finds due starts: a release from the Host tier first, then, where it is quiet (after a device
+    // synchronization: a kernel may still read a slot), the SSD tier's records and chunks; a growth of one piece (a
+    // step, or the SSD tier's largest chunk), the SSD tier first. The memory work (copies, page-locking, releases)
+    // runs on the monitor's worker, so a round waits for no more than the bookkeeping. A release is logged once it
+    // completed, the growth pieces together once they stop.
+    void maintain_ram(bool idle) {
+        if (!ram_) { return; }
+        HostMemoryWorker& worker = ram_->worker();
+        if (prefix_ && prefix_->host_resizing()) {
+            const auto step = prefix_->step_host_resize(worker);
+            if (ram_resize_) { ram_resize_->prefix += step.released + step.grown; }
+            // Landed moves wait only for the restores in flight, which this round finishes: the next step before the
+            // next round, not at the monitor's next wake.
+            if (step.waiting && !idle) { ram_->poke(); }
         }
-        HostExpertTier* tier = tier_ && residency_ && !residency_->loads_pending() ? tier_.get() : nullptr;
-        if (tier != nullptr) { residency_->publish_promotions(); }
-        const std::uint64_t shrinkable =
-            (prefix_ ? prefix_->host_tier_shrinkable_bytes() : 0U) + (tier ? tier->shrinkable_bytes() : 0U);
-        const std::uint64_t growable =
-            (prefix_ ? prefix_->host_tier_growable_bytes() : 0U) + (tier ? tier->growable_bytes() : 0U);
-        // A release with the reading that asked for it; a growth with what is available after it.
-        const auto report = [this](bool release, std::uint64_t available, std::uint64_t prefix, std::uint64_t experts) {
-            if (prefix + experts == 0) { return; }
-            const double gib   = 1024.0 * 1024.0 * 1024.0;
-            const double total = static_cast<double>(prefix + experts) / gib, in_prefix = static_cast<double>(prefix) / gib,
-                         in_experts = static_cast<double>(experts) / gib, left = static_cast<double>(available) / gib;
-            char text[256];
-            if (release) {
-                std::snprintf(text, sizeof(text),
-                              "RAM pressure: %.1f GiB available; gave back %.1f GiB (prefix cache %.1f, experts %.1f)",
-                              left, total, in_prefix, in_experts);
-            } else {
-                std::snprintf(text, sizeof(text),
-                              "RAM free again: took back %.1f GiB (prefix cache %.1f, experts %.1f); %.1f GiB available",
-                              total, in_prefix, in_experts, left);
+        if (tier_ && tier_->growth_landed()) {
+            if (HostExpertTier* tier = closed_expert_tier()) {
+                const std::uint64_t linked = tier->link_growth();
+                if (ram_resize_) { ram_resize_->experts += linked; }
             }
-            diagnostic(text, DiagnosticLevel::Info);
-        };
-        const runtime::expert_offload::RamDecision decision = ram_->decide(shrinkable, growable);
-        const std::uint64_t asked_at                        = ram_->available();
+        }
+        if (idle && tier_ && tier_->room_unfilled() && !tier_->growth_pending()) {
+            if (HostExpertTier* tier = quiet_expert_tier()) {
+                const std::int32_t* frames = residency_->host_table();
+                (void)tier->fill_room([frames](std::uint32_t key) { return frames[key] >= 0; });
+            }
+        }
+        // A resize lasts until its memory work has run: a release until the worker has given the memory back, so the
+        // next reading counts it and no second release starts on a stale one.
+        const bool busy = (prefix_ && prefix_->host_resizing()) ||
+                          (tier_ && (tier_->growth_pending() || tier_->releasing()));
+        ram_->set_busy(busy);
+        if (busy) { return; }
+        if (ram_resize_) {
+            const RamResize done = *std::exchange(ram_resize_, std::nullopt);
+            const bool took      = done.prefix + done.experts != 0;
+            const bool more      = ram_->resized(done.release || !took, ram_shrinkable(), ram_growable());
+            if (done.trim) {
+                report_trim(done.asked_at, done.prefix);
+            } else if (done.release) {
+                report_ram(true, done.asked_at, done.prefix, done.experts);
+            } else {
+                ram_grown_prefix_ += done.prefix;
+                ram_grown_experts_ += done.experts;
+                if (!more) {
+                    report_ram(false, ram_->available(), std::exchange(ram_grown_prefix_, 0),
+                               std::exchange(ram_grown_experts_, 0));
+                }
+            }
+            return; // the next piece, if due, at the wake resized() asked for
+        }
+        if (ram_trim_ && trim_host_tier(worker)) { return; }
+        if (!idle && !ram_->due()) { return; }
+        const runtime::expert_offload::RamDecision decision = ram_->decide(ram_shrinkable(), ram_growable());
         if (decision.grow == 0) {
-            report(false, asked_at, std::exchange(ram_grown_prefix_, 0), std::exchange(ram_grown_experts_, 0));
+            report_ram(false, ram_->available(), std::exchange(ram_grown_prefix_, 0), std::exchange(ram_grown_experts_, 0));
         }
         if (decision.release == 0 && decision.grow == 0) { return; }
-        std::uint64_t prefix = 0, experts = 0;
+        RamResize resize{.release = decision.release != 0, .asked_at = ram_->available()};
         if (decision.release != 0) {
-            device_.synchronize();
-            if (prefix_) { prefix = prefix_->shrink_host_tier(decision.release); }
-            if (tier != nullptr && prefix < decision.release) { experts = tier->shrink(decision.release - prefix); }
+            const std::uint64_t aim = prefix_ ? prefix_->begin_host_release(decision.release, worker) : 0U;
+            if (aim < decision.release) {
+                if (HostExpertTier* tier = quiet_expert_tier()) {
+                    device_.synchronize();
+                    resize.experts = tier->shrink(decision.release - aim, worker);
+                }
+            }
         } else {
+            // While requests run a retired expert chunk comes back at most every kChunkGrowthSpacing: page-locking it
+            // holds the driver (cudaHostAlloc, about 0.1 s per GiB), so a round waits for one chunk at a time, not
+            // several in a row; nothing else grows meanwhile, so the RAM stays for it.
+            if (!idle && tier_ && tier_->retired_chunk_bytes() != 0 && Clock::now() < ram_next_chunk_growth_) { return; }
             const std::uint64_t piece =
                 std::min(decision.grow, std::max(runtime::expert_offload::RamControl::kStepBytes,
-                                                 tier ? tier->largest_chunk_bytes() : std::uint64_t{0}));
-            if (tier != nullptr) {
-                const std::int32_t* frames = residency_->host_table();
-                experts = tier->grow(piece, [frames](std::uint32_t key) { return frames[key] >= 0; });
-            }
-            if (prefix_ && experts < piece) { prefix = prefix_->grow_host_tier(piece - experts); }
+                                                 tier_ ? tier_->largest_chunk_bytes() : std::uint64_t{0}));
+            const std::uint64_t experts = tier_ ? tier_->begin_growth(piece, worker) : 0U;
+            if (!idle && tier_ && tier_->growth_pins_chunks()) { ram_next_chunk_growth_ = Clock::now() + kChunkGrowthSpacing; }
+            if (prefix_ && experts < piece) { (void)prefix_->begin_host_growth(piece - experts, worker); }
         }
-        const bool more =
-            ram_->resized(decision.release != 0 || prefix + experts == 0, ram_shrinkable(), ram_growable());
-        if (decision.release != 0) {
-            report(true, asked_at, prefix, experts);
-            return;
+        ram_resize_ = resize;
+        ram_->set_busy(true);
+    }
+
+    // Once, at the first maintenance after the start (the Engine is ready): an automatic Host tier was sized from the
+    // start's plan, and the process holds more than the plan counts once it runs (its CUDA context and runtime
+    // buffers: 2.4 GiB beyond the plan's "other" for Qwen3.8-Flash-Next FP4-Local, 2026-11-13), so it gives back what
+    // keeps less than --ram-free-mib available, whole chunks, to leave the reserve free as auto promises. Whether a
+    // release started.
+    bool trim_host_tier(HostMemoryWorker& worker) {
+        ram_trim_                     = false;
+        const std::uint64_t available = ram_->measure();
+        if (available >= ram_reserve_ || !prefix_) { return false; }
+        if (prefix_->begin_host_release(ram_reserve_ - available, worker) == 0) { return false; }
+        ram_resize_ = RamResize{.release = true, .trim = true, .asked_at = available};
+        ram_->set_busy(true);
+        return true;
+    }
+    void report_trim(std::uint64_t available, std::uint64_t prefix) {
+        if (prefix == 0) { return; }
+        const double gib = 1024.0 * 1024.0 * 1024.0;
+        char text[256];
+        std::snprintf(text, sizeof(text),
+                      "RAM after the start: %.1f GiB available, under --ram-free-mib %.1f GiB: the automatic prefix "
+                      "cache gave back %.2f GiB",
+                      static_cast<double>(available) / gib, static_cast<double>(ram_reserve_) / gib,
+                      static_cast<double>(prefix) / gib);
+        diagnostic(text, DiagnosticLevel::Info);
+    }
+
+    // A release with the reading that asked for it; a growth with what is available after it.
+    void report_ram(bool release, std::uint64_t available, std::uint64_t prefix, std::uint64_t experts) {
+        if (prefix + experts == 0) { return; }
+        const double gib   = 1024.0 * 1024.0 * 1024.0;
+        const double total = static_cast<double>(prefix + experts) / gib, in_prefix = static_cast<double>(prefix) / gib,
+                     in_experts = static_cast<double>(experts) / gib, left = static_cast<double>(available) / gib;
+        char text[256];
+        if (release) {
+            std::snprintf(text, sizeof(text),
+                          "RAM pressure: %.1f GiB available; gave back %.1f GiB (prefix cache %.1f, experts %.1f)", left,
+                          total, in_prefix, in_experts);
+        } else {
+            std::snprintf(text, sizeof(text),
+                          "RAM free again: took back %.1f GiB (prefix cache %.1f, experts %.1f); %.1f GiB available",
+                          total, in_prefix, in_experts, left);
         }
-        ram_grown_prefix_ += prefix;
-        ram_grown_experts_ += experts;
-        if (!more) {
-            report(false, ram_->available(), std::exchange(ram_grown_prefix_, 0), std::exchange(ram_grown_experts_, 0));
-        }
+        diagnostic(text, DiagnosticLevel::Info);
     }
 
     // ---- warm start (design §19.3.5 S4b) ----
@@ -4071,8 +4242,14 @@ private:
             const auto promoted = s.promotions - at_admission.promotions;
             const auto landed   = s.landed - at_admission.landed;
             const auto cpu      = cpu_service_ ? cpu_service_->served_experts() - lane.cpu_served_at_admission : 0;
+            // The free memory the frames are sized against: past the OS budget (--vram-past-budget) the driver's own
+            // reading is 0.
             std::size_t free_vram = 0, total_vram = 0;
-            if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) { free_vram = 0; }
+            if (vram_) {
+                free_vram = static_cast<std::size_t>(vram_->query().device_free);
+            } else if (cudaMemGetInfo(&free_vram, &total_vram) != cudaSuccess) {
+                free_vram = 0;
+            }
             // The process's RAM beside the plan (candidates §22 RAM comparison: the engines' totals were only derived).
             const HostMemorySnapshot ram = host_memory_snapshot();
             constexpr double kGiB        = 1024.0 * 1024.0 * 1024.0;
@@ -4100,7 +4277,8 @@ private:
                               "SSD expert tier: request %llu expert reads (%.2f GiB, mean %.2f ms), %llu failed; %llu "
                               "read for the prefill stream (%.2f GiB); %llu "
                               "fetched (%llu from RAM slots, %llu copied from unpinned records); %llu served in place "
-                              "from unpinned records; %llu admitted to RAM, %llu demoted from VRAM, %llu promoted from unpinned records",
+                              "from unpinned records; %llu admitted to RAM, %llu kept in free unpinned records, %llu demoted "
+                              "from VRAM, %llu promoted from unpinned records",
                               static_cast<unsigned long long>(reads),
                               static_cast<double>(reads) * static_cast<double>(residency_->frame_bytes()) / (1ULL << 30),
                               reads ? 1e-6 * static_cast<double>(t.read_ns - a.read_ns) / static_cast<double>(reads) : 0.0,
@@ -4113,6 +4291,7 @@ private:
                               static_cast<unsigned long long>(t.unpinned_copies - a.unpinned_copies),
                               static_cast<unsigned long long>(t.unpinned_served - a.unpinned_served),
                               static_cast<unsigned long long>(t.admitted - a.admitted),
+                              static_cast<unsigned long long>(t.record_fills - a.record_fills),
                               static_cast<unsigned long long>(s.demotions - at_admission.demotions),
                               static_cast<unsigned long long>(s.unpinned_promotions - at_admission.unpinned_promotions));
                 diagnostic(text, DiagnosticLevel::Debug);
@@ -4723,11 +4902,11 @@ private:
         } catch (...) {
             // A failed call (an unreadable record, say) still returns the stream's slots: left
             // active, the next streamed chunk could never begin and the release would refuse.
-            if (streamed) { expert_stream_->end(); }
+            if (streamed) { expert_stream_->end(s); }
             split_call_ = false;
             throw;
         }
-        if (streamed) { expert_stream_->end(); }
+        if (streamed) { expert_stream_->end(s); }
         split_call_ = false;
         residency_->enqueue_route_download(s, batch * width);
     }
@@ -7127,9 +7306,21 @@ private:
     void shrink_kv(bool evict = false) {
         if (!kv_vmm_ || pool_->backed_pages() <= plan_.kv_base_pages) { return; }
         if (evict && prefix_) {
+            // The Host writes a lane's release started pin their blocks until poll sees them land, and nothing polls
+            // while the engine idles: without this the blocks of the last conversation stayed pinned, the shrink
+            // released nothing and the pool kept them (with the frames they took) until the next admission.
+            prefix_->poll();
             runtime::prefix_cache::PrefixCacheIndex& index = prefix_->index();
+            std::uint32_t evicted = 0;
             for (std::uint32_t budget = pool_->backed_pages() - plan_.kv_base_pages;
-                 budget != 0 && !pool_->can_back(plan_.kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {}
+                 budget != 0 && !pool_->can_back(plan_.kv_base_pages) && index.evict_backed_device_blocks(1) != 0; --budget) {
+                ++evicted;
+            }
+            diagnostic("idle KV shrink: " + std::to_string(evicted) + " cached blocks with Host copies released; " +
+                           std::to_string(pool_->allocated_pages()) + " of " + std::to_string(pool_->backed_pages()) +
+                           " backed pages in use, " + std::to_string(index.device_evictable_blocks()) +
+                           " of them cached blocks without Host copies",
+                       DiagnosticLevel::Debug);
         }
         // Down in growth steps, the last one to the base (Qwen3.5's elastic_kv.cpp: a pool grown to a capacity
         // off the step grid stopped above the base when a page below the base was in use, and then woke the
@@ -7886,8 +8077,23 @@ private:
     std::unique_ptr<prefix::PrefixCache> prefix_;
     // The last quote (prefix_select without a lane) chose a source being read from the SSD tier.
     bool prefix_ssd_wait_ = false;
-    // After the prefix cache, so its thread stops first (start_ram_resize).
+    // After the prefix cache and the SSD tier, so its threads (the monitor and the worker running the tiers' memory
+    // jobs) stop first (start_ram_resize).
     std::unique_ptr<runtime::expert_offload::RamMonitor> ram_;
+    // The resize under way (maintain_ram): a release or a growth, the reading that asked for it, and what each tier
+    // gave back or took back so far.
+    struct RamResize {
+        bool release           = false;
+        bool trim              = false; // the start's trim (trim_host_tier)
+        std::uint64_t asked_at = 0;
+        std::uint64_t prefix = 0, experts = 0;
+    };
+    std::optional<RamResize> ram_resize_;
+    std::uint64_t ram_reserve_ = 0;
+    bool ram_trim_             = false; // an automatic Host tier trims once after the start
+    // While requests run, the earliest time the next retired expert chunk may be page-locked again (maintain_ram).
+    static constexpr std::chrono::seconds kChunkGrowthSpacing{2};
+    Clock::time_point ram_next_chunk_growth_{};
     // The growth so far of the pieces the monitor asks for one after another (maintain_ram logs it once they stop).
     std::uint64_t ram_grown_prefix_ = 0, ram_grown_experts_ = 0;
     std::uint64_t next_capture_ = 0;

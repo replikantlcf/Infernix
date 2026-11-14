@@ -466,6 +466,8 @@ public:
     }
     [[nodiscard]] std::optional<runtime::prefix_cache::PersistResult> save_hybrid_cache_now(const CancellationView& abandoned);
     [[nodiscard]] MemorySummary memory_summary() const noexcept;
+    // RuntimeStats::memory (Program::memory_usage).
+    [[nodiscard]] MemoryUsage memory_usage() const noexcept;
     void reset_memory_peaks() noexcept;
 
     const execution::Parameters& parameters;
@@ -539,6 +541,12 @@ public:
     const bool use_cuda_graph;
     const bool causal_scoring;
     const std::size_t kv_payload_bytes;
+    // The persistent arena's parts by use (PersistentLayout::kv_bytes, state_image_bytes, drafter_bytes).
+    const std::size_t persistent_kv_bytes;
+    const std::size_t persistent_state_image_bytes;
+    const std::size_t persistent_drafter_bytes;
+    // The device bytes of the speculative drafter's own weights (MTP's or DFlash's), within the weights' arena.
+    const std::uint64_t drafter_weight_bytes;
     const std::size_t graph_allowance_bytes;
     // Free Device memory CUDA Graph preparation consumed at startup (instantiate, upload and one
     // launch of every executable), for comparison with graph_allowance_bytes.
@@ -921,15 +929,40 @@ public:
     std::optional<runtime::prefix_cache::PersistResult> hybrid_shutdown_save_;
 
     // ---- RAM pressure (Program::start_ram_resize): the monitor and the engine's diagnostic sink -------------------
+    // Declared after the prefix cache and the offloaded experts, so its threads (the monitor and the worker running the
+    // tiers' memory jobs) stop first.
     std::unique_ptr<runtime::expert_offload::RamMonitor> ram_;
     std::function<void(const std::string&, DiagnosticLevel)> ram_diagnostic_;
+    // The resize under way: a release or a growth, the reading that asked for it, and what each tier gave back or took
+    // back so far.
+    struct RamResize {
+        bool release           = false;
+        bool trim              = false; // the start's trim (trim_host_tier)
+        std::uint64_t asked_at = 0;
+        std::uint64_t prefix = 0, experts = 0;
+    };
+    std::optional<RamResize> ram_resize_;
+    std::uint64_t ram_reserve_ = 0;
+    bool ram_trim_             = false; // an automatic Host tier trims once after the start
+    bool trim_host_tier(HostMemoryWorker& worker);
+    // While requests run, the earliest time the next retired expert chunk may be page-locked again (maintain_ram).
+    static constexpr std::chrono::seconds kChunkGrowthSpacing{2};
+    std::chrono::steady_clock::time_point ram_next_chunk_growth_{};
     // The growth so far of the pieces the monitor asks for one after another (logged once they stop).
     std::uint64_t ram_grown_prefix_ = 0, ram_grown_experts_ = 0;
-    // Between requests: the resize the monitor finds due, applied to the prefix cache's Host tier, then (a release past
-    // it, a growth before it) to the offloaded experts' SSD tier.
-    void maintain_ram();
-    // The offloaded experts' SSD tier (null without one), and what the RAM tiers could give back and take back now.
+    // Idle (`idle`) or between rounds while requests run: advances the resize under way and starts the one the monitor
+    // finds due, the prefix cache's Host tier first for a release and the offloaded experts' SSD tier first for a
+    // growth (Program::maintain_busy).
+    void maintain_ram(bool idle);
+    void report_ram(bool release, std::uint64_t available, std::uint64_t prefix, std::uint64_t experts);
+    // The offloaded experts' SSD tier (null without one), the same when it may resize now (no binding open, the
+    // deferred round settled, no prompt stream, and the landed promotions published with none queued), and what the
+    // RAM tiers could give back and take back now.
     [[nodiscard]] runtime::expert_offload::HostExpertTier* ram_expert_tier() noexcept;
+    [[nodiscard]] runtime::expert_offload::HostExpertTier* quiet_expert_tier();
+    // The same when a landed growth may be linked: no binding and no round open (linking only adds empty slots and
+    // records, which no promotion, stream or transfer in flight touches).
+    [[nodiscard]] runtime::expert_offload::HostExpertTier* closed_expert_tier();
     [[nodiscard]] std::uint64_t ram_shrinkable();
     [[nodiscard]] std::uint64_t ram_growable();
     std::uint64_t hybrid_saved_writes_ = 0; // host_write_bytes at the last save or load

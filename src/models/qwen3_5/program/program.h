@@ -178,7 +178,7 @@ struct HybridPrefixCacheStats {
     std::uint32_t snapshots                  = 0;
     std::uint32_t device_resident_blocks     = 0;
     std::uint32_t device_evictable_blocks    = 0;
-    std::uint32_t host_slabs                 = 0;
+    std::uint32_t host_slabs                 = 0; // Host-tier slabs in service now (a RAM release or growth moves it)
     std::uint32_t host_free_slabs            = 0;
     std::uint64_t host_slab_bytes            = 0;
     std::uint32_t free_device_snapshot_slots = 0;
@@ -439,12 +439,18 @@ public:
     // and the expert state is saved every ten minutes of rounds; the cache's monitor asks for this
     // through the waker, from its own thread, and the Engine calls maintain() under its execution lock.
     void maintain();
+    // Between rounds while requests run, when a waker asked (runtime/contract/program.h): the RAM tiers' resize
+    // advances or starts (--ram-resize auto); nothing else outside rounds runs here.
+    void maintain_busy();
     void set_maintenance_waker(std::function<void()> waker);
     // RAM pressure (EngineOptions::ram_resize, runtime::expert_offload::RamMonitor): starts the monitor under which
-    // maintain() shrinks the prefix cache's Host tier while the OS runs short and grows it back once more than
-    // `reserve_bytes` plus a step stays free, reporting each resize to `diagnostic`. A no-op without a Host tier.
+    // maintain() and maintain_busy() shrink the prefix cache's Host tier and the offloaded experts' SSD tier while the
+    // OS runs short (less than max(reserve_bytes / 2, 2 GiB) available) and grow them back once more than the reserve
+    // plus a step stays free, reporting each resize to `diagnostic`. `trim_host_tier` (an automatic Host tier): the first
+    // maintenance after the start gives back what keeps less than the reserve available. A no-op without a RAM tier.
     // Before the Engine sets its maintenance waker.
-    void start_ram_resize(std::uint64_t reserve_bytes, std::function<void(const std::string&, DiagnosticLevel)> diagnostic);
+    void start_ram_resize(std::uint64_t reserve_bytes, bool trim_host_tier,
+                          std::function<void(const std::string&, DiagnosticLevel)> diagnostic);
     // Offloaded experts: the logical CPUs the Engine's round thread runs on, a core the CPU expert team
     // leaves free (runtime::expert_offload::CpuPlacement::engine); 0 (unpinned) otherwise.
     [[nodiscard]] std::uint64_t engine_thread_cpus() const noexcept;
@@ -509,6 +515,10 @@ public:
     // With offloaded experts: the VRAM expert cache's counters since startup and its size now
     // (RuntimeStats::expert_cache); nothing otherwise.
     [[nodiscard]] std::optional<ExpertCacheTotals> expert_cache_totals() const noexcept;
+    // What the device, host and SSD hold now, by use, and with offloaded experts the headroom their frames' sizing
+    // kept free (RuntimeStats::memory; the prefix cache's Host and SSD tiers, and otherwise the headroom, are the
+    // Engine's to fill). Engine thread, between units; with every stats publication, so O(1).
+    [[nodiscard]] MemoryUsage memory_usage() const noexcept;
     void reset_memory_peaks() noexcept;
 private:
     explicit Program(std::unique_ptr<detail::ProgramImpl> impl) noexcept;

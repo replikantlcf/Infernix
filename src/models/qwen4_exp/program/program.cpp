@@ -30,6 +30,7 @@ const ProgramDevicePlan& Program::device_plan() const noexcept { return impl_->d
 const VramSizing& Program::vram_sizing() const noexcept { return impl_->vram_sizing(); }
 ExpertRamFill Program::expert_ram_fill() const noexcept { return impl_->expert_ram_fill(); }
 std::optional<ExpertCacheTotals> Program::expert_cache_totals() const noexcept { return impl_->expert_cache_totals(); }
+MemoryUsage Program::memory_usage() const noexcept { return impl_->memory_usage(); }
 
 void Program::set_maintenance_waker(std::function<void()> waker) { impl_->set_maintenance_waker(std::move(waker)); }
 
@@ -42,11 +43,16 @@ void Program::maintain() {
     impl_->settle_deferred();
     impl_->apply_vram_target(true);
     impl_->maintain_expert_state();
-    impl_->maintain_ram();
+    impl_->maintain_ram(true);
     impl_->maintain_storage();
 }
 
-void Program::start_ram_resize(std::uint64_t reserve_bytes) { impl_->start_ram_resize(reserve_bytes); }
+// It settles a deferred round only when the SSD expert tier resizes (ProgramImpl::quiet_expert_tier).
+void Program::maintain_busy() { impl_->maintain_ram(false); }
+
+void Program::start_ram_resize(std::uint64_t reserve_bytes, bool trim_host_tier) {
+    impl_->start_ram_resize(reserve_bytes, trim_host_tier);
+}
 
 HybridPrefixCacheStats Program::hybrid_stats() const noexcept { return impl_->prefix_stats(); }
 

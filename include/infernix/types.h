@@ -27,14 +27,16 @@ inline constexpr std::size_t kMaximumPromptMediaBytes = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes  = 1ULL << 30;
 inline constexpr std::size_t kDefaultMediaLiveBytes   = 2ULL << 30;
 // Physical Host memory Infernix leaves free for the OS and other programs after its weights, experts,
-// n-gram table and caches, when --ram-free-mib is not given (8 GiB since 2026-10-26: with 2 GiB a desktop paged
-// once Qwen3.8-Flash-Next's experts and n-gram table took the rest; Basalt's RAM-low guard sits at ~8.3 GiB).
-inline constexpr std::uint64_t kDefaultRamFreeBytes = 8ULL << 30;
+// n-gram table and caches, when --ram-free-mib is not given: 4 GiB since 2026-11-13 (the owner's choice, once the RAM
+// plans counted the CUDA kernel images, 4.5 GiB they had missed, so that the 8 GiB reserve of before actually stayed
+// free); 8 GiB from 2026-10-26 (with 2 GiB a desktop paged once Qwen3.8-Flash-Next's experts and n-gram table took the
+// rest, which the missed images made 2.4-3.8 GiB less than planned).
+inline constexpr std::uint64_t kDefaultRamFreeBytes = 4ULL << 30;
 // Prompt-attention split workspace when --prefill-split-workspace-mib is not given.
 inline constexpr std::uint32_t kDefaultPrefillSplitWorkspaceMiB = 256;
 inline constexpr std::uint32_t kMaximumPrefillSplitWorkspaceMiB = 16384;
-// Pinned Host slab pool of the hybrid prefix cache when --host-context-mib is not given, for every
-// architecture.
+// Pinned Host slab pool of a Qwen3.5 Program planned without the Engine and without a size (tests and
+// tools that build a Program directly). The Engine always resolves the size (ContextCacheOptions).
 inline constexpr std::size_t kDefaultHybridHostCacheBytes = 8ULL << 30;
 // How long the prefix cache holds a conversation's state after a reply ending in a tool call,
 // when --cache-tool-hold-secs is not given (Qwen3.5): longer than most tools take to run.
@@ -573,9 +575,8 @@ private:
 enum class HybridHostStatePrecision : std::uint8_t { Fp32, Fp24, Bf16 };
 
 // Prefix-cache tuning. Every field is optional: Engine construction derives the unset ones from
-// max_concurrency, prefill_chunk and whether a Host tier exists (host_capacity_bytes, default
-// kDefaultHybridHostCacheBytes, 0 disables it), and Engine::options() reports the effective
-// values.
+// max_concurrency, prefill_chunk and whether a Host tier exists (ContextCacheOptions::host_capacity_bytes,
+// sized automatically when unset, 0 disables it), and Engine::options() reports the effective values.
 struct HybridPrefixCacheOptions {
     // Device StateImage slots holding inactive snapshots (and tap/endpoint staging). Total Device
     // StateImage capacity is max_concurrency + device_snapshot_slots. Default: one per request
@@ -629,15 +630,12 @@ struct ContextCacheOptions {
     // root and a preempted request recovers by Replay, as it does with the cache on.
     bool enabled = true;
     HybridPrefixCacheOptions hybrid;
-    // The pinned Host slab pool that cached KV blocks and state snapshots share (default
-    // kDefaultHybridHostCacheBytes, 0 disables the Host tier; 0 when the cache is disabled). This
-    // does not bound total process RAM. Engine::options() returns the resolved capacity.
+    // The pinned Host slab pool that cached KV blocks and state snapshots share (0 disables the Host tier;
+    // 0 when the cache is disabled). This does not bound total process RAM. Unset (the default,
+    // --host-context-mib auto): the Engine gives it all the RAM the model's own plan (the experts and the n-gram
+    // table first) leaves beyond ram_free_bytes, within what the process may still page-lock, in 256 MiB steps
+    // and at least 1 GiB (runtime/engine/expert_memory.h). Engine::options() reports the resolved size.
     std::optional<std::size_t> host_capacity_bytes;
-    // --host-context-mib auto (host_capacity_bytes unset): Qwen3.8-Flash-Next sizes the Host tier after its
-    // experts and n-gram table from the RAM they leave beyond ram_free_bytes, min(8 GiB, 0.4 x left) in 256 MiB
-    // steps and at least 1 GiB (after Strata v0.2.6's rule); other models take kDefaultHybridHostCacheBytes.
-    // Engine::options() reports the resolved size in host_capacity_bytes.
-    bool host_capacity_auto = false;
     // The SSD tier below the Host tier (docs/maintainer/hybrid-prefix-cache-spec.md §5.7): a scratch
     // file of ssd_capacity_bytes (rounded down to whole Host slabs) created in ssd_directory at startup,
     // read and written unbuffered, and removed when the process ends. 0 (the default) disables it; it
@@ -856,10 +854,11 @@ struct EngineOptions {
     // that would take it, the n-gram table goes to RAM only beside it, and an automatic Host tier sizes from
     // what is left beyond it.
     std::uint64_t ram_free_bytes = kDefaultRamFreeBytes;
-    // --ram-resize auto|off: between requests the RAM tiers (the prefix cache's Host tier; the expert tier's slots
-    // and records) give memory back while less than 2 GiB of physical memory is available, and take it back in
-    // pieces, up to their startup sizes, once more than ram_free_bytes (at least 3 GiB) plus 1 GiB has stayed
-    // available for 10 s (runtime::expert_offload::RamMonitor). Off: every tier keeps its startup size.
+    // --ram-resize auto|off: the RAM tiers (the prefix cache's Host tier; the expert tier's slots and records) give
+    // memory back, while requests run as well as between them, once less than max(ram_free_bytes / 2, 2 GiB) of
+    // physical memory is available, until ram_free_bytes (at least a GiB more) is again, and take it back in pieces,
+    // up to their startup sizes, once more than that plus 1 GiB has stayed available for 10 s
+    // (runtime::expert_offload::RamMonitor). Off: every tier keeps its startup size.
     bool ram_resize = true;
     // Qwen3.8-Flash-Next (--expert-ram-mib): at most this much Host RAM for the routed experts.
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
@@ -2042,6 +2041,53 @@ struct ExpertCacheMemorySummary {
     std::uint64_t kv_backed_bytes   = 0;
 };
 
+// The memory a Program holds now, by category (RuntimeStats::memory; serving.md, the JSON telemetry's `memory`).
+// Each figure is what is allocated (reserved, which is what the OS counts as used); the `*_used` figures are the
+// occupied share inside a part. The parts of one kind never overlap. The CUDA context, the driver's own allocations
+// and buffers no part names are not counted: the process's own usage less the parts.
+struct MemoryUsage {
+    struct Device {
+        std::uint64_t weights       = 0; // the model's device weights, the drafter's excepted
+        std::uint64_t drafter       = 0; // a separate drafter's weights, and the drafters' columns, rings and pools
+        std::uint64_t experts       = 0; // the VRAM expert cache's frames that hold experts
+        std::uint32_t expert_frames = 0;
+        std::uint64_t kv            = 0; // the KV cache's backed pages and tables, less `prefix`'s pages
+        std::uint64_t kv_used       = 0; // of them, pages holding requests' tokens
+        std::uint64_t state         = 0; // recurrent (GDN) state, per-request rows and records, call inputs and outputs
+        std::uint64_t prefix        = 0; // the prefix cache's device snapshots and the KV pages only it holds
+        std::uint64_t workspace     = 0; // activation workspace, with frames the expert cache lends to prefill and vision
+        std::uint64_t cuda_graphs   = 0; // CUDA Graph executables (measured when they were prepared)
+        std::uint64_t staging       = 0; // copy staging and tables (expert misses, the expert cache's tables)
+    } device;
+    struct Host {
+        std::uint64_t experts        = 0; // expert records in RAM
+        std::uint64_t expert_records = 0;
+        std::uint64_t prefix         = 0; // the prefix cache's Host tier
+        std::uint64_t prefix_used    = 0; // of it, slabs holding entries
+        std::uint64_t weights        = 0; // weights kept in RAM (pinned mirrors and escapes, the embedding, a vision tower)
+        std::uint64_t ngram          = 0; // the n-gram table in RAM, or its row cache
+        std::uint64_t staging        = 0; // pinned staging buffers
+    } host;
+    struct Ssd {
+        std::uint64_t prefix         = 0; // the prefix cache's SSD tier file
+        std::uint64_t prefix_used    = 0;
+        std::uint64_t experts        = 0; // expert records read from the artifact on use (not in RAM)
+        std::uint64_t expert_records = 0;
+    } ssd;
+    std::uint64_t vram_headroom = 0; // device memory the Engine keeps free for the display and other programs
+};
+
+// One reading of the Engine's device memory (Engine::device_memory): the card's total and free bytes (cudaMemGetInfo;
+// under a Windows video-memory budget past it, or with several devices, the budget less this process's use) and,
+// where the OS reports them (Windows WDDM, WSL2), this process's own use of the device's memory and of the system
+// memory it page-locked for the device.
+struct DeviceMemoryReading {
+    std::uint64_t total_bytes = 0;
+    std::uint64_t free_bytes  = 0;
+    std::optional<std::uint64_t> process_bytes;
+    std::optional<std::uint64_t> process_pinned_bytes;
+};
+
 struct MemorySummary {
     int device                                = 0;
     std::uint32_t max_context                 = 0;
@@ -2276,6 +2322,9 @@ struct RuntimeStats {
     // The VRAM expert cache of an offloaded-expert model (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B);
     // absent otherwise.
     std::optional<ExpertCacheTotals> expert_cache;
+
+    // What the Program holds now, by category (MemoryUsage).
+    MemoryUsage memory;
 
     // The prefix cache; zero when it is disabled. Block and snapshot gauges are absolute; the
     // rest are cumulative event counters.

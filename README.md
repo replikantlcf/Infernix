@@ -567,13 +567,13 @@ infernix-serve.exe Huihui-Qwen3.8-Flash-Next-abliterated-FP4-Local-Infernix-0000
 Qwen3.8-27B on a 32 GB RTX 5090:
 
 ```bat
-infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --host-context-mib 52000 --prefill-chunk 4096 --kv-capacity auto --tolerant-tool-calls
+infernix-serve.exe qwen3_8_27b_nvfp4-nvidia.ninfer --max-context 240000 --max-concurrency 2 --spec dflash2 --draft-tokens auto --lm-head-draft --ngram-draft-tokens auto --kv-dtype int8 --preserve-thinking --prefill-chunk 4096 --kv-capacity auto --tolerant-tool-calls
 ```
 
 Ornith-1.5-122B (experts in about 70 GiB of RAM; [guide](docs/qwen3_5-122b.md)):
 
 ```bat
-infernix-serve.exe Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix --max-context 262144 --max-concurrency 2 --kv-dtype int8 --spec mtp --draft-tokens auto --host-context-mib 4096
+infernix-serve.exe Ornith-1.5-122B-NVFP4-Infernix-00001-of-00003.infernix --max-context 262144 --max-concurrency 2 --kv-dtype int8 --spec mtp --draft-tokens auto
 ```
 
 The uncensored conversion (`Ornith-1.5-122B-UNCENSORED-NVFP4-Infernix-00001-of-00003.infernix`) takes the same
@@ -628,6 +628,11 @@ cmake --build build -j
 The server is `build/apps/infernix-serve`, with the same options, and the launcher
 `build/apps/infernix-launcher`. Under WSL2 use the Windows NVIDIA
 driver (install none inside WSL) and copy models into the Linux filesystem; `/mnt/` reads are slow.
+Ubuntu 24.04's FFmpeg (6.1) decodes every image format but animated WebP, which needs FFmpeg 8; an
+animated WebP sent to such a build is refused with a message saying so. Under WSL2 Infernix plans RAM
+against the Linux VM's memory (`.wslconfig`'s `memory=`), which Windows cannot see it use: an
+automatic Host prefix cache fills the VM down to `--ram-free-mib` (on a 96 GB machine with an 88 GiB VM,
+the 27B pinned 75 GiB), so keep the VM's limit below what Windows can spare or set `--host-context-mib`.
 
 The [`Dockerfile`](Dockerfile) builds the same server in a CUDA 13.4 image for Docker or Podman, with
 the NVIDIA Container Toolkit installed on the host. Mount the folder that holds the model and

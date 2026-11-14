@@ -7,7 +7,9 @@ stops the current `infernix-serve`, starts the requested model with its saved co
 forwards the request to it, as LM Studio does.
 
 The launcher runs no inference itself. It supervises one `infernix-serve` process at a time on a
-private loopback port and relays requests and streamed answers to it.
+private loopback port and relays requests and streamed answers to it. The server never outlives
+the launcher: if the launcher ends without stopping it (a crash, a forced kill), the system ends
+the server too, on Windows and Linux, so it does not keep holding the GPU.
 
 ## Start
 
@@ -103,6 +105,18 @@ One page, top to bottom:
   85 and 95 °C, GPU temperature at 80 and 90 °C, and RAM when less than 4 GiB and 2 GiB are
   available (how full it is says little: models with offloaded experts fill it on purpose). A
   temperature past its limit is also named beside **All gauges** while its dial is not shown.
+- **Memory**: what the loaded `infernix-serve` holds, as one bar for VRAM and one for RAM: its
+  parts (model weights, the drafter, experts with their count, the KV cache, model state, the prefix
+  cache, workspace, CUDA graphs, staging, the n-gram table), then **Infernix other** (its memory no
+  part names: the CUDA context, the driver, heaps), **Other processes** and **Free**, beside which
+  VRAM shows what the server keeps free for the display (its headroom). The KV cache and the prefix
+  cache are drawn faint, with the share holding tokens or entries solid. While the server uses an SSD
+  tier (an SSD prefix cache, or experts read from the artifact on the SSD), each part on the SSD is
+  listed with its size. A part keeps its colour in every bar; hovering one gives its exact size and
+  what it is. The parts come from `memory` in the server's `/metrics?format=json`
+  ([serving](serving.md#json-representation)), as do the free VRAM and RAM the other programs' share
+  follows from (the server's own readings, which its headroom and reserve are kept against); an older
+  `infernix-serve` reports no parts, and the panel says so. Under WSL2 RAM is the Linux VM's.
 - **Inference statistics**: the same figures as `infernix-serve`'s console panel, over the last ten
   requests and the whole session of the loaded model: requests, time to first token, prompt-cache hit
   rate, prefill and decode tok/s, mean decode batch, drafter acceptance and accepted tokens per
@@ -222,9 +236,12 @@ Defaults per family (README "Recommended settings per model"):
 |---|---|
 | all | `--max-concurrency 2 --kv-dtype int8 --preserve-thinking --tolerant-tool-calls --pending-timeout-ms 900000`, and `--spec auto --draft-tokens auto` when a drafter is available |
 | Qwen3.8-Flash-Next | `--max-context 262144 --lm-head-draft`, the best DFlash2 drafter found (`--draft-model`) and n-gram volume (`--ngram-volume`, unless `<artifact>.ngram` exists) |
-| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096`, `--host-context-mib` 55 % of RAM up to 52000, and the `--max-context` that fits beside the artifact in the GPU's memory (below) |
+| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096`, and the `--max-context` that fits beside the artifact in the GPU's memory (below) |
 | Qwen3.6-27B, Qwen3.6-35B-A3B | `--lm-head-draft` where the artifact has a proposal head; the 27B's context as for Qwen3.8-27B |
-| Qwen3.5-122B-A10B | `--max-context 262144 --host-context-mib 4096` (the experts take the RAM) |
+| Qwen3.5-122B-A10B | `--max-context 262144` |
+
+No family sets `--host-context-mib`: `infernix-serve`'s default (`auto`) gives the Host prefix cache all the RAM
+the model and its experts leave beyond `--ram-free-mib` ([serving guide](serving.md)).
 
 A 27B keeps all of its KV cache on the GPU, so its context is what the GPU holds beside the
 weights: the launcher reckons 2.03 GB plus 33,792 bytes per token of context (measured with INT8 KV,
@@ -551,12 +568,15 @@ the model folders; only its header is read) and requests get plausible figures o
 the chat (thinking, prompt progress, timings) and the usage page, and **Will it fit?** gets a plan
 that fits up to 225,280 tokens of context. It crashes, locks up or stalls on request (`POST
 /fake/crash`, `/fake/hang`, `/fake/stall` on its own port) and fails or overfills its load with
-`--fake-fail-load TEXT` and `--fake-hog-mib N` in the model's parameters. Its own `--help` lists a
+`--fake-fail-load TEXT` and `--fake-hog-mib N` in the model's parameters; `--fake-experts` there
+makes it an offloaded-expert model (an expert cache, experts in RAM and an SSD tier on the
+dashboard's **Memory**) and `--fake-no-memory` a server too old to report its memory. Its own
+`--help` lists a
 dozen options, and the Configure form shows a control only for an option the server lists: set
 `INFERNIX_FAKE_SERVE_HELP` to a text file holding a real `infernix-serve --help` and it prints that
 instead, so the form shows every control.
 [`tools/launcher/launcher_check.py`](../tools/launcher/launcher_check.py) runs a launcher against it
-and checks the features (configurations, model ids, environment, script export and import, the fit
-plan, keep-alive streams, routes and the pin, prompt progress, usage, API keys and sign-in, chats,
-idle unload) and the watchdog, the event log and the request log, and, on Windows, that a launcher
+and checks the features (configurations, model ids, environment, the memory breakdown, script export
+and import, the fit plan, keep-alive streams, routes and the pin, prompt progress, usage, API keys
+and sign-in, chats, idle unload) and the watchdog, the event log and the request log, and, on Windows, that a launcher
 started on a console without a window still stops its server in order.

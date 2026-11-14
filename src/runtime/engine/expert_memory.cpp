@@ -1,6 +1,7 @@
 #include "runtime/engine/expert_memory.h"
 
 #include "core/host_memory.h"
+#include "infernix/ops/kernel_images.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -38,6 +39,9 @@ expert_offload::HostMemoryDemand expert_ram_demand(const EngineOptions& options,
     // The prefix cache pins its whole Host tier at startup, beside the experts.
     demand.prefix_cache = prefix_cache_bytes;
     demand.load_staging = kLoadStagingBytes;
+    // A start has read the kernel images into RAM before planning (load_kernel_images); Engine::plan has not, and
+    // counts them as the process's growth.
+    demand.process_growth = expert_offload::kLedgerGiB + ops::kernel_images_pending_bytes();
     demand.expert_cap   = options.expert_ram_bytes;
     // Windows page-locks memory for the GPU only up to the adapter's shared system memory; the
     // experts past that stay in RAM unpinned (the SSD tier's unpinned records).
@@ -51,9 +55,30 @@ std::uint64_t ledger_left_bytes(const expert_offload::HostMemoryLedger& ledger) 
     return ledger.snapshot.available_physical > used ? ledger.snapshot.available_physical - used : 0;
 }
 
-std::uint64_t auto_host_context_bytes(std::uint64_t left_bytes) noexcept {
-    constexpr std::uint64_t kCap = 8ULL << 30, kStep = 256ULL << 20;
-    return std::max(kMinAutoHostContextBytes, std::min(kCap, left_bytes / 5 * 2) / kStep * kStep);
+std::uint64_t frontend_cache_bytes(const EngineOptions& options) noexcept {
+    return options.grammar_cache_bytes + options.speculative.ngram_archive_bytes +
+           (options.enable_vision ? options.media_cache_bytes + options.media_live_bytes : 0U);
+}
+
+std::optional<std::uint64_t> ledger_pin_left_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept {
+    const expert_offload::HostMemoryDemand& demand = ledger.demand;
+    if (!demand.pin_room) { return std::nullopt; }
+    const std::uint64_t others = demand.other_pinned + demand.later_pinned + demand.prefix_cache;
+    const std::uint64_t pinned =
+        others + static_cast<std::uint64_t>(static_cast<double>(others) * demand.lock_overhead) + 1 + ledger.expert_pinned;
+    return *demand.pin_room > pinned ? *demand.pin_room - pinned : 0;
+}
+
+std::uint64_t auto_host_context_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept {
+    constexpr std::uint64_t kStep = 256ULL << 20;
+    // Physical memory, and the commit limit (a small page file), each beyond the reserve and the plan.
+    const std::uint64_t used        = ledger.demand.reserve + ledger.planned + ledger.expert_ram;
+    const std::uint64_t commit_left = ledger.snapshot.available_commit > used ? ledger.snapshot.available_commit - used : 0;
+    std::uint64_t left              = std::min(ledger_left_bytes(ledger), commit_left);
+    if (const auto pin_left = ledger_pin_left_bytes(ledger)) { left = std::min(left, *pin_left); }
+    // The tier is pinned: its lock overhead comes out of the same room.
+    const auto bytes = static_cast<std::uint64_t>(static_cast<double>(left) / (1.0 + ledger.demand.lock_overhead));
+    return std::max(kMinAutoHostContextBytes, bytes / kStep * kStep);
 }
 
 ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,

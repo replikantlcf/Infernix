@@ -6,8 +6,9 @@ Runs on Windows and Linux. <dir> holds at least one supported artifact (only its
 nothing in it is changed). Each group starts its own launcher with its memory and logs in a fresh
 temporary folder (printed; removed afterwards unless --keep).
 
-features: model ids, named configurations, environment, script export and import, the fit plan,
-          keep-alive streams while a model loads (OpenAI and Anthropic, and a failed load), model
+features: model ids, named configurations, environment, the memory breakdown, script export and
+          import, the fit plan, keep-alive streams while a model loads (OpenAI and Anthropic, a
+          failed load, and the server's error answer after the load), model
           routes and the pin, prompt progress, request labels, usage, API keys and sign-in, chats,
           and a configuration's idle unload (about four minutes).
 watchdog: crash, lock-up, stall, the restart limit, idle servers, loads that do not fit, the RAM
@@ -367,6 +368,21 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         last = activity(port)[-1]
         check("...routed by its name", last["routed_by"] == "name" and last["model_key"] == named_id, str(last)[:160])
 
+    with section("Memory breakdown"):
+        # The server's memory by part reaches the dashboard unchanged (the stand-in reports a dense model's).
+        def memory() -> dict | None:
+            status, metrics = call(port, "GET", "/launcher/api/metrics")
+            return metrics.get("memory") if status == 200 and isinstance(metrics, dict) else None
+
+        held = wait_for(memory, 10) or {}
+        device = held.get("device") or {}
+        parts = device.get("parts") or []
+        keys = [part.get("key") for part in parts]
+        check("/launcher/api/metrics carries the server's memory by part",
+              {"weights", "kv_cache", "workspace", "cuda_graphs"} <= set(keys) and device.get("total_bytes", 0) > 0
+              and (device.get("process_bytes") or 0) >= sum(part.get("bytes", 0) for part in parts)
+              and bool((held.get("host") or {}).get("parts")) and "ssd" in held and held["ssd"] is None, str(keys))
+
     with section("Script export and import, both shells"):
         # Script export and import, both shells.
         for shell in ("cmd", "sh"):
@@ -448,6 +464,15 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         served += "message_stop" in text
         check("an Anthropic stream gets ping events while it loads", status == 200 and "event: ping" in text and
               text.index("event: ping") < text.find("message_start") and "message_stop" in text, text[:160])
+        # The server answers a stream that waited for the load with a JSON error (it refuses compaction): the
+        # error event carries the server's message, not only its status.
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+        status, kind, headers_at, pieces = stream(port, "/v1/responses/compact",
+                                                  {"model": "fake-main", "input": "hello", "stream": True})
+        text = "".join(piece for _, piece in pieces)
+        check("a server's error answer to a stream that waited for the load keeps its message",
+              status == 200 and '"error"' in text and "compaction is not supported" in text, text[:200])
         call(port, "PUT", f"{cfg}/config", {"args": base + ["--fake-load-ms", "300", "--fake-fail-load",
                                                                "cudaMalloc failed: out of memory"]})
         call(port, "POST", "/launcher/api/unload", {})
