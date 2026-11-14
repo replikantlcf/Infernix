@@ -135,6 +135,37 @@ jobs:
             & "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\dumpbin.exe" /dependents $exe
           }
 #####
+      - name: Stage runtime DLLs for smoke test (skip existing)
+        shell: pwsh
+        run: |
+          $vcpkgBin   = "${{ github.workspace }}\vcpkg\installed\x64-windows\bin"
+          $targetDir  = "$env:BUILD_DIR\apps\Release"
+
+          if (-not (Test-Path $vcpkgBin)) {
+            Write-Warning "vcpkg bin directory not found: $vcpkgBin"
+            exit 0
+          }
+          if (-not (Test-Path $targetDir)) {
+            New-Item -ItemType Directory -Force -Path $targetDir | Out-Null
+          }
+
+          $copied  = 0
+          $skipped = 0
+
+          Get-ChildItem -Path $vcpkgBin -Filter "*.dll" -File | ForEach-Object {
+            $dest = Join-Path $targetDir $_.Name
+            if (-not (Test-Path $dest)) {
+              Copy-Item -Path $_.FullName -Destination $dest
+              Write-Host "  + $($_.Name)"
+              $copied++
+            } else {
+              Write-Host "  = $($_.Name) (already present, skipped)"
+              $skipped++
+            }
+          }
+
+          Write-Host "Staged runtime DLLs: copied=$copied, skipped(existing)=$skipped"
+#####
 
       - name: Smoke test (infernix-serve.exe --help, with timeout)
         continue-on-error: true
