@@ -73,21 +73,29 @@ jobs:
             --triplet x64-windows
 
 #####
-      - name: Fix zlib library name mismatch (z.lib vs zlib.lib)
+      - name: Temp fix zlib library name mismatch (z.lib vs zlib.lib)
         shell: pwsh
         run: |
-          $zlibPath = "${{ env.VCPKG_ROOT }}\installed\x64-windows\lib\zlib.lib"
-          $targetPath = "${{ env.VCPKG_ROOT }}\installed\x64-windows\lib\z.lib"
+          $vcpkgLibDir = "${{ github.workspace }}\vcpkg\installed\x64-windows\lib"
+          $zlibPath = Join-Path $vcpkgLibDir "zlib.lib"
+          $targetPath = Join-Path $vcpkgLibDir "z.lib"
+
+          Write-Host "Looking for zlib.lib at: $zlibPath"
+          Write-Host "Will create z.lib at: $targetPath"
 
           if (Test-Path $zlibPath) {
             if (-not (Test-Path $targetPath)) {
               Copy-Item -Path $zlibPath -Destination $targetPath
-              Write-Host "Copied 'zlib.lib' to 'z.lib' to satisfy FFmpeg's linker requirements."
+              Write-Host "Successfully copied 'zlib.lib' to 'z.lib'."
             } else {
               Write-Host "'z.lib' already exists. No action needed."
             }
           } else {
-            Write-Host "Warning: Source file '$zlibPath' not found. Skipping copy."
+            # Если файл не найден, показываем содержимое папки для диагностики
+            Write-Host "ERROR: Source file '$zlibPath' not found."
+            Write-Host "Contents of lib directory:"
+            Get-ChildItem -Path $vcpkgLibDir -Filter "z*" | Format-Table Name, Length
+            exit 1 # Завершаем с ошибкой, чтобы не продолжать заведомо провальную сборку
           }
 #####
       - name: Configure CMake
