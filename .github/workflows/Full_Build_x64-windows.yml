@@ -126,6 +126,15 @@ jobs:
         shell: pwsh
         run: |
           cmake --build $env:BUILD_DIR --config Release --parallel
+#####
+      - name: Show dependencies of infernix-serve.exe (diagnostic)
+        shell: pwsh
+        run: |
+          $exe = "$env:BUILD_DIR\apps\Release\infernix-serve.exe"
+          if (Test-Path $exe) {
+            & "C:\Program Files\Microsoft Visual Studio\18\Enterprise\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64\dumpbin.exe" /dependents $exe
+          }
+#####
 
       - name: Smoke test (infernix-serve.exe --help, with timeout)
         continue-on-error: true
