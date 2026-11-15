@@ -365,6 +365,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.route_trace_path        = options.route_trace;
     engine_options.device                   = options.device;
     engine_options.max_context              = options.max_context;
+    engine_options.max_context_auto         = options.max_context_auto;
     engine_options.rope_yarn_factor          = options.rope_yarn_factor;
     engine_options.kv_capacity              = options.kv_capacity;
     engine_options.vram_headroom_bytes      = options.vram_headroom_bytes;
@@ -414,14 +415,11 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     : options_(std::move(options)) {
     engine_ = std::make_unique<infernix::Engine>(
         make_engine_options(options_, std::move(startup_observer), std::move(diagnostic_observer)));
-    if (!options_.request_log_jsonl.empty()) {
-        // The bytes, not the validated text: a window starts and ends on a token, so its first and
-        // last character are usually cut, and the tracker replaces those bytes itself.
-        prefix_misses_ = std::make_unique<PrefixMissTracker>(
-            [engine = engine_.get()](std::span<const infernix::TokenId> ids) {
-                return engine->detokenize_bytes(ids);
-            });
-    }
+    // The bytes, not the validated text: a window starts and ends on a token, so its first and last
+    // character are usually cut, and the tracker replaces those bytes itself. Always kept: the
+    // `req#N done` line names a miss's kind, the request JSONL carries the whole record.
+    prefix_misses_ = std::make_unique<PrefixMissTracker>(
+        [engine = engine_.get()](std::span<const infernix::TokenId> ids) { return engine->detokenize_bytes(ids); });
     request_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(

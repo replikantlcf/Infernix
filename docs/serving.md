@@ -178,6 +178,7 @@ What is exact and what is estimated (`estimated` is always `true`):
 | `GET /health` | Engine readiness |
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
 | `GET /metrics?format=json` | JSON snapshot: engine identity, live gauges, totals, and the last 128 terminal requests (`Accept: application/json` also selects it) |
+| `GET /monitor` | each request the Engine holds now: phase, lane, service turn, recovery and progress ([Request monitor](#request-monitor)) |
 | `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and llama.cpp-compatible `meta` and `chat_template_caps` objects |
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -919,14 +920,17 @@ finish-reason chunk and `[DONE]` (Responses `response.incomplete`, Anthropic `me
 
 A failure after the stream has started is sent as OpenAI does: one unnamed `data:` event whose
 payload is the usual error body (`{"error": {...}}`, which OpenAI SDKs raise as an API error), then
-the connection closes without a finish-reason chunk, usage chunk or `[DONE]`. A stream's response
-(status 200 and its headers) starts at Engine admission, or 5 s after the request was queued if it is
-still waiting then: a queue timeout or an orderly stop within those 5 s answers as a plain HTTP status
-on every route, and a request still queued starts its stream and waits there, with an SSE comment
-(`: keep-alive`; Responses: `response.created`, then a repeated `response.in_progress`) every 5 s, so a
-client that gives up on a connection that stays silent (one agent client closed every request queued
-for 120 s) keeps it. Its queue's later answer is then the stream's error in the form above (Anthropic:
-`message_start`, then an `error` event; Responses: `response.failed`).
+the connection closes without a finish-reason chunk, usage chunk or `[DONE]`. A Chat Completions
+stream's response (status 200 and its headers) starts at Engine admission, so a queue timeout or an
+orderly stop while it waits answers as a plain HTTP status: some clients record an error event after a
+200 as a successful empty reply and retry it at once. A Messages or Responses stream starts at
+admission, or 5 s after the request was queued if it is still waiting then: within those 5 s the
+queue's answers are a plain HTTP status, and a request still queued starts its stream and waits there,
+with an SSE comment (`: keep-alive`; Responses: `response.created`, then a repeated
+`response.in_progress`) every 5 s, so a client that gives up on a connection that stays silent (one
+agent client closed every request queued for 120 s) keeps it. Its queue's later answer is then the
+protocol's own error event (Anthropic: `message_start`, then an `error` event; Responses:
+`response.failed`).
 
 ### llama.cpp-compatible request observations
 
@@ -1878,7 +1882,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--chat-template FILE` | replace the artifact's chat template at startup; it must be one the target accepts | artifact template |
 | `--claude-code-prompt as-sent\|local` | Anthropic Messages from Claude Code: use its System prompt as sent, or replace its Claude-specific parts with a short local-agent preamble ([Anthropic Messages](#anthropic-messages)) | `as-sent` |
 | `--rope-yarn-factor F` | startup-fixed runtime YaRN factor, finite `[1,4]`; extends allowed ceiling only | `1` |
-| `--max-context N` | logical context ceiling of each sequence | `8192` |
+| `--max-context N\|auto` | logical context ceiling of each sequence. `auto` sizes it at startup to the largest context whose smallest reservation fits beside the weights (what `--plan` reports as `max_context`), within the model's positions, so one request may fill the KV cache; startup logs the value and `/v1/models` and `/metrics` report it. With it the KV capacity defaults to `auto` (also with `--no-prefix-reuse`), and an explicit `--kv-capacity N` is its ceiling. Qwen3.5-family models whose experts stay in VRAM (the 27Bs, the 35B-A3B); offloaded experts and Qwen3.8-Flash-Next refuse it, as the KV cache would take their expert cache's VRAM | `8192` |
 | `--kv-capacity N\|auto` | explicit shared Main Text KV capacity, or maximize it from remaining GPU memory (with offloaded experts, as on Qwen3.8-Flash-Next and Qwen3.5-122B-A10B, `auto` is `--max-context` x `--max-concurrency` and the expert cache takes the rest); omitted means `auto` with the prefix cache and `--max-context` with `--no-prefix-reuse` | `auto` |
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free for the display and other programs (`auto` = 1024 with a display on the GPU or when that is unknown, 256 without). Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`). Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): after the expert cache takes the rest ([details](qwen3_8-flash-next.md#vram)) | `auto` |
 | `--vram-past-budget` | Windows: also size into the VRAM the Windows per-process budget withholds (~0.6 GiB on an RTX 5090), measured at startup: with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) the expert cache (~240 more expert frames), otherwise the KV pool of `--kv-capacity auto` (more KV, so more context in VRAM and a larger Device prefix cache). Every startup reading, the Program's check that its allocations landed in VRAM and the free VRAM the server reports count it. That memory may be moved to system memory if another program needs VRAM: an expert cache then shrinks, while a KV pool stays and runs slower until the VRAM frees ([details](qwen3_8-flash-next.md#vram)) | off |
@@ -2034,6 +2038,19 @@ errors are warnings, and its warnings and notices, such as swscaler's `deprecate
 notice for each full-range (JPEG-coded) video, are `debug`. A terminal may use one
 transient line during startup, but Serve throughput is always a persistent record. Redirected
 stderr contains no terminal control sequences.
+
+Three records help with the prefix cache under pressure. A `throughput` record whose interval paused
+or resumed requests adds `pauses N, resumes S from snapshot, R by replay (T tok replayed, P of
+prefill)`: P is Replay's share of the interval's prefill work, the prompt tokens computed plus those
+replayed. A `req#N done` record whose prompt recomputed at least 4,096 tokens that one of the last 16
+requests' contexts held adds `miss diverged at K, L tok recomputed` (the client sent a history that
+departs from that context at token K, for example with its reasoning stripped) or `miss evicted,
+shared K, L tok recomputed` (the history matched but the cache had lost it); the request JSONL's
+`prefix_miss` has the detail. At `debug`, `engine | admission req N fresh|resume, prompt P: sources
+...; outcome` traces each admission: the sources the cache offered (reused tokens and kind, the one
+tried marked `*`, and the prompt's cached blocks) and what became of it (`bound`, `waits for a lane`,
+the shortage and whether the cache, a pause or the residents' release covers it, or `next source`). A
+request waiting across admission passes logs each distinct outcome once.
 
 One writer thread does every console write (records, the transient line and the statistics
 panel), and a thread that logs only queues its record, so a stderr that stops taking output, such
@@ -2265,6 +2282,7 @@ occupied share (KV pages holding requests' tokens, prefix-cache space holding en
 | `cuda_graphs` | CUDA Graph executables, as measured when they were prepared | | |
 | `staging` | expert-miss staging and the expert cache's tables | the pinned upload ring and the Program's pinned buffers | |
 | `ngram` | | Qwen3.8-Flash-Next's n-gram table in RAM, or its row cache | |
+| `ngram_archive` | | the n-gram drafter's conversation archive (`--ngram-archive-mib`): what its sources hold | |
 
 The [launcher](launcher.md)'s dashboard draws `memory` as one bar per member, with the server's unnamed use
 (`process_bytes` less the parts) and other processes' use beside the parts.
@@ -2273,6 +2291,35 @@ The route follows the server's API-key authentication. The document contains no 
 tool argument, key, or client address, and no header value but the client's own request label
 (`X-Infernix-Request-Label`, accepted only as printable ASCII of at most 128 bytes). `requests` is a
 bounded window, not a durable log; use `--request-log-jsonl` when every request must be retained.
+
+### Request monitor
+
+`GET /monitor` shows how each request the Engine holds stands now, as the Engine's last statistics
+publication saw it (after NInfer's monitor snapshot): the residents in lane order, the one binding,
+the paused ones, then up to 32 queued ones in FIFO order. It follows the server's API-key
+authentication, sends `Cache-Control: no-store`, and carries no request text.
+
+```bash
+curl http://127.0.0.1:8080/monitor
+```
+
+| Field | Meaning |
+|---|---|
+| `schema` | `infernix.monitor/1` |
+| `time` | Unix seconds of the response |
+| `progress_owner` | the Engine id of the request that owns the current service turn under resource pressure ([scheduling](maintainer/resource-scheduling-and-context-cache.md)); `null` without pressure |
+| `no_progress_s` | as `infernix_no_progress_seconds` |
+| `queued_not_listed` | queued requests past the 32 listed |
+| `requests[].engine_id` | the Engine's request id (`engine_request_id` in the request log) |
+| `requests[].id`, `label`, `protocol` | the server's request id (`req#N`), its `X-Infernix-Request-Label` and protocol; `null` for the Engine's own idle-time prefill and for a request not admitted yet |
+| `requests[].phase` | `queued`, `binding` (restoring cached state into a lane), `prefill`, `replay` (a resume recomputing its history), `pausing`, `paused`, `decode`, `control` (forced control tokens) or `finishing` |
+| `requests[].lane` | its lane while it holds one, else `null` |
+| `requests[].background` | the Engine's idle-time prefill of a finished turn |
+| `requests[].progress_owner`, `recovery_pending` | it owns the service turn; a resumed request still protects its recovery capacity |
+| `requests[].recovery_route` | `replay` when its latest resume recomputed history, else `none` |
+| `requests[].prompt_tokens`, `reused_tokens`, `computed_prompt_tokens`, `output_tokens` | its prompt, the prefix its binding reused, the prompt tokens computed since, and the tokens it has generated |
+| `requests[].preemptions`, `snapshot_restores`, `replay_restores`, `replayed_tokens` | its pauses, its resumes from a snapshot at the paused frontier and by Replay, and the history tokens Replay recomputed |
+| `requests[].age_s`, `paused_s`, `since_progress_s` | seconds since submission, paused in total, and since its last committed progress (prompt prefilled, history replayed or output committed; `null` before any) |
 
 ## Structured request log
 
@@ -2314,7 +2361,8 @@ they do not infer request behavior from process-global counter deltas.
 unspecified. `enable_thinking` records whether the response starts in thinking mode.
 
 `request_done.prefix_miss` explains a large re-prefill, or is `null`. The server keeps the token
-contexts (prompt and output) of its last 16 requests while the request log is on. A request that
+contexts (prompt and output) of its last 16 requests (with or without the request log: the
+`req#N done` record names a miss's kind too). A request that
 computes at least 4,096 prompt tokens is compared with them, and the context sharing the longest
 prefix with its prompt (`common_prefix_tokens`) decides:
 
@@ -2504,7 +2552,8 @@ committed blocks whose Device copy another request was using, so the request's p
 until it finished.
 `taps_created` and `taps_skipped` count planned prefill snapshots published and dropped, and
 `endpoints_created` end-of-answer snapshots. Publication refusals are counted too:
-`taps_skipped_no_slot` (of `taps_skipped`, no Device snapshot slot was available),
+`taps_skipped_no_slot` (of `taps_skipped`, no Device snapshot slot was available), `taps_retried`
+(flexible taps skipped for lack of room and then taken at a later prefill chunk boundary),
 `endpoints_skipped` (an end-of-answer snapshot that passed its checks but found no slot or could
 not be published), `host_image_write_refusals` and `host_block_write_refusals` (snapshots and
 blocks refused Host slabs, which then stay Device-only), `device_slot_evictions` (Device snapshot
@@ -2565,8 +2614,8 @@ capacity of the same size bounds how many run at once, and beyond it they are re
 overloaded, as generation requests are. The absolute
 `--pending-timeout-ms` deadline starts before preparation, covers media acquisition and Engine FIFO
 waiting, and returns HTTP 503 with code `request_queue_timeout` and the same `Retry-After` if admission
-does not occur in time; a streaming request still queued 5 s after it was queued has started its stream
-by then and gets the timeout as the stream's error event instead.
+does not occur in time; a Messages or Responses streaming request still queued 5 s after it was queued
+has started its stream by then and gets the timeout as the stream's error event instead.
 Once admitted, a request may pause for resource pressure without restarting this initial-admission
 deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
 cannot fit. There is no admission ETA or unbounded overflow queue.

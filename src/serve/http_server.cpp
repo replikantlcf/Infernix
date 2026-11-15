@@ -610,6 +610,13 @@ void HttpServer::register_routes() {
         res.set_content(metrics_.render(service_->runtime_stats(), service_->is_available()),
                         "text/plain; version=0.0.4; charset=utf-8");
     });
+    // The Engine's view of each request it holds: phase, lane, service turn, recovery, progress.
+    server_.Get("/monitor", [this](const httplib::Request&, httplib::Response& res) {
+        res.set_header("Cache-Control", "no-store");
+        res.set_content(render_monitor_json(service_->request_monitor(),
+                                            live_requests_.rows(LiveRequests::Clock::now()), unix_time_seconds()),
+                        "application/json; charset=utf-8");
+    });
     server_.Get(api_route_pattern(R"(/models/(.+))"),
                 [this](const httplib::Request& req, httplib::Response& res) {
                     handle_model(req, res);
@@ -665,7 +672,7 @@ void HttpServer::register_routes() {
 }
 
 void HttpServer::handle_models(const httplib::Request&, httplib::Response& res) const {
-    res.set_content(make_models_list(public_model_id_, unix_time_now(), options_.max_context,
+    res.set_content(make_models_list(public_model_id_, unix_time_now(), service_->engine_options().max_context,
                                      model_metadata_, chat_template_caps_),
                     "application/json");
 }
@@ -681,7 +688,7 @@ void HttpServer::handle_model(const httplib::Request& req, httplib::Response& re
         write_openai_error(res, error);
         return;
     }
-    res.set_content(make_model_object(public_model_id_, unix_time_now(), options_.max_context,
+    res.set_content(make_model_object(public_model_id_, unix_time_now(), service_->engine_options().max_context,
                                       model_metadata_, chat_template_caps_),
                     "application/json");
 }
