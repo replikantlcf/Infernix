@@ -27,6 +27,7 @@
 #include "models/qwen3_5/program/offload.h"
 #include "models/qwen3_5/program/prefix/hybrid_cache.h"
 #include "runtime/expert_offload/ram_monitor.h"
+#include "runtime/engine/context_cache/online_cost.h"
 #include "runtime/prefix_cache/cost.h"
 #include "runtime/prefix_cache/prefix_index.h"
 #include "runtime/prefix_cache/tap_planner.h"
@@ -88,6 +89,8 @@ struct RequestBasePlanImpl {
     RequestConstraintPlan constraint;
     std::shared_ptr<const VisionControlPlan> vision_control_plan;
     bool allow_prefix_reuse = false;
+    // runtime::ResolvedExecutionOptions::background: the idle-time pass, whose prefill steps stay one chunk.
+    bool background = false;
     // The prepared ngram index moves out of the immutable prompt into this one-shot slot; the
     // request's single fresh binding takes it (a resumed binding keeps its saved proposer).
     std::shared_ptr<PreparedNgramIndex> ngram_index;
@@ -937,6 +940,12 @@ public:
     std::unique_ptr<HybridPrefixCache> hybrid_;
     std::array<HybridLaneState, kMaximumConcurrency> hybrid_lanes_;
     runtime::prefix_cache::CacheCostModel hybrid_cost_;
+    // The prefill terms' measured scale (runtime/engine/context_cache/online_cost.h): hybrid_cost_ stays the
+    // Engine's model, and the index ranks and values with it scaled. hybrid_observe_prefill feeds it one finished
+    // prompt's prefill time (an artifact without fitted coefficients is otherwise priced as the generic 27B).
+    runtime::OnlinePrefillScale hybrid_prefill_scale_;
+    double hybrid_applied_prefill_scale_ = 1.0;
+    void hybrid_observe_prefill(std::uint32_t lane, std::uint32_t base, std::uint32_t prompt_tokens, double seconds);
     double hybrid_coalesce_wait_seconds_ = 0.0;
     // The last hybrid_sources call deferred its request to an SSD promotion (spec §5.7).
     bool hybrid_source_pending_ = false;
@@ -1018,6 +1027,8 @@ public:
     // once the batch has landed. The view is valid only until the cache's next poll(), which every
     // KV commit runs, so only PrefillContext::take_layer_ready calls it, inside the chunk function.
     [[nodiscard]] std::span<const cudaEvent_t> hybrid_take_restore_layers(std::uint32_t lane);
+    // Empties the prefix cache and every Program-side reference into it (a failed round, a full failure).
+    void hybrid_reset_cache() noexcept;
     // True when a sibling lane still prefilling a prompt that shares more with this one than the
     // cache offers will publish a snapshot where they diverge soon enough to wait for. Plans that
     // snapshot as an exact tap of the sibling when none is planned near the divergence.

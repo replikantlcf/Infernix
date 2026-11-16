@@ -6,6 +6,7 @@
 #include "core/evictable_weight_pool.h"
 #include "core/host_memory.h"
 #include "core/startup.h"
+#include "core/temporary_switches.h"
 #include "core/vmm_arena.h"
 #include "core/vram_budget.h"
 #include "models/qwen3_5/load.h"
@@ -21,6 +22,7 @@
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/expert_offload/route_trace.h"
 #include "runtime/expert_offload/vram_monitor.h"
+#include "runtime/prefix_cache/persist_file.h"
 
 #include <algorithm>
 #include <system_error>
@@ -228,6 +230,23 @@ std::size_t free_device_bytes(const VramSnapshot& s) {
     if (!s.has_budget) { return s.device_free; }
     const std::uint64_t left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
     return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
+}
+
+// What a start resolves its KV capacity in (kv_available_bytes): an automatic capacity leaves `headroom` of
+// free device memory and, of the OS budget, the expert frames' margin (size_expert_frames) with the retry's
+// extra headroom, so a budget below free memory is not stacked on the display headroom (it cost up to 960 MiB
+// of KV with a display: 24.10 GiB free against 21.88 the budget left planned 20.88, now 21.82). Past the
+// budget (--vram-past-budget) the source's free memory is already the widened budget less usage, whose
+// allowance kept its own margin (kPastBudgetMargin): the headroom alone comes off it, as before.
+std::size_t kv_sizing_bytes(const VramSnapshot& s, bool automatic, std::size_t headroom, std::size_t retry_headroom) {
+    std::optional<std::uint64_t> budget_left;
+    if (s.has_budget && s.budget_allowance == 0) {
+        budget_left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
+    } else if (s.has_budget) {
+        return free_device_bytes(s);
+    }
+    return kv_available_bytes(automatic, s.device_free, budget_left, headroom,
+                              static_cast<std::size_t>(expert_offload::kVramBudgetMarginBytes) + retry_headroom);
 }
 
 std::size_t current_free_device_bytes(int device, bool past_budget) {
@@ -678,10 +697,14 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         if (!qwen4_exp) {
             // With offloaded experts and a Host tier one slot (candidates §22 VM-03, 2026-10-27): each further slot
             // is 146.5 MiB of the 122B's frames, and the VRAM defaults measured its one-request decode +1.0-1.7 %
-            // with one; its conversations' endpoints restore from the Host tier instead. Resident artifacts keep a
-            // slot per lane (their freed VRAM would be context, not speed, and restores were not measured there).
-            hybrid.device_snapshot_slots = hybrid.device_snapshot_slots.value_or(
-                offloaded_experts && host_tier ? 1U : concurrency + (host_tier ? 1U : 2U));
+            // with one; its conversations' endpoints restore from the Host tier instead. Resident artifacts take one
+            // too since 2026-11-15 (a slot per lane before): the slots' VRAM is KV capacity, and on the 27B at four
+            // lanes one slot against five gave 14,272 more tokens and, where two agent conversations did not fit
+            // the pool together, continuing turns of 1.9 s mean and 9.2 s worst against 2.5-2.6 s and 16.5 s
+            // (hybrid spec §16.13); an image restores from the Host tier in a few milliseconds, pipelined behind
+            // the first pass. Without a Host tier the slots are the only snapshot storage: one per lane and two.
+            hybrid.device_snapshot_slots =
+                hybrid.device_snapshot_slots.value_or(host_tier ? 1U : concurrency + 2U);
         }
         // Taps without a Host tier would evict other conversations' resident snapshots.
         hybrid.max_new_taps = hybrid.max_new_taps.value_or(host_tier ? 8U : 2U);
@@ -905,6 +928,10 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             options.context_cache.host_capacity_bytes =
                 auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
             set_growth(snapshot, demand);
+            // The tier page-locks RAM down to the reserve, so the process's own pageable memory (its heap, the
+            // driver's pages, the kernel images) is what Windows would trim first under pressure: the growth the
+            // plan counted stays resident, as beside offloaded experts.
+            if (!plan_only) { reserve_expert_working_set(options, demand); }
         }
     }
     // Engine::plan: the pinned block's check (materialize's), the RAM report, and the weights; then the
@@ -1017,21 +1044,34 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             planned->vram.planned_bytes  = dense_bytes;
             return {};
         }
-        if (!plan_only) {
-            spill.emplace(*spill_source);
-            spill->begin();
-        }
+    }
+    // Every start checks that its weights landed in device memory: a resident model's arena is as exposed to
+    // the sysmem fallback as an offloaded one's dense weights, and without the check its spill surfaced only as
+    // a KV sizing failure that did not name the weights. The load page-locks the pinned block and the ladder's
+    // tail mirror meanwhile (its staging slots are released again), which the guard takes off the shared system
+    // memory use it reads.
+    std::uint64_t pinned_in_load = 0;
+    if (!plan_only) {
+        if (!spill_source) { spill_source = open_vram_budget_source(device.device, options.vram_past_budget); }
+        dense_bytes    = plan.materialization().device_capacity_bytes;
+        pinned_in_load = plan.materialization().pinned_capacity_bytes + tail_mirror;
+        spill.emplace(*spill_source);
+        spill->begin();
     }
     if (plan_only && !pinned_refusal.empty()) { plan_refuse(*planned, std::move(pinned_refusal)); }
     auto model = plan_only ? models::qwen3_5::plan_model(std::move(plan))
                           : models::qwen3_5::materialize_model(std::move(plan), device, &options.startup_observer);
     device.synchronize();
     if (spill) {
-        if (const std::uint64_t spilled = spill->end(dense_bytes); spilled != 0) {
-            throw std::runtime_error(std::to_string(spilled >> 20) +
-                                     " MiB of the dense weights were placed in shared system memory by the driver's "
-                                     "sysmem fallback: free VRAM and start again (" + spill->readings(dense_bytes) +
-                                     ")");
+        // The upload's staging slots count as page-locked too: they are released before this reading, but a
+        // release the OS has not yet taken off the process's use must not read as a spill.
+        pinned_in_load += model->storage_stats().peak_staging_bytes;
+        if (const std::uint64_t spilled = spill->end(dense_bytes, pinned_in_load); spilled != 0) {
+            throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of the model's " +
+                                     (expert_ram ? "dense weights" : "weights") + " (" +
+                                     std::to_string(dense_bytes >> 20) +
+                                     " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
+                                     "VRAM and start again (" + spill->readings(dense_bytes) + ")");
         }
     }
     StartupPhaseScope frontend(options.startup_observer, StartupPhase::FrontendInitialize);
@@ -1052,7 +1092,21 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             }
         }
     }
+    // The native Parameters allocate the DFlash2 full head's screen (models::qwen3_5::execution::Parameters::
+    // draft_screen, 357.6 MB for the 27B's head) outside the weights' arena, after the check above: the same guard
+    // reads its step, so a screen the driver placed in shared system memory fails the start by name instead of
+    // slowing every proposal round.
+    if (spill) { spill->begin(); }
     auto instance = std::make_unique<ModelInstance>(std::move(model), options);
+    if (spill) {
+        const std::uint64_t screen_bytes = instance->parameters.draft_screen.bytes;
+        if (const std::uint64_t spilled = screen_bytes != 0 ? spill->end(screen_bytes, 0) : 0; spilled != 0) {
+            throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of the DFlash2 draft screen (" +
+                                     std::to_string(screen_bytes >> 20) +
+                                     " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
+                                     "VRAM and start again (" + spill->readings(screen_bytes) + ")");
+        }
+    }
     frontend.complete();
     // --a8-activations (LOSSY, opt-in; design §19.3.31): the 8-bit activation routes of this artifact
     // (models::qwen3_5::A8Routes, which the Program's ExecutionSchedule takes too), in decode and verification calls
@@ -1108,10 +1162,18 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         // parameters' derived buffers it did not allocate (the DFlash2 drafter's head screen).
         const VramSnapshot vram_now  = open_vram_budget_source(device.device, options.vram_past_budget)->query();
         const std::size_t free_now   = free_device_bytes(vram_now);
+        // What the capacity resolves in: with a resident model's automatic capacity the display headroom comes
+        // off free device memory and the margin off the OS budget (kv_sizing_bytes); otherwise free_now.
+        const std::size_t sizing_headroom =
+            static_cast<std::size_t>(runtime::expert_offload::display_headroom(vram_now.display, false,
+                                                                              options.vram_headroom_bytes)) +
+            retry_headroom;
+        const std::size_t sizing_now = kv_sizing_bytes(
+            vram_now, !expert_ram && kv_policy.mode == KvCapacityMode::Automatic, sizing_headroom, retry_headroom);
         const std::size_t free_bytes =
-            plan_only ? planned_free_after_weights(free_now, planned_weights,
+            plan_only ? planned_free_after_weights(sizing_now, planned_weights,
                                                    planned_beside_weights + instance->parameters.planned_device_bytes)
-                      : free_now;
+                      : sizing_now;
         if (vram_now.has_budget) {
             publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
                                "KV sizing: %zu MiB free (cudaMemGetInfo %zu MiB; OS budget %llu MiB, %llu used)",
@@ -1123,10 +1185,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         // the GPU, 1 GiB with one or when unknown). Measured headless on the 27B and 35B at 4 x 65,536 (RTX
         // 5090, 2026-11-03): the earlier fixed 1 GiB stayed free, and long prefills, decode at four lanes
         // and a constrained tool call took 2 MiB more after startup.
-        const std::size_t headroom =
-            static_cast<std::size_t>(runtime::expert_offload::display_headroom(vram_now.display, false,
-                                                                              options.vram_headroom_bytes)) +
-            retry_headroom;
+        const std::size_t headroom = sizing_headroom;
         // The sequence plan of `trial` (these options at another prefill chunk, for the fit below) with its
         // KV capacity resolved; none when Engine::plan finds no capacity that fits.
         const auto plan_sequence = [&](const EngineOptions& trial)
@@ -1155,9 +1214,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
             // whole, an automatic one down to every lane's full context. None fitting keeps chunk-wide steps.
             {
                 const std::uint64_t page_tokens = planner.capacity_curve().main_page_tokens;
-                const std::uint64_t lane_page_groups =
+                std::uint64_t lane_page_groups =
                     static_cast<std::uint64_t>(trial.max_concurrency) *
                     ((static_cast<std::uint64_t>(trial.max_context) + page_tokens - 1U) / page_tokens);
+                // INFERNIX_TMP_IDLE_WIDE_KV_PERCENT: the idle width may also cost that share of the pages.
+                if (const std::int64_t percent =
+                        temporary_switches::integer("INFERNIX_TMP_IDLE_WIDE_KV_PERCENT", 0, 0, 20);
+                    percent != 0) {
+                    lane_page_groups = std::min<std::uint64_t>(
+                        lane_page_groups,
+                        resolution.main_page_groups * static_cast<std::uint64_t>(100 - percent) / 100U);
+                }
                 for (const std::uint32_t width : models::qwen3_5::idle_prefill_widths(instance->parameters, trial)) {
                     auto wide = models::qwen3_5::make_sequence_planner(instance->parameters, device, trial, width, offload);
                     if (const auto fitted = resolve_kv_capacity_beside(kv_policy, wide.capacity_curve(), free_bytes,
@@ -1310,6 +1377,17 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         instance->program->set_hybrid_coalesce_wait_limit(
             static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0);
         const std::filesystem::path& file = options.context_cache.hybrid.persistent_file;
+        // A prefix cache file no longer used leaves its kept SSD file behind, which nothing removes: the start names
+        // each (another running server's is among them, so none is deleted).
+        if (!file.empty() && options.context_cache.ssd_capacity_bytes != 0) {
+            for (const runtime::prefix_cache::KeptSsdFile& other : runtime::prefix_cache::other_kept_ssd_files(
+                     options.context_cache.ssd_directory,
+                     runtime::prefix_cache::kept_ssd_file(options.context_cache.ssd_directory, file))) {
+                publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                                   "SSD prefix cache: %s (%llu MiB) is not used by this server",
+                                   other.path.string().c_str(), static_cast<unsigned long long>(other.bytes >> 20));
+            }
+        }
         if (!file.empty()) {
             const runtime::prefix_cache::PersistResult loaded =
                 instance->program->attach_hybrid_cache_file(

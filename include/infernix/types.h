@@ -1893,8 +1893,8 @@ enum class AdmissionFallbackReason : std::uint8_t {
 
 struct GenerationAdmissionStats {
     std::uint32_t preferred_reused_tokens = 0;
-    // Subset of initial queue wait, not additional TTFT. Includes waiting for a lane
-    // after a useful source has been selected.
+    // Subset of initial queue wait, not additional TTFT: the time from the request's first source quote to its
+    // binding. A request is quoted only once a lane is free for it, so waiting for a lane is not in it.
     double source_wait_seconds              = 0.0;
     AdmissionFallbackReason fallback_reason = AdmissionFallbackReason::None;
 };
@@ -2068,6 +2068,7 @@ struct MemoryUsage {
         std::uint32_t expert_frames = 0;
         std::uint64_t kv            = 0; // the KV cache's backed pages and tables, less `prefix`'s pages
         std::uint64_t kv_used       = 0; // of them, pages holding requests' tokens
+        std::uint64_t mtp_kv        = 0; // the MTP drafter's own KV page pool (Qwen3.5 with --spec mtp), not in `kv`
         std::uint64_t state         = 0; // recurrent (GDN) state, per-request rows and records, call inputs and outputs
         std::uint64_t prefix        = 0; // the prefix cache's device snapshots and the KV pages only it holds
         std::uint64_t workspace     = 0; // activation workspace, with frames the expert cache lends to prefill and vision

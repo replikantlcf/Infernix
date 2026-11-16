@@ -18,7 +18,24 @@ namespace infernix::models::qwen4_exp::testing {
 namespace {
 std::atomic<std::int64_t> forced_tap_position{-1}; // -1: none
 std::atomic<std::uint32_t> restore_delay_us{0};
+std::atomic<bool> restore_fault{false};
+std::atomic<std::uint64_t> drain_count{0};
+std::atomic<std::uint64_t> tap_block_write_count{0};
 } // namespace
+
+void set_restore_fault() noexcept { restore_fault.store(true); }
+
+bool take_restore_fault() noexcept { return restore_fault.exchange(false); }
+
+void count_tap_block_writes(std::uint64_t blocks) noexcept {
+    tap_block_write_count.fetch_add(blocks, std::memory_order_relaxed);
+}
+
+std::uint64_t tap_block_writes() noexcept { return tap_block_write_count.load(std::memory_order_relaxed); }
+
+void count_drain() noexcept { drain_count.fetch_add(1, std::memory_order_relaxed); }
+
+std::uint64_t drains() noexcept { return drain_count.load(std::memory_order_relaxed); }
 
 void set_restore_delay(std::uint32_t microseconds) noexcept { restore_delay_us.store(microseconds); }
 
@@ -202,10 +219,13 @@ void ProgramImpl::mtp_flush_cell(Lane& lane, std::uint32_t index) {
 // binding (resource-scheduling §5.2): it takes its deepest cached state (its pause's capture when cached)
 // that the whole pool holds, whether or not it fits beside them now, so its binding reports the shortage
 // instead of replaying the ledger from a shallower state, whose prefill arithmetic would change the
-// request's output.
+// request's output. Its source is its own resume point or an earlier state of its own, which shows nothing new of
+// the conversation: the selection keeps what its first binding learnt (ResumeStateImpl::follow), so its opener tap
+// is planned as before the pause.
 std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::PreparedPromptData& prompt,
                                                                        const BasePlanImpl& base,
-                                                                       std::uint32_t lane, bool resumed) {
+                                                                       std::uint32_t lane, const ResumeStateImpl* resume) {
+    const bool resumed          = resume != nullptr;
     pc::PrefixCacheIndex& index = prefix_->index();
     const auto n                = static_cast<std::uint32_t>(prompt.token_ids.size());
     const std::uint32_t E       = binding_pages(base, n);
@@ -242,12 +262,13 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
     };
     PrefixSelection root;
     root.need = E;
+    if (resumed) { root.follow = resume->follow; }
     if (lane == kNoLane) { prefix_ssd_wait_ = false; }
     if (base.reuse && n > 1) {
         prefix_->poll();
         pc::MatchResult match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
-        if (prefix_->await_extended_endpoint(match.path, prompt.token_ids)) {
-            // The endpoint this prompt continues has just been published.
+        if (prefix_->await_extended_capture(match.path, prompt.token_ids, options_.free_cache_resume)) {
+            // The endpoint, or the sibling's tap, this prompt continues has just been published.
             match = index.match(prompt.token_ids, prompt.block_hashes, prompt.block_extras, n);
         }
         if (prefetch_landing() && std::any_of(match.candidates.begin(), match.candidates.end(),
@@ -298,7 +319,9 @@ std::optional<PrefixSelection> ProgramImpl::prefix_select(const qwen3_5::Prepare
             PrefixSelection s;
             s.snapshot = c.snapshot;
             s.frontier = c.frontier;
-            if (index.snapshot(c.snapshot).kind == pc::SnapshotKind::Endpoint) {
+            if (resumed) {
+                s.follow = resume->follow;
+            } else if (index.snapshot(c.snapshot).kind == pc::SnapshotKind::Endpoint) {
                 s.follow = PrefixFollow::Endpoint;
             } else if (prefix_->meta(c.snapshot).opener) {
                 s.follow = PrefixFollow::Opener;
@@ -456,10 +479,10 @@ void ProgramImpl::hybrid_hold_queue(std::span<const RequestBasePlan* const> queu
         if (base == nullptr || base->impl_ == nullptr || !base->impl_->reuse || !base->impl_->prompt) { continue; }
         const auto& prompt = qwen3_5::PreparedPromptAccess::view(*base->impl_->prompt);
         if (prompt.token_ids.size() <= 1 || prompt.block_hashes.size() != prompt.token_ids.size() / kBlock) { continue; }
-        const ResumeStateImpl* resume = resumes[entry] ? resumes[entry]->impl_.get() : nullptr;
+        ResumeStateImpl* resume = resumes[entry] ? resumes[entry]->impl_.get() : nullptr;
         const std::vector<pc::TapExclusion> spans = prefix_exclusions(prompt);
         if (resume && resume->generated) {
-            const qwen3_5::PreparedPromptData ledger = ledger_prompt(prompt, *resume);
+            const qwen3_5::PreparedPromptData& ledger = ledger_of(prompt, *resume);
             const auto n          = static_cast<std::uint32_t>(ledger.token_ids.size());
             pc::MatchResult match = index.match(ledger.token_ids, ledger.block_hashes, ledger.block_extras, n);
             std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
@@ -525,7 +548,9 @@ bool ProgramImpl::prefix_await_sibling(const qwen3_5::PreparedPromptData& prompt
         // A capture of the lane's inside the shared prefix that has not landed publishes within a
         // copy time.
         // On the grid only a prefilling lane's capture (a tap) can serve: an endpoint's state is decode's.
-        if (lane.prefix.capture != 0 && !prefix_->capture_result(lane.prefix.capture) &&
+        // Only this request's own capture, at its deepest frontier, and only while the cache still copies it: the
+        // id of an earlier request's capture on the slot, or one whose result was forgotten, is not in flight.
+        if (lane.prefix.captured && prefix_->capture_pending(lane.prefix.capture) &&
             lane.prefix.deepest > reuse && lane.prefix.deepest <= shared &&
             (!grid || (lane.phase == Phase::Prefill && lane.prefix.deepest % resume_grid() == 0))) {
             consider(Wait{.lane = i, .target = lane.prefix.deepest, .plan_tap = false});
@@ -657,7 +682,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
                                          std::any_of(lane.prefix.path.begin(), lane.prefix.path.end(), [&](pc::NodeRef n) {
                                              return cache.node(n).device != pc::CopyState::Resident;
                                          }));
-    if (s.snapshot) {
+    if (s.snapshot) try {
         if (restores) { prefix_->open_restore(stream); }
         for (const pc::NodeRef node : lane.prefix.path) {
             if (cache.node(node).device != pc::CopyState::Resident) {
@@ -682,6 +707,11 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
             }
         }
         if (s.image_restore) { prefix_->restore_image(*s.snapshot, index); }
+        if (restores && testing::take_restore_fault()) {
+            // The failure an activation can meet and the Engine recovers from: out of device memory at a restore
+            // copy (FS-01). Any other exception here fails the whole Engine, which empties the cache anyway.
+            throw DeviceMemoryExhausted("Qwen4Exp prefix cache: injected restore fault (testing::set_restore_fault)");
+        }
         if (restores) { lane.prefix.restore = prefix_->submit_restore(); }
         if (s.cow == PrefixCow::Anchor) {
             // The anchor's copy is stream-ordered (or pinned by the restore batch): drop its pin.
@@ -693,12 +723,28 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
         cache.unpin_snapshot(*s.snapshot); // the restore batch holds its own pin while it lands
         lane.prefix.resume  = s.snapshot;
         lane.prefix.deepest = s.frontier;
+        // The capturing request resumed from an endpoint. A paused request's own resume point is published as an
+        // endpoint too: its binding keeps what the request recorded before the pause (restore_request).
+        lane.prefix.lineage_echo = cache.snapshot(*s.snapshot).kind == pc::SnapshotKind::Endpoint;
         ++prefix_->counters().admissions;
         prefix_->counters().reused_tokens += s.frontier;
+    } catch (...) {
+        // A batch left open would keep its blocks Filling and pinned and refuse every later restore ("a restore is
+        // already open") until a restart: its destinations and pins go back now, behind whatever was enqueued.
+        prefix_->fail_restore();
+        throw;
     }
     // The slot no longer holds the endpoint image once anything is admitted into it.
     prefix_->forget_capture(lane.prefix.resident_capture);
     lane.prefix.resident_capture = 0;
+    // The earlier request's capture on this slot: its copy-out is ordered above, and once it has landed its id
+    // names nothing this request waits for. Left set, a forgotten id read as a capture still in flight, and a
+    // request sharing this lane's prefix waited for it until the lane's first capture or release
+    // (prefix_await_sibling). One still copying keeps its id: the lane's first call waits on it per layer.
+    if (lane.prefix.capture != 0 && !prefix_->capture_pending(lane.prefix.capture)) {
+        prefix_->forget_capture(lane.prefix.capture);
+        lane.prefix.capture = 0;
+    }
     lane.prefix.captured         = false;
     lane.prefix.saves            = prefix_saves_;
     if (!s.snapshot) { reset_slot(index); }
@@ -736,6 +782,7 @@ void ProgramImpl::prefix_activate(Lane& lane, std::uint32_t index, const PrefixS
     // A conversation that continued an endpoint, or whose behaviour is not known yet, may resume its next
     // turn at this one's endpoint (one that continued only an opener resumes at this turn's opener).
     lane.prefix.close_endpoint = options_.free_cache_resume && s.follow != PrefixFollow::Opener;
+    lane.prefix.follow         = s.follow;
 }
 
 // The prompt's prefill calls from `frontier` (design §19.3.1, "Prefill integration"): with `taps`, the
@@ -864,6 +911,14 @@ qwen3_5::PreparedPromptData ProgramImpl::ledger_prompt(const qwen3_5::PreparedPr
     return out;
 }
 
+// The ledger prompt of a paused request, built once: a pause's history is fixed until its resume, and every quote,
+// queue hold and binding of it would otherwise copy the whole context again.
+const qwen3_5::PreparedPromptData& ProgramImpl::ledger_of(const qwen3_5::PreparedPromptData& prompt,
+                                                          ResumeStateImpl& r) const {
+    if (!r.ledger) { r.ledger = std::make_shared<const qwen3_5::PreparedPromptData>(ledger_prompt(prompt, r)); }
+    return *r.ledger;
+}
+
 
 // ---- publication -------------------------------------------------------------------------------------
 
@@ -910,20 +965,57 @@ void ProgramImpl::prefix_publish(Lane& lane, std::uint32_t frontier) {
     }
 }
 
-// A tap or endpoint snapshot of the lane's state at its frontier F = state_tokens (Host-born).
-void ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKind kind, bool hand_over_tail,
+// A tap or endpoint snapshot of the lane's state at its frontier F = state_tokens (Host-born). False when the Host
+// tier had no room for it now (the cache counts taps_skipped): the caller may try again at a later frontier.
+bool ProgramImpl::prefix_capture(Lane& lane, std::uint32_t index, pc::SnapshotKind kind, bool hand_over_tail,
                                  bool resume_point) {
     const std::uint32_t F = lane.state_tokens;
     const std::uint32_t k = F / kBlock;
-    if (F == 0 || lane.prefix.path.size() < k) { return; }
+    if (F == 0 || lane.prefix.path.size() < k) { return true; }
     prefix::PrefixCache::Capture c =
         prefix_capture_at(lane, F, kind, hand_over_tail, lane.mtp_live && lane.mtp_cells == F);
     // A paused request's frontier is its own resume point: its Host image is admitted over any retained
     // snapshot that is not pinned (a refused capture makes the resume replay, with prefill arithmetic).
     // The claim only admits it; its retention priority is the snapshot's own afterwards.
-    if (resume_point) { c.claim = pc::kResumePointClaim; }
+    if (resume_point) {
+        c.claim         = pc::kResumePointClaim;
+        c.publish_claim = pc::kResumePointClaim; // a full snapshot table yields an entry as the Host tier its slabs
+    }
     const std::uint64_t id = c.id;
-    if (prefix_->capture(index, std::move(c), device_.stream)) { prefix_captured(lane, id, F); }
+    if (!prefix_->capture(index, std::move(c), device_.stream)) { return false; }
+    prefix_captured(lane, id, F);
+    // An endpoint's blocks follow it with the rest of the lane's at its finish (prefix_finish).
+    if (kind != pc::SnapshotKind::Endpoint) { prefix_write_through(lane, F); }
+    return true;
+}
+
+// Continuous write-through (hybrid-prefix-cache-spec §17, as Qwen3.5's since 2026-11-15): once a tap at F is taken
+// the lane's blocks below F are reachable from a snapshot, so their Host writes start now, behind the tap's image
+// on the transfer stream, and not in one batch when the lane releases. A pause or a finish then copies only the
+// blocks past the last tap: the batch that held gigabytes of a long lane's pages on the Device until it landed, and
+// that a waiting admission had to wait out, is gone. Blocks past the tap stay unwritten until a deeper snapshot
+// reaches them. The blocks are final (no write of the lane remains below its published frontier) and each is held
+// on the Device by its write until it lands, so no page returns to the pool under the copy; the copies are D2H,
+// beside the prefill's H2D expert stream, and take no Device memory. A capture the index later refuses leaves
+// blocks without a snapshot above them, which the Host tier reclaims first (dead KV).
+void ProgramImpl::prefix_write_through(Lane& lane, std::uint32_t F) {
+    if (lane.prefix.withdraw) { return; }
+    const std::size_t covered  = std::min<std::size_t>(lane.prefix.path.size(), F / kBlock);
+    const std::uint64_t before = prefix_->counters().host_block_writes;
+    try {
+        prefix_->write_blocks(std::span<const pc::NodeRef>(lane.prefix.path.data(), covered), device_.stream);
+    } catch (...) {} // as at release: a failed write leaves the blocks for the release's batch
+    testing::count_tap_block_writes(prefix_->counters().host_block_writes - before);
+}
+
+// A tap due at boundary B that the Host tier refused for room (hybrid-prefix-cache-spec §7.4): it is due again at
+// the next call boundary, as a flexible tap there. Without the retry a long cold prompt that met a full Host tier
+// at one ladder position kept no snapshot there or after it, and a pause or a diverging turn recomputed a ladder
+// step more. The retry is a plain tap: the boundary another conversation shares was B, not the later frontier.
+void ProgramImpl::prefix_retry_tap(Lane& lane, std::uint32_t B, bool forward) {
+    lane.prefix.taps.insert(lane.prefix.taps.begin(),
+                            pc::PlannedTap{.position = B, .placement = pc::TapPlacement::Flexible, .boundary = false,
+                                           .forward = forward});
 }
 
 void ProgramImpl::prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F) {
@@ -933,6 +1025,9 @@ void ProgramImpl::prefix_captured(Lane& lane, std::uint64_t id, std::uint32_t F)
         lane.prefix.captures.push_back(lane.prefix.capture);
     } else {
         prefix_->forget_capture(lane.prefix.capture);
+        // Its first accepted capture is the one that supersedes the snapshot it resumed from (prefix_capture_at):
+        // a withdrawal undoes that supersession, and only that one (a refused capture superseded nothing).
+        if (lane.prefix.resume) { lane.prefix.superseded = *lane.prefix.resume; }
     }
     lane.prefix.capture  = id;
     lane.prefix.captured = true;
@@ -957,8 +1052,7 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
     c.meta.frontier    = F;
     c.meta.mtp_written = mtp_written;
     c.meta.mtp_next    = lane.history.size() > F ? lane.history[F] : -1;
-    c.meta.lineage_echo = lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume) &&
-                          prefix_->index().snapshot(*lane.prefix.resume).kind == pc::SnapshotKind::Endpoint;
+    c.meta.lineage_echo = lane.prefix.lineage_echo;
     c.meta.opener = kind != pc::SnapshotKind::Endpoint &&
                     std::any_of(lane.prefix.hints.begin(), lane.prefix.hints.end(), [&](const pc::TapHint& hint) {
                         return hint.kind == pc::TapHintKind::GenerationOpener && hint.position == F;
@@ -969,8 +1063,7 @@ prefix::PrefixCache::Capture ProgramImpl::prefix_capture_at(Lane& lane, std::uin
     // requests diverging before this one. Its own earlier captures stay retained: its ladder taps and
     // its system-block boundary are where edits and side calls over the history diverge (§19.3.1).
     if (!lane.prefix.captured && lane.prefix.resume) {
-        c.supersedes            = *lane.prefix.resume;
-        lane.prefix.superseded  = *lane.prefix.resume;
+        c.supersedes = *lane.prefix.resume;
         if (prefix_->index().valid(*lane.prefix.resume)) {
             const std::uint32_t from = prefix_->index().snapshot(*lane.prefix.resume).frontier;
             if (from < F) {
@@ -1009,8 +1102,9 @@ void ProgramImpl::prefix_after_prefill_call(Lane& lane, std::uint32_t index, boo
     const std::uint32_t B = lane.state_tokens;
     bool boundary = false, forward = false;
     if (prefix_take_taps(lane, B, lane.next_call, boundary, forward) &&
-        prefix_tap_far_enough(lane.prefix.deepest, B, forward)) {
-        prefix_capture(lane, index, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false);
+        prefix_tap_far_enough(lane.prefix.deepest, B, forward) &&
+        !prefix_capture(lane, index, boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, false)) {
+        prefix_retry_tap(lane, B, forward);
     }
 }
 
@@ -1110,6 +1204,8 @@ void ProgramImpl::prefix_release(Lane& lane) noexcept {
     lane.prefix.reused    = 0;
     lane.prefix.reuse     = false;
     lane.prefix.close_endpoint = false;
+    lane.prefix.follow         = PrefixFollow::Unknown;
+    lane.prefix.lineage_echo   = false;
 }
 
 // After a non-finite failure, once the lane's pins are released (hybrid-prefix-cache-spec §7.8):

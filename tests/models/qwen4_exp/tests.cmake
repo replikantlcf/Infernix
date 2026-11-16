@@ -134,6 +134,11 @@ infernix_add_test(infernix_qwen4_exp_call_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_call_plan.cpp"
   LIBRARIES infernix_model_runtime)
 
+# What a pause leaves in the prefix cache, as pause_replay_tokens prices it (host only).
+infernix_add_test(infernix_qwen4_exp_prefix_pause_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_prefix_pause.cpp"
+  LIBRARIES infernix_model_runtime)
+
 # RoPE staging of a lane: prompt M-RoPE, later tokens, block starts, MTP sub-chunks (host only).
 infernix_add_test(infernix_qwen4_exp_rope_positions_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_rope_positions.cpp"
@@ -142,7 +147,7 @@ infernix_add_test(infernix_qwen4_exp_rope_positions_test
 # The startup RAM ledger (host only).
 infernix_add_test(infernix_qwen4_exp_memory_plan_test
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_memory_plan.cpp"
-  LIBRARIES infernix_model_loading)
+  LIBRARIES infernix_engine infernix_model_loading)
 
 # Prefix-cache state images and page records on synthetic Device pools (no model; skips without a GPU).
 infernix_add_test(infernix_qwen4_exp_prefix_state_test

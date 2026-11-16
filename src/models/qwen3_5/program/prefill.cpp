@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/program_impl.h"
 #include "models/qwen3_5/program/context_work.h"
 #include "models/qwen3_5/program/execution_context.h"
+#include "models/qwen3_5/program/prefix/test_seams.h"
 #include "models/qwen3_5/execution/linear.h"
 #include "models/qwen3_5/execution/lossless.h"
 #include "models/qwen3_5/execution/vision_overlay.h"
@@ -104,6 +105,7 @@ PrefillChunkResult prefill_text_chunk(PrefillContext& state, std::span<const Tok
     card.set_before_first_sample(state.before_first_sample);
     card.set_prefill_last_rows_only(state.last_rows_only);
     card.set_rope_delta(state.rope_delta);
+    testing::note_text_pass(state.text_kv_base, state.rope_delta); // a test's recorder; off, nothing
     card.set_rewrite_checkpoint_hidden_output(state.rewrite_checkpoint_hidden);
     card.set_prefill_split_frontier(split_frontier ? static_cast<std::int64_t>(*split_frontier)
                                                    : -1);
@@ -274,7 +276,11 @@ PrefillProgress ProgramImpl::advance_prefill(SequenceHandle handle,
         std::function<void()>& hook;
         ~ClearHook() { hook = nullptr; }
     } clear_hook{prefill_first_sample_};
-    auto progress = wrap_prefill(lane, advance_prefill_raw(lane, timing));
+    // Taps this unit publishes (one taken at a chunk boundary, or a deferred one whose anchor block the unit
+    // committed): a queued request coalesced onto this prefill can resume from one, so the Engine re-runs admission.
+    const std::uint64_t taps = hybrid_ ? hybrid_->counters().taps_created : 0U;
+    auto progress            = wrap_prefill(lane, advance_prefill_raw(lane, timing));
+    progress.snapshot_published = hybrid_ && hybrid_->counters().taps_created != taps;
     if (!progress.complete) { settle_unit(lane); }
     return progress;
 }
@@ -703,8 +709,8 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             selectors.destination,
             staged.initial_mtp_extent,
             0,
-            dflash_prefill_host_ingress,
-            sequence.rope_delta};
+            dflash_prefill_host_ingress};
+        schedule_state.rope_delta        = sequence.rope_delta; // by name: see PrefillContext
         schedule_state.prefill_gpu_timer = &prefill_gpu_timer_;
         schedule_state.before_first_sample = &prefill_first_sample_;
         schedule_state.last_rows_only      = true; // YC-01: a generation prompt
@@ -1009,6 +1015,10 @@ runtime::PrefillStepResult ProgramImpl::advance_prefill(SequenceState& sequence,
             }
         }
         request.timings.prefill_seconds = std::max(0.0, staged.elapsed_seconds - vision_seconds);
+        // The prefix cache's cost model learns its prefill scale from text prompts (ranking and valuation only).
+        if (!staged.vision_plan) {
+            hybrid_observe_prefill(sequence.lane, staged.base, prompt_tokens, request.timings.prefill_seconds);
+        }
         if (staged.vision) { staged.vision->retire_handoff(); }
 
         request.prefill.reset();
