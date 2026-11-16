@@ -1016,7 +1016,10 @@ curl http://127.0.0.1:8080/v1/chat/completions \
   }'
 ```
 
-OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs.
+OpenAI image and video sources may be HTTP(S) URLs or base64 data URLs. A `file` part
+(`{"type":"file","file":{"file_data":"data:application/pdf;base64,...","filename":"report.pdf"}}`) in a
+user or tool message is a PDF document, read as described in
+[Documents, PDFs and citations](#documents-pdfs-and-citations); `file_id` needs a Files API and is refused.
 
 Text and media requests use one complete-prompt context contract. After chat-template rendering and
 media-token expansion, the result must fit Engine `--max-context`. The current Vision runtime also
@@ -1209,7 +1212,10 @@ An `input_text`, `input_image`, or tool-result part may carry
 identity or output semantics. String message status/phase metadata is accepted but has no Qwen
 prompt representation.
 
-`input_file`, `input_audio`, image `file_id`, image detail other than `auto` or `high`, reasoning metadata without raw
+An `input_file` part in a user message or a tool result is a PDF document (`file_data`, a base64 PDF
+as a data URL or bare, or `file_url`; `filename` titles it), read as described in
+[Documents, PDFs and citations](#documents-pdfs-and-citations). A `file_id` input, `input_audio`, image `file_id`,
+image detail other than `auto` or `high`, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
@@ -1443,7 +1449,29 @@ blocks, Thinking history, tool-use history, tool results, user-defined tools, ag
 and Anthropic SSE. Consecutive User or Assistant messages are joined without adding separators.
 Mid-conversation System messages retain their text and input position; where the active chat
 template rejects them there, Infernix instead renders them under the User role (role only, never
-text or position). A final Assistant message
+text or position). As in the Anthropic API, a System message with content follows a User message
+(or an Assistant message ending in a server tool's result) and ends `messages` or precedes an
+Assistant message; an empty one that only sets `output_config.effort` may follow any turn, renders
+nothing and sets the reply's effort (the latest one wins over the top-level value).
+
+Mid-conversation tool changes: a System message may also carry `tool_addition` and `tool_removal`
+blocks (Anthropic's `mid-conversation-tool-changes` / `inline-tools` betas; the headers are not
+required). `tool_addition` takes a `tool_reference` to a tool in `tools` (a deferred one is shown
+from there on, a removed one offered again) or a `tool_definition` holding a custom tool entry,
+which declares or redefines that tool from there on; `tool_removal` takes a `tool_reference` and
+withdraws the tool from there on. Each message shows its net change where it stands: added or
+redefined definitions as the loaded-tools block that tool search results use, withdrawn tools as one
+line naming them. The tool section and every earlier turn keep their tokens, so the prefix cache
+still hits. The output contract takes the tools as at the end of the history: a tool defined by
+value joins it as a deferred declaration, a withdrawn one leaves it (the tool section still lists a
+withdrawn listed tool, as the conversation saw it), and a redefined one is constrained by its newer
+definition. `tool_choice` may name a tool the history defines and may not force one it withdrew.
+With a `tool_addition` in the messages, every top-level tool may be deferred. `cache_control` on a
+tool block (or its definition, not both) is a breakpoint after the System message. Refused:
+`tool_reference_unresolved` for a name in neither `tools` nor an earlier definition,
+`tool_name_conflict` for a definition under a server tool's name, `mcp_servers_not_supported` for
+MCP references and toolsets, `invalid_cache_control` for a deferred definition with a breakpoint.
+Turn-scoped messages (`clear_at`) are not interpreted. A final Assistant message
 is an Assistant prefill: generation continues its existing text instead of opening another turn.
 Assistant prefill cannot contain media and cannot start with Thinking enabled; a turn cut by the
 output limit may carry reasoning content. It cannot carry `tool_use` blocks: every `tool_use`
@@ -1580,9 +1608,10 @@ fields and semantics (`cache_n` equals `cache_read_input_tokens`). It is not an 
 stream attaches it only to the terminal `message_delta` event; `timings_per_token` and
 `return_progress` are Chat Completions options and have no Messages equivalent.
 
-Documents, Search Results, Files, Structured Outputs, server-tool blocks other than tool search,
-container uploads, and other execution-dependent blocks are rejected with the missing capability
-identified. Metadata,
+Documents (plain text, custom content, and base64 or URL PDFs) and search results, with or without
+citations, are described in [Documents, PDFs and citations](#documents-pdfs-and-citations). Files
+API sources (`file_id`), server-tool blocks other than tool search, container uploads, and other
+execution-dependent blocks are rejected with the missing capability identified. Metadata,
 service tier, inference geography, protocol-version/beta headers, cache TTL, and unknown advisory
 fields do not block an otherwise executable request. The request `model` is any non-empty local
 proxy label and is echoed in the response; it does not select the resident artifact.
@@ -1609,6 +1638,86 @@ curl http://127.0.0.1:8080/v1/messages/count_tokens \
     "messages": [{"role": "user", "content": "Count this prompt."}]
   }'
 ```
+
+## Documents, PDFs and citations
+
+The Anthropic route accepts `document` blocks (a `text` source, a `content` source of text blocks, a
+`base64` PDF with `media_type` `application/pdf`, or a `url` PDF) and `search_result` blocks, in a User
+message or a `tool_result`. A `file` source needs the Files API and is refused (`files_not_supported`),
+as is a base64 source that is not a PDF (`documents_not_supported`). The OpenAI routes accept PDFs
+as Chat `file` parts and Responses `input_file` parts; they have no citations.
+
+**Prompt form.** Each block is rendered where it stands, from its own content alone, so a
+conversation that resends the same documents renders the same tokens and keeps its prefix cache:
+`<document>` with its `<title>` and `<context>`, then its text (a content source's blocks separated
+by blank lines); `<search_result>` with its `<source>` and `<title>`, then its blocks; a PDF as
+`<document>` with its title (or an OpenAI file's `filename`) and context, then per page
+`<page number="N">`, the page's image and its text.
+
+**PDFs** are read with PDFium, which the build needs (`tools/deps/fetch_pdfium.py` downloads the
+pinned release; `build_native.bat` and the Dockerfile use it). A build without it refuses PDF
+documents (`documents_not_supported`). One that needs a password or an unsupported security handler
+is refused (`pdf_encrypted`), and bytes PDFium cannot open are `invalid_pdf`. Each page's text comes
+from its text layer. With `--vision`, each page is also rendered and enters the prompt as an image,
+sized to the processor's 32-pixel grid so it is not resized again: at most 1,024 vision tokens a page
+(about a million pixels), out of a budget of `min(32768, --max-context / 4)` tokens that the
+request's PDFs spend in request order, less 1,024 for each image or video before them, so a page's
+size depends only on what precedes it. A PDF whose pages cannot all get the processor's smallest
+image (64 tokens, 256 x 256 pixels; about 256 pages at `--max-context 65536`) gives its remaining
+budget to its pages without a text layer, and the others stay text only. A page left with neither
+text nor an image carries a fixed note saying so, so the model knows it was not read. Without
+`--vision` a PDF is text only, and one with no text layer at all (a scanned document) is refused with
+`pdf_no_text`. Read PDFs (text and page images) stay in a 256 MiB server cache by their bytes, so an
+agent that resends a PDF on every turn reads it once (a PDF over 128 MiB is read again each time).
+
+What limits a PDF is the context: its pages' text, chunk IDs and images must fit `--max-context`,
+and a prompt that does not fit is answered like any other (`context_length_exceeded`, "prompt is too
+long"). Neither pages nor bytes say how many tokens a PDF holds: of four NVIDIA manuals of 598-884
+pages, the 19.2 MiB PTX ISA holds the same 1.2 MiB of text as the 2.3 MiB Runtime API, and each is
+315,590-412,095 tokens on the Qwen3.8 tokenizer (a 120-page excerpt 89,185), past a 262,144-token
+context. Bytes are already bounded by the request
+body (`--max-request-mib`) and the request's media byte budget (256 MiB at most), which counts a PDF's
+bytes but not its rendered pages (the vision budget bounds those). A request's PDFs may hold at most
+1,000 pages together (`pdf_too_many_pages`), which bounds only the reading before the context check:
+about 1 ms a page for the text (0.65-0.98 ms measured on those manuals), 1-2 ms a page for the
+smallest images and 3-6 ms for the largest. PDFium serves one page at a time across the server, in
+arrival order, so concurrent PDF requests take turns by page.
+
+**Citations.** `citations: {"enabled": true}` is accepted on all of a request's documents or on none,
+and separately on all of its search results or none (HTTP 400 otherwise), and not together with
+`output_config.format`. A citable source is cut into chunks: the sentences of plain text and of each
+PDF page (a sentence keeps the whitespace after it, so the chunks concatenate to the text; a full stop
+before a lowercase word, after an abbreviation a number follows ("Fig. 3") or after a line's leading
+number ("1. Install"), and a contents line's dot leader, end none), or each block of
+custom content and of a search result. Each chunk's ID costs about 5-8 prompt tokens: those manuals
+give 9-13 chunks a page, so citations add 74-100 tokens a page (10-20 % of their prompt). The model reads each chunk after its ID `[S.C]` (S
+counts the request's citable sources from 0, C the source's chunks from 0) and, once, right after the
+first citable source, an instruction to put the words of its answer that a passage supports in
+`<cite ids="S.C,...">...</cite>`. The response turns each tag into a text block of its own, whose
+`citations` hold one entry per run of consecutive chunks of one source, in the order the tag lists
+them, each with its `cited_text` (the chunks' text):
+
+| Source | Citation |
+|---|---|
+| plain text document | `char_location`: `document_index`, `document_title`, `start_char_index`, `end_char_index` (Unicode code points, end exclusive) |
+| PDF document | `page_location`: `document_index`, `document_title`, `start_page_number`, `end_page_number` (1-based, end exclusive) |
+| custom content document | `content_block_location`: `document_index`, `document_title`, `start_block_index`, `end_block_index` (end exclusive) |
+| search result | `search_result_location`: `search_result_index`, `source`, `title`, `start_block_index`, `end_block_index` |
+
+`document_index` and `search_result_index` count the request's documents and search results in
+order. A stream sends a cited block's `citations_delta` events right after its `content_block_start`,
+then its `text_delta` events; text that may begin a tag is held back until it is decided. A tag
+whose IDs name no chunk is dropped with its closing tag and its text stays plain; IDs it names among
+valid ones are dropped; `<cite>` without IDs, and a `</cite>` that closes nothing, stay text; an
+empty tag gives no block; a tag around punctuation alone (a model that writes
+`claim <cite ids="0.1">.</cite>`, as Qwen models without thinking often do) gives its citations to the
+text block before it, which the punctuation ends; a tag still open when the text ends (the output
+limit, a tool call) closes there, and one the end cut part-way is dropped. The model never cites
+inside its thinking. An assistant text block with citations sent back as history is rendered as the
+cite tag it came from, so the next turn's prompt repeats what the model wrote and keeps the prefix
+cache (a punctuation tag's block comes back as one tag around the whole block, which differs from
+the generated text from that block on). `output_tokens`
+counts the generated tokens, the tags included; `cited_text` is not generated and costs nothing.
 
 ## Deferred tools and tool search
 
@@ -2563,9 +2672,10 @@ slots taken from another snapshot) and `device_slot_refusals` (slot requests ref
 `free_device_snapshot_slots` is an end-of-interval gauge. `host_image_writes`, `host_block_writes`,
 `host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
 Host-tier write-through and restores, and `host_write_copies` and `host_restore_copies` the copy
-calls that moved those bytes (many small copies queue behind other work on the copy engine; the
-Qwen3.8-Flash-Next prefix cache reports 0); `prefetched_blocks` counts the restored blocks copied for a
-waiting FIFO head before its admission. `evicted_blocks` counts Device block evictions,
+calls that moved those bytes (a restore enqueues its copies in batches, one call a model layer's KV
+planes; the Qwen3.8-Flash-Next prefix cache reports 0); `prefetched_blocks` counts
+the restored blocks copied for a queued request (the FIFO head or the request behind it) before its
+admission. `evicted_blocks` counts Device block evictions,
 `host_snapshot_evictions` snapshots evicted from the Host tier, `host_dead_reclaims` Host slabs
 reclaimed from KV that no snapshot can reach, and `unbacked_node_losses` Device evictions of blocks
 with no Host copy, which remove them and the blocks after them from the cache. With queue holds

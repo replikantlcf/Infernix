@@ -848,6 +848,15 @@ ChatTemplateRoleSupport Frontend::chat_template_role_support() const noexcept {
     return impl_->chat_template.role_support();
 }
 
+VisionImageBudget Frontend::vision_image_budget() const noexcept {
+    if (!impl_->vision_enabled) { return {}; }
+    const fi::ProcessorOptions& processor = impl_->processor;
+    return VisionImageBudget{.prompt_tokens = processor.max_vision_tokens,
+                             .token_edge    = fi::merged_token_image_edge(),
+                             .min_pixels    = processor.image_min_pixels,
+                             .max_pixels    = processor.image_max_pixels};
+}
+
 Frontend make_frontend(const FrontendResources& resources, FrontendOptions options) {
     return Frontend(std::make_shared<const Frontend::Impl>(resources, options));
 }
@@ -903,8 +912,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
     }
-    const auto tool_call_output = fi::build_tool_call_output_contract(
-        options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names, options.declared_parameter_names);
+    const auto tool_call_output =
+        fi::build_tool_call_output_contract(options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names,
+                                            options.declared_parameter_names, options.withdrawn_tool_names);
     std::vector<PromptCacheMarker> rendered_markers = cache_hints.markers;
     std::optional<std::size_t> engine_tool_marker_index;
     if (cache_hints.allow_engine_automatic_shared_prefixes && !options.tool_jsons.empty()) {

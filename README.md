@@ -147,6 +147,9 @@ Against NInfer on the same artifact ([benchmarks](#qwen38-27b-infernix-vs-ninfer
   default with the drafter measured fastest for each model (`--spec auto`).
 - **KV formats**: `int8`, `bf16`, `fp8`, `nvfp4`, `k8v4`, `vq2` and `k4v2`.
 - **Vision**: images and video; the vision encoder can stay in system RAM.
+- **Documents**: PDFs (page text, and page images with vision, read with PDFium), plain-text documents and
+  search results, with Anthropic citations
+  ([serving](docs/serving.md#documents-pdfs-and-citations)).
 - **Conversion**: Hugging Face, NVIDIA ModelOpt, Quasar and GGUF sources; Q4-Q8, FP8, NVFP4 and
   mixed recipes.
 - **Windows and Linux**: native MSVC and GCC builds, WSL2 included.
@@ -522,18 +525,24 @@ download a model) under **Models**, press **Load**, and point your tools at the 
 ## Quick start (Windows)
 
 Prerequisites: Visual Studio 2026 (or 2022, MSVC 14.44) with its C++ CMake tools (they bring Ninja),
-the CUDA 13.4 toolkit or later (CMake refuses an older one), and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
+the CUDA 13.4 toolkit (CMake refuses an older one; later ones are untested, and 13.5's device link may need over 46 GB of RAM:
+[build system](docs/maintainer/build-system.md)), and FFmpeg, libjpeg-turbo and curl from vcpkg (`x64-windows`, at `C:\vcpkg`;
 `vcpkg install libjpeg-turbo:x64-windows` adds libjpeg-turbo to an existing tree); adjust the paths at
 the top of `build_native.bat`. It builds with Ninja Multi-Config (about 30 % faster than the Visual
 Studio generator); a `build-windows` tree from the Visual Studio generator is configured afresh on its
 next build.
 
+PDF documents need PDFium: `tools\deps\fetch_pdfium.py` downloads the pinned prebuilt release, checks
+its SHA-256 and unpacks it where `build_native.bat` finds it (without it the build succeeds and PDFs
+are refused).
+
 ```bat
+py -3.11 -I tools\deps\fetch_pdfium.py
 build_native.bat configure
 build_native.bat build
 ```
 
-The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs beside it.
+The server is `build-windows\apps\Release\infernix-serve.exe`, with its DLLs (`pdfium.dll` among them) beside it.
 
 **The easy way: the launcher.** Run `infernix-launcher.exe`, beside the server: see
 [Infernix Launcher](#infernix-launcher-beta).
@@ -591,13 +600,15 @@ measured overall, and `auto` picks the draft length):
 | Qwen3.6-27B (NVFP4, groupwise) | `--spec mtp --draft-tokens auto --lm-head-draft` | the per-round MTP length where its configuration registers `adaptive-mtp` (startup reports it), else 3 every round |
 | Ornith-1.5-122B (and its UNCENSORED conversion) | `--spec mtp --draft-tokens auto` | 2 confidence-gated drafts: 14 % faster than plain decode at one request, about 6 % slower while two decode together; DFlash2's `auto` decodes plain |
 
-For long conversations on a model whose weights all sit in VRAM (the 27Bs, the 35B-A3B), add `--embedding-host`:
+For long conversations on the 27Bs, whose KV cache two long conversations outgrow, add `--embedding-host`:
 the token embedding moves to pinned RAM and its VRAM (1.18 GiB on the 27B, about 37K tokens of INT8 KV) becomes
 KV cache, with the same output. Leave `--prefill-chunk` at its default: prefill already takes 4,096-token steps
 while nothing else runs, and a larger chunk makes every other request wait longer and takes KV cache for its
 workspace. On an RTX 5090, two agent conversations of 185K and 100K tokens on the 27B NVFP4 at four lanes reached
 their first token in 0.5 s on average (0.7 s at worst) with these settings, against 2.5 s (16.5 s) with
-`--prefill-chunk 4096` and neither option, where the two did not fit the KV cache together.
+`--prefill-chunk 4096` and neither option, where the two did not fit the KV cache together. The 35B-A3B's KV cache
+already holds about 850K tokens at four lanes, so there `--embedding-host` only costs its prompts' row reads (cold
+prefill 0.5-0.8 % slower).
 
 Without `--spec`, `infernix-serve` and `infernix` speculate as `--spec auto --draft-tokens auto`: they make the
 table's drafter choice by themselves from the artifact's drafters and report it at startup. On Flash-Next that is
@@ -623,13 +634,14 @@ DLLs beside `infernix-serve.exe` and install the Visual C++ redistributable if m
 
 ## Quick start (Linux)
 
-64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13.4 or
-later (CMake refuses an older toolkit: CUDA 13.2 miscompiles sm_120a code), CMake 3.28+, a C++20
+64-bit Linux and WSL2 (tested on Ubuntu 24.04, CUDA 13.4, GCC 13.3). Prerequisites: CUDA 13.4
+(CMake refuses an older toolkit: CUDA 13.2 miscompiles sm_120a code; later ones are untested), CMake 3.28+, a C++20
 compiler, Ninja, `pkg-config`, and the FFmpeg, libjpeg-turbo and curl development packages:
 
 ```bash
 sudo apt-get install -y build-essential cmake ninja-build pkg-config libavformat-dev libavcodec-dev libavutil-dev libswscale-dev libjpeg-turbo8-dev libcurl4-openssl-dev
-cmake --preset release
+python3.11 -I tools/deps/fetch_pdfium.py   # PDF documents (PDFium); prints the tree for PDFIUM_ROOT
+cmake --preset release -DPDFIUM_ROOT="$PWD/build-deps/pdfium/chromium-8152/linux-x64"
 cmake --build build -j
 ```
 

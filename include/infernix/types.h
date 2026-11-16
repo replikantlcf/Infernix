@@ -1334,6 +1334,11 @@ struct PromptOptions {
     // constraints cover them after tool_jsons, in this order, while the template's tool section
     // omits them; a message that loads one carries its definition in its own content.
     std::vector<std::string> deferred_tool_jsons;
+    // Names of listed declarations (tool_jsons) the output contract leaves out: tools the conversation withdrew or
+    // redefined after the tool section listed them (Anthropic tool_removal / tool_addition in a mid-conversation
+    // system message). The tool section still lists them as the conversation first saw them; a redefinition's newer
+    // declaration is in deferred_tool_jsons under the same name.
+    std::vector<std::string> withdrawn_tool_names;
     // The client knows tools the request does not declare (it defers tools behind its own search, as
     // Claude Code does with its MCP tools): a well-formed call to an undeclared name stays a call for
     // the client to judge instead of turning into text. The prompt does not change.
@@ -1495,6 +1500,17 @@ struct MediaGeometry {
     std::int32_t height = 0;
 
     [[nodiscard]] friend bool operator==(MediaGeometry, MediaGeometry) noexcept = default;
+};
+
+// How Vision sizes an image, for a caller that renders images itself (PDF pages): an image whose sides are
+// multiples of token_edge and whose area lies within [min_pixels, max_pixels] enters unresized, as
+// (width / token_edge) * (height / token_edge) vision tokens. One prompt's images and videos hold at most
+// prompt_tokens together. All zero without vision.
+struct VisionImageBudget {
+    std::uint64_t prompt_tokens = 0;
+    std::uint32_t token_edge    = 0;
+    std::uint64_t min_pixels    = 0;
+    std::uint64_t max_pixels    = 0;
 };
 
 struct PromptSummary {
@@ -2375,11 +2391,12 @@ struct RuntimeStats {
     std::uint64_t hybrid_host_block_writes       = 0;
     std::uint64_t hybrid_host_image_restores     = 0;
     std::uint64_t hybrid_host_block_restores     = 0;
-    // Of those, blocks copied for a waiting FIFO head before its admission.
+    // Of those, blocks copied for a queued request (the FIFO head or the one behind it) before its admission.
     std::uint64_t hybrid_prefetched_blocks       = 0;
     std::uint64_t hybrid_host_write_bytes        = 0;
     std::uint64_t hybrid_host_restore_bytes      = 0;
-    // The copy calls behind those bytes (Qwen3.5's Host tier; zero for other caches).
+    // The copy calls behind those bytes, a restore's each a batch of copies (Qwen3.5's Host tier; zero for other
+    // caches).
     std::uint64_t hybrid_host_write_copies       = 0;
     std::uint64_t hybrid_host_restore_copies     = 0;
     std::uint64_t hybrid_evicted_blocks          = 0;
