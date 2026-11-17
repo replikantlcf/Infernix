@@ -8264,6 +8264,42 @@ counts, another list layout, another artifact's chunks, the first round, chunk s
 `infernix_qwen4_exp_engine_host_real_test` checks that the reproducible route's tokens equal those
 of an Engine without a host.
 
+**A start's own pool** (2026-11-17, `HostExpertTier::fill_pool`, candidates QK-06). Without a host the slots were
+page-locked before the fill read anything, and `cudaHostAlloc` is serial in the driver (0.12 s/GiB from one to eight
+threads, 64 MiB or 1 GiB pieces alike; unbuffered reads keep their rate beside it: 6.6 against 6.1-6.5 GiB/s). Now,
+before the tier is built, a worker page-locks the chunks `pin_slots` will take, in its order and sizes, while the
+Program reads the fill order's first keys into each chunk's free resident slots (past the ring, prefetch and demotion
+lists) as it lands, in their file order so neighbouring records go as one scatter read; the chunks then go to a pool of
+this start's own with those keys, and the tier keeps them unread as it keeps a host's. A chunk the OS refuses ends the
+page-locking: the tier asks for the rest itself and meets the refusal and the pin reserve as before (the unit test
+compares that end state with a tier built without the pool), and a failed read leaves its slot to the fill. Records of
+one size only (not a GGUF import's classes), no CSF, no stripe, not on a host. FP4-Local with `--host-context-mib 16384`
+(58.2 GiB of slots; RTX 5090, i9-13900K, alternated starts): 56.3 GiB read in 8.9 s with the page-locking (7.2-7.6 s)
+under it, start 20.5 / 20.7 s against 27.5 / 27.6 s (six starts of the build before: 27.4-35.4 s, median 27.5); a start
+whose experts all fit as banks (7500) is unchanged (23.0 / 23.2 against 22.7 / 23.6 s).
+
+**The seeds' copies stay** (2026-11-17, `HostExpertTier::refill_over_seeds`). After the frames' warm start the first
+pass's RAM copies of the VRAM seeds were all released, their slots took the fill order's remaining keys, and the slots
+left over were read again from the artifact as shadows of the least-used seeds: an FP4-Local start released 4,562
+copies and read 1,860 of them back (4.8 GiB), 27,433 records for 24,576 experts. Now each class releases only as many
+copies as its remaining keys need, most-used seed first, and the least-used keep the copies they have; a class that
+still has a key on the SSD while it keeps a shadow (a seed the order does not name, a pinned or listed slot) releases
+the rest and is filled again. When every seed had a copy from the first pass (FP4-Local: 4,562 of 4,562), the keys
+in RAM, in VRAM and the shadows are the same as before and only the slots of those records differ. FP4-Local,
+`--host-context-mib 16384` (RTX 5090, i9-13900K): every start reads each record once (the real host test's four
+starts: 24,576), and the step after the warm start takes 1.11-1.15 s against 1.83-1.88 s (12 of 12 alternated
+starts with a normal warm start). Starts with the CPU rates confirmed at once: 15.7 / 15.8 / 16.9 s against 16.5 /
+16.5 / 16.5 s; the 16.9 s start's warm start took 1.2 s longer, a step before this change (another series, with
+the full settle every start: 20.0 / 19.9 / 19.9 against 20.6 / 20.7 / 23.9 s, the 23.9 s start's warm start 3.2 s
+longer). Decode on the new slot layout was not measured. In one earlier series five of six starts of this build read
+the 1-column CPU rate at ~16,500 against ~20,000 experts/s while the alternated starts of the build before did not;
+the 8-column rate of those readings stayed normal (47,100-48,400 against 48,400-52,200 columns/s), every start had
+the same saved state and so the same fill order, and 18 later starts of this build in three orders (same-build runs,
+alternated, the reference rewritten or fixed) read 19,600-21,000: the cause was not found. The 122B with
+`--expert-ram-mib 40000` needs every copy's slot, so it releases them all, as before (7,449 experts in RAM, 2,402 on
+the SSD, both builds). Not run: an artifact with several record sizes (IQ3_S), where the per-class release has only
+the unit tests.
+
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 
 Branch `claude/fn-prefill`. The steps are §19.3.6 item 4's F0-F6 (`strata-amendments.md`, "Prefill");
@@ -9113,8 +9149,9 @@ elastic pool does the same job with no kernel change:
       unmapped), as many as the growth needs: a fixed pool at the capacity takes them all.
     - Growth is refused while frames are lent. The quote and the prefix selection count what one
       growth could add.
-    - When only a prefill's stream ring and wide arena are lent (no layer walk, no vision window),
-      the Engine's reclaim for a short binding returns them between calls and grows (the prompt's
+    - When only a prefill's loans are lent (the stream's ring, wide arena and walk area and the wide
+      workspace; no walk span running, no vision window; `returnable_frames`), the Engine's reclaim for
+      a short binding returns them between calls or walk spans and grows (the prompt's
       next streamed call lends again from the smaller cache, or stages: the same bytes), and the
       quote counts that growth. A completed prompt also re-runs admission, since its loans return
       then. Before 2026-10-15 a long prompt held its loans for its whole prefill, and a request
@@ -10865,6 +10902,16 @@ bit-identical greedy output, plain decode 397.4 → 398.6 tok/s (every four-bloc
   queue), finished before A, and its output equals its solo run; A took 19.2 s instead of 15.4 s. The
   reclaim returns the leases only when the pool's capacity has room for the growth (at a full
   `--max-context 150000` it had returned 4,221 frames for nothing).
+  From 2026-10-17 (the wide arena and the walk area became leases of their own, 1bd307c5) to 2026-11-16 the
+  check counted only the ring and the wide workspace, so no streamed prompt's loans were ever returnable and
+  every such wait lasted the whole prompt: in the greedy two-conversation run (Dense8, C = 2) a cold 96K
+  prompt waited 17.5-19.0 s behind a cold 182K one (16 s of it short 1,471 KV pages). `returnable_frames`
+  counts all four leases; `test_queued_growth_real` (an 81,920-token two-span prompt, an 8,192-token request
+  1.5 s later) binds the second request 4.2 s before the first prompt's first output (the old count: at it).
+  Fixed work (Dense8, `--reproducible`, two closed-loop conversations, a 151K and an 80K cold prompt 2 s apart, then
+  ~1.9K-token turns, every reply its exact length; 4 runs an arm, alternated): makespan 46.73 s (46.7-46.8) before,
+  46.84 s (46.7-47.0) after; first outputs summed 55.7 -> 53.3 s (the 80K prompt's 23.1 -> 12.6 s, the 151K
+  prompt's 16.3 -> 25.3 s).
 - A built-in calibrated expert order seeds the warm start (S4b) when no saved state exists: NInfer's
   `kFlashNextExpertPriority` (f8a774f73; 48 layers × 512 experts ranked over 128 tasks in nine
   domains), copied into `expert_cache/calibrated_order.cpp` and applied to every model of its shape
@@ -11473,6 +11520,25 @@ later only if the second beat the first's experts/s by more than 10 %; the best 
 startup line lists each reading's experts/s, and the busy warning stays only when every reading was busy.
 The full layout's reading moved from before the
 CPU service's creation to after the warm start, beside the tier's, and pays the 4 s pause.
+
+**A reference ends the readings early (2026-11-17).** The pause was spent waiting in most starts: in 15 of 17
+FP4-Local starts of 2026-11-16/17 the first reading lay within 7 % of the best. Now a start that settled in full on a
+quiet CPU records its rates beside the saved expert state (`<expert state>.cpu-rates`, one line a key: the CPU's brand,
+logical CPUs and RAM size, then the artifact, the team's workers and CPUs, its arithmetic, the record stride, banks or
+tier; `placement.h` `load_cpu_rate_reference` / `save_cpu_rate_reference`; the 122B's offload too). A later start of
+the same key takes two readings back to back (the first draws the CPU and memory out of their idle states, as the link
+probe's spinning SMs draw the link out of its); when their best lies within 10 % of the reference either way, the
+readings end there and the startup line says "confirmed against N from <date>". Below the band (memory still slow) or
+above it (a changed machine) they settle as before, and the full settle rewrites the reference; a confirmed start never
+writes it (it would ratchet down by up to 10 % a start). The session always takes this start's readings. Without an
+expert state file (`--expert-state off`, the bench) nothing changes. The PCIe link probe is not cached: it runs at every
+start (41dd1824's 200 ms of spinning SMs, then its best copy), about 0.2 s. FP4-Local, alternated starts (RTX 5090,
+i9-13900K): banks (`--host-context-mib 7500`) 19.0 / 18.8 / 19.1 s against 23.0 / 23.1 / 22.8 s; the SSD tier (16384)
+16.6 / 16.6 / 16.4 s against 24.7 / 25.1 / 27.2 s. There the first reading read 9,640-10,912 experts/s and the one
+taken right after it 19,383-19,922: the low first reading is the probe's own warm-up, gone 60 ms later, so the old rule
+paid two pauses for it. A reference doctored to 30,000 experts/s was met with 20,763 and settled in full (23.5 s), and
+rewritten. Residual risk: a change the key cannot see (DIMM speed, a BIOS power plan) could put a depressed pair of
+readings inside the band; the startup line names the reference so it can be seen.
 
 ### 19.3.29 IQ3_S prefill: BF16 tiles over the decoded planes, one-pass walk MoE calls (2026-10-19)
 

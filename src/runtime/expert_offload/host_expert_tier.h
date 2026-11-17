@@ -170,6 +170,24 @@ public:
     // shares each class's lent slots among min(its layers, this), so each layer's reads fit them.
     static constexpr std::uint32_t kStreamWindow = 4;
 
+    // Before a tier of `store` with `options` is built: page-locks the chunks its construction pins (Options::allocate,
+    // on a worker thread, in the order pin_slots takes them) and reads the first keys of `order` (the startup fill's)
+    // into each chunk's resident slots as the chunk lands, then gives every chunk to `pool` with the records it holds
+    // (HostSlotPool::keep under `identity`). A tier built next with that pool takes the chunks and its fill keeps those
+    // records unread, so the page-locking (~0.12 s/GiB, serial in the driver) runs beside the reads instead of before
+    // them (candidates QK-06; a FP4-Local start with 58 GiB of slots spent 7.8 s pinning, then 13.8 s reading). A chunk
+    // the OS refuses ends the pinning: the tier asks for the rest itself and meets the refusal as before. A failed read
+    // leaves its slot unheld (the tier reads it). Records of one size and no CSF only; otherwise nothing is done.
+    struct PoolFill {
+        std::uint32_t chunks  = 0; // given to the pool
+        std::uint32_t records = 0; // read, every one equal to the artifact's bytes
+        std::uint32_t failed  = 0; // reads that failed (their slots left unheld)
+        std::uint64_t bytes   = 0; // of the chunks
+        double seconds = 0, pin_seconds = 0; // the whole call; the worker's page-locking
+    };
+    [[nodiscard]] static PoolFill fill_pool(const ExpertStore& store, Options options, std::span<const std::uint32_t> order,
+                                            HostSlotPool& pool, const std::string& identity);
+
     HostExpertTier(const HostExpertTier&)            = delete;
     HostExpertTier& operator=(const HostExpertTier&) = delete;
 
@@ -196,6 +214,17 @@ public:
     // into free resident slots of their record size until none is left; returns how many. A key whose
     // size has no free slot is passed over, so later keys can be read before it.
     std::uint32_t prefill(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip = {});
+    // After the frames' warm start from the first fill, `in_vram` naming the keys VRAM now holds: the RAM copies of
+    // those keys (shadows) give up as many slots as the fill order's other keys need (each class's keys prefill would
+    // place, less its free slots), most-used first (`ranked` order), and those keys are read (prefill(ranked,
+    // in_vram)). The least-used copies stay as the shadows a later prefill_shadows would otherwise read again from the
+    // artifact (1,860-2,857 records of a FP4-Local start). A class whose ranked keys still lack a host copy while it
+    // keeps a shadow then gives up the rest of its shadows and is filled again: no ranked key stays on the SSD for a
+    // shadow. Returns the shadows released and the records read.
+    struct SeedRefill {
+        std::uint32_t released = 0, refilled = 0;
+    };
+    SeedRefill refill_over_seeds(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& in_vram);
     // Reads the keys of `ranked` (best first) that have no host copy and that `skip` rejects into
     // unpinned records until none is left; they keep them for good. Returns how many.
     std::uint32_t fill_unpinned(std::span<const std::uint32_t> ranked, const std::function<bool(std::uint32_t)>& skip);

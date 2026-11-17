@@ -1483,10 +1483,33 @@ public:
                 for (const auto& layer : parameters_.layers) { banks.push_back(layer.moe.bank); }
                 tier.csf = runtime::expert_offload::tier_csf_shape(banks);
             }
+            // The slots page-lock beside the startup fill's reads (HostExpertTier::fill_pool, candidates QK-06): a pool of
+            // this start's own holds the chunks with the first keys of the fill order read into them, and the tier takes
+            // them and keeps those records. Not with an EngineHost's pool (its chunks already hold records), an expert
+            // stripe or CSF records.
+            if (!options_.expert_slot_pool && options_.expert_stripe.empty() && !tier.csf) {
+                const auto [load, source] = startup_expert_state(false);
+                (void)source;
+                const std::vector<std::uint32_t> order = tier_fill_order(load.state ? &*load.state : nullptr);
+                startup_pool_ = std::make_shared<runtime::expert_offload::HostSlotPool>([](void* p) { (void)cudaFreeHost(p); });
+                startup_fill_ = HostExpertTier::fill_pool(*records, tier, order, *startup_pool_, pool_identity());
+                tier.pool          = startup_pool_;
+                tier.pool_identity = pool_identity();
+                char line[256];
+                std::snprintf(line, sizeof(line),
+                              "SSD expert tier: %u records (%.1f GiB) read into %u slot chunks while they were "
+                              "page-locked, in %.1f s (page-locking %.1f s), %u reads failed",
+                              startup_fill_.records,
+                              static_cast<double>(startup_fill_.records) * static_cast<double>(records->record_bytes()) /
+                                  (1ULL << 30),
+                              startup_fill_.chunks, startup_fill_.seconds, startup_fill_.pin_seconds, startup_fill_.failed);
+                diagnostic(line, DiagnosticLevel::Debug);
+            }
             tier_ = std::make_unique<HostExpertTier>(*records, std::move(tier));
             // What the tier did not take (another size, more than it pins) is released before anything else is
             // page-locked, so the Program ends with the memory a start without the host would hold.
             if (options_.expert_slot_pool) { options_.expert_slot_pool->release_idle(); }
+            if (startup_pool_) { startup_pool_->release_idle(); }
             residency_->attach_tier(tier_.get(), options_.expert_ram_exclusive);
             if (tier_->refused_slots() > 0) {
                 diagnostic("SSD expert tier: Windows refused to page-lock " + std::to_string(tier_->refused_slots()) +
@@ -2618,9 +2641,17 @@ public:
     [[nodiscard]] bool leases_returnable() const noexcept {
         if (!kv_vmm_ || !residency_ || walk_.active || wide_active_) { return false; }
         const std::uint64_t lent = residency_->stats().lent_frames;
-        const std::uint64_t returnable = (stream_lease_.valid() ? stream_lease_.count : 0U) +
-                                         (work_lease_.valid() ? work_lease_.count : 0U);
-        return lent != 0 && lent == returnable;
+        return lent != 0 && lent == returnable_frames();
+    }
+    // The frames return_stream_lease and return_wide_work give back: the stream's ring, wide arena and walk
+    // area, and the wide workspace. (Counting the ring alone, after the arena and the walk area became leases
+    // of their own, kept every streamed prompt's loans from going back, so a request short of KV waited out
+    // the whole prompt: 16 s behind a cold 182K one, 2026-11-16.)
+    [[nodiscard]] std::uint64_t returnable_frames() const noexcept {
+        const auto count = [](const ExpertResidency::FrameLease& lease) -> std::uint64_t {
+            return lease.valid() ? lease.count : 0U;
+        };
+        return count(stream_lease_) + count(stream_wide_lease_) + count(stream_walk_lease_) + count(work_lease_);
     }
 
     // ---------------------------------------------------------------- execution
@@ -3319,11 +3350,28 @@ public:
                 testing::count_held_finish();
             }
             out.status = runtime::ConsumeStatus::Consumed;
-        } catch (const std::exception& error) {
-            // The Engine fails a terminal sequence that does not finish; say why.
-            diagnostic(std::string("Qwen4Exp: finish failed: ") + error.what(), DiagnosticLevel::Error);
         } catch (...) {
-            diagnostic("Qwen4Exp: finish failed", DiagnosticLevel::Error);
+            // The reply is whole on the host; finishing failed (the device under the enqueued work, a publication).
+            // The lane is released (or held published) without more publication, the request completes, and the
+            // Engine then recovers the device with this error. A lane that cannot be released fails the Engine.
+            out.device_error = std::current_exception();
+            try {
+                const auto index = lane_of(sequence);
+                if (lanes_[index].phase == Phase::Finishable) {
+                    if (release_lane) {
+                        release(index);
+                    } else {
+                        lanes_[index].phase = Phase::Published;
+                        testing::count_held_finish();
+                    }
+                }
+                out.status = runtime::ConsumeStatus::Consumed;
+            } catch (const std::exception& error) {
+                diagnostic(std::string("Qwen4Exp: a lane whose finish failed could not be released: ") + error.what(),
+                           DiagnosticLevel::Error);
+            } catch (...) {
+                diagnostic("Qwen4Exp: a lane whose finish failed could not be released", DiagnosticLevel::Error);
+            }
         }
         return out;
     }
@@ -3343,7 +3391,16 @@ public:
             }
             release(index);
             out.status = runtime::ConsumeStatus::Consumed;
-        } catch (...) {}
+        } catch (...) {
+            // A device failure while the lane published its endpoint or was released: released here without one,
+            // and the Engine recovers the device once this request is answered (FinishResult::device_error).
+            out.device_error = std::current_exception();
+            try {
+                const auto index = lane_of(sequence);
+                if (lanes_[index].phase != Phase::Free) { release(index); }
+                out.status = runtime::ConsumeStatus::Consumed;
+            } catch (...) {}
+        }
         return out;
     }
 
@@ -3420,6 +3477,8 @@ public:
         // took more).
         out.cuda_graph_allowance_bytes = sizing_.reserve;
         out.cuda_graph_measured_bytes  = graph_set_.bytes > 0 ? static_cast<std::size_t>(graph_set_.bytes) : 0;
+        // An elastic pool keeps a fixed reserve and takes the rest back by chunks (internal_reserve, VM-04).
+        out.cuda_graph_excess_absorbed = residency_ && residency_->elastic();
         if (residency_) {
             // As the 122B's ExpertOffload::memory_summary reports its cache; the cache only resizes
             // under the VRAM monitor, so without it the startup frames are today's.
@@ -3882,14 +3941,12 @@ public:
         diagnostic(text, DiagnosticLevel::Info);
     }
 
-    // ---- warm start (design §19.3.5 S4b) ----
-    // Fills the frames from the saved state, before the first request; without one (a first start, a
-    // state of another artifact, or no file given: the bench and the tools), from the calibrated expert
-    // order when the model has its shape, unless --expert-state off asked for an empty cache. With the
-    // SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies are released
-    // and their slots refilled with the next keys of the fill order, so the two levels hold different
-    // experts. Only a given file is read or saved.
-    void warm_start_experts() {
+    // Where the warm start's ranking and counts came from.
+    enum class SeedSource { None, Saved, Calibrated };
+
+    // The saved state the warm start seeds from (or the calibrated order), and its source. The SSD tier's slot pool
+    // (HostExpertTier::fill_pool) reads it before the tier exists, for the same fill order.
+    std::pair<expert_cache::ExpertStateLoad, SeedSource> startup_expert_state(bool report) {
         const auto keys = c_.num_hidden_layers * c_.moe.experts;
         expert_cache::ExpertStateLoad load;
         SeedSource source = SeedSource::None;
@@ -3900,13 +3957,25 @@ public:
             if (load.state) {
                 source = SeedSource::Saved;
             } else if (options_.expert_seed && has_calibrated_order()) {
-                if (!options_.expert_state.empty()) {
+                if (report && !options_.expert_state.empty()) {
                     diagnostic("expert cache: no saved state used: " + load.message, DiagnosticLevel::Debug);
                 }
                 load.state = calibrated_expert_order();
                 source     = SeedSource::Calibrated;
             }
         }
+        return {std::move(load), source};
+    }
+
+    // ---- warm start (design §19.3.5 S4b) ----
+    // Fills the frames from the saved state, before the first request; without one (a first start, a
+    // state of another artifact, or no file given: the bench and the tools), from the calibrated expert
+    // order when the model has its shape, unless --expert-state off asked for an empty cache. With the
+    // SSD tier, RAM is filled first (the frames load from it), then the seeds' RAM copies are released
+    // and their slots refilled with the next keys of the fill order, so the two levels hold different
+    // experts. Only a given file is read or saved.
+    void warm_start_experts() {
+        auto [load, source] = startup_expert_state(true);
         const expert_cache::SavedState* state = load.state ? &*load.state : nullptr;
         TierFill fill;
         if (tier_) {
@@ -3923,9 +3992,6 @@ public:
     }
 
 private:
-    // Where the warm start's ranking and counts came from.
-    enum class SeedSource { None, Saved, Calibrated };
-
     // The calibrated order (program/calibrated_order.h) ranks Qwen3.8-Flash-Next's experts: it
     // applies to every model of that shape (NInfer's guard), whatever the artifact's formats.
     [[nodiscard]] bool has_calibrated_order() const noexcept {
@@ -3949,7 +4015,7 @@ private:
     // filled the first layers and left the last ones on disk).
     [[nodiscard]] std::vector<std::uint32_t> tier_fill_order(const expert_cache::SavedState* state) const {
         const std::uint32_t layers = c_.num_hidden_layers, experts = c_.moe.experts, keys = layers * experts;
-        if (tier_->keys() != keys) { throw std::logic_error("Qwen3.8-Flash-Next: the SSD tier has another key count"); }
+        if (tier_ && tier_->keys() != keys) { throw std::logic_error("Qwen3.8-Flash-Next: the SSD tier has another key count"); }
         // A key's place in the layer-interleaved order: expert e of every layer before expert e + 1.
         const auto spread = [&](std::uint32_t key) { return (key % experts) * layers + key / experts; };
         std::vector<std::uint32_t> order;
@@ -4008,39 +4074,41 @@ private:
         return fill;
     }
 
-    // After the frames' warm start: the seeds are in VRAM, so their RAM copies (shadows) are
-    // released and their slots take the next keys of the fill order. A seed VRAM later evicts is
-    // demoted into RAM when it outranks the coldest resident (T4), as any key without a host copy.
-    // Slots still free once every other key has a host copy (the exclusive layout's reserve) hold
-    // shadows of the least-used seeds, the first a prefill's loan or decode evicts, so those
-    // evictions keep a RAM copy instead of leaving the expert to the SSD.
+    // After the frames' warm start: the seeds are in VRAM, so their RAM copies (shadows) give their
+    // slots to the next keys of the fill order, most-used first, and the least-used keep theirs. A
+    // seed VRAM later evicts is demoted into RAM when it outranks the coldest resident (T4), as any
+    // key without a host copy. Slots still free once every other key has a host copy (the exclusive
+    // layout's reserve) hold shadows of the least-used seeds, the first a prefill's loan or decode
+    // evicts, so those evictions keep a RAM copy instead of leaving the expert to the SSD.
     void finish_tier_fill(const TierFill& fill, std::uint32_t seeded) {
         const auto start        = std::chrono::steady_clock::now();
-        std::uint32_t released  = 0, refilled = 0;
+        std::uint32_t refilled  = 0;
         const std::int32_t* in_vram = residency_->host_table();
         const auto vram_holds = [in_vram](std::uint32_t key) { return in_vram != nullptr && in_vram[key] >= 0; };
-        if (seeded > 0) {
-            released = tier_->controller().release_shadows();
+        // The seeds' RAM copies the first pass read; the slots the others hold are the order's other keys.
+        const auto seed_copies = static_cast<std::uint32_t>(tier_->controller().shadow_count());
+        if (seeded > 0 && seed_copies > 0) {
             // The whole order again, past the keys VRAM holds: with record-size classes the first pass passed over
-            // the keys of a class it had filled, wherever they rank, so the released slots are theirs first. From
-            // the position the first pass stopped at, IQ3_S kept 17 experts on the SSD beside 2,895 shadows, and the
-            // first 16K prefill read them (6,700-6,723 against 6,836-6,845 tok/s, 2026-10-29).
-            if (released > 0) { refilled = tier_->prefill(fill.order, vram_holds); }
+            // the keys of a class it had filled, wherever they rank, so the freed slots are theirs first. From the
+            // position the first pass stopped at, IQ3_S kept 17 experts on the SSD beside 2,895 shadows, and the
+            // first 16K prefill read them (6,700-6,723 against 6,836-6,845 tok/s, 2026-10-29). Only the copies those
+            // keys need go; releasing them all read the least-used again as shadows below (1,860 records a start).
+            refilled = tier_->refill_over_seeds(fill.order, vram_holds).refilled;
         }
         // The unpinned records take the next keys of the order that neither the slots nor the frames
         // hold: they keep them for good, so a copy of a VRAM seed would be wasted.
         const std::uint32_t unpinned = tier_->fill_unpinned(fill.order, vram_holds);
-        std::uint32_t shadows = 0;
         if (seeded > 0 && in_vram != nullptr) {
             std::vector<std::uint32_t> least_used_seeds;
             for (auto it = fill.order.rbegin(); it != fill.order.rend(); ++it) {
                 if (in_vram[*it] >= 0) { least_used_seeds.push_back(*it); }
             }
-            shadows = tier_->prefill_shadows(least_used_seeds);
+            (void)tier_->prefill_shadows(least_used_seeds);
         }
+        const auto shadows = static_cast<std::uint32_t>(tier_->controller().shadow_count());
         const double seconds =
             fill.seconds + std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-        const std::uint32_t keys = tier_->keys(), in_ram = fill.filled - released + refilled;
+        const std::uint32_t keys = tier_->keys(), in_ram = fill.filled - seed_copies + refilled;
         const std::uint32_t slots = tier_->pinned_slots();
         const double gib          = static_cast<double>(tier_->record_bytes()) / (1ULL << 30); // an unpinned record: the largest
         char split[160] = "";
@@ -4052,10 +4120,14 @@ private:
         if (shadows > 0) {
             std::snprintf(shadow_text, sizeof(shadow_text), " and copies of the %u least-used in VRAM", shadows);
         }
-        const std::uint32_t on_ssd = keys - in_ram - released - unpinned;
-        // An EngineHost's slots: the records still there from its last Engine were kept, the rest read.
-        char read[96];
-        if (tier_->stats().kept > 0) {
+        const std::uint32_t on_ssd = keys - in_ram - seed_copies - unpinned;
+        // An EngineHost's slots: the records still there from its last Engine were kept, the rest read. This start's own
+        // pool (fill_pool): the records read while their slots were page-locked, then the rest.
+        char read[128];
+        if (startup_pool_ && tier_->stats().kept > 0) {
+            std::snprintf(read, sizeof(read), "%llu read in %.1f s as their slots were page-locked, the rest in %.1f s",
+                          static_cast<unsigned long long>(tier_->stats().kept), startup_fill_.seconds, seconds);
+        } else if (tier_->stats().kept > 0) {
             std::snprintf(read, sizeof(read), "%llu kept from the last Engine, the rest read in %.1f s",
                           static_cast<unsigned long long>(tier_->stats().kept), seconds);
         } else {
@@ -4081,7 +4153,7 @@ private:
                       fill.source == SeedSource::Saved        ? "the saved ranking, then the last session's use counts"
                       : fill.source == SeedSource::Calibrated ? "the calibrated expert order"
                                                               : "spread across the layers",
-                      released > 0 ? (", none of them among the " + std::to_string(released) + " in VRAM").c_str() : "",
+                      seed_copies > 0 ? (", none of them among the " + std::to_string(seed_copies) + " in VRAM").c_str() : "",
                       shadow_text, split, seconds, on_ssd, keys);
         diagnostic(line, DiagnosticLevel::Debug);
         if (const std::string csf = tier_->csf_summary(); !csf.empty()) { diagnostic(csf, DiagnosticLevel::Debug); }
@@ -7704,6 +7776,10 @@ private:
     // in the stripe file.
     std::optional<ExpertStore> striped_store_;
     std::unique_ptr<ops::offloaded_moe::FetchChannel> fetch_channel_;
+    // The startup's own slot pool (HostExpertTier::fill_pool): declared before tier_, so it outlives the tier, which
+    // gives its chunks back to it when it ends.
+    std::shared_ptr<runtime::expert_offload::HostSlotPool> startup_pool_;
+    HostExpertTier::PoolFill startup_fill_;
     std::unique_ptr<HostExpertTier> tier_;
     // The tier's losses (keys that left both tiers) when the current stream span began (ForwardBatch::stream_whole).
     std::uint64_t tier_losses_at_span_ = 0;
