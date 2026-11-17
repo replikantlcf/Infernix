@@ -42,6 +42,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <variant>
 #include <vector>
 
 namespace infernix::models::qwen3_5::detail {
@@ -684,8 +685,15 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
         if (plan.execution_schedule.sampled_mtp_drafts) {
             matrix(layout, DType::I32, kMtpSampledDraftRanks, columns);
             matrix(layout, DType::FP32, kMtpSampledDraftRanks, columns);
-        } else if (plan.execution_schedule.mtp_draft_confidence) {
-            scratch(layout, ops::argmax_with_probability_workspace_bytes(DType::BF16, head_rows, head_rows, columns));
+        } else {
+            if (plan.execution_schedule.mtp_draft_confidence) {
+                scratch(layout,
+                        ops::argmax_with_probability_workspace_bytes(DType::BF16, head_rows, head_rows, columns));
+            }
+            // QK-04: the Gumbel-max routes re-draw sampled rows' argmax drafts under the target's keys.
+            if (plan.execution_schedule.gumbel_sampling) {
+                scratch(layout, ops::speculative_couple_drafts_workspace_bytes(head_rows, columns));
+            }
         }
     };
     const auto mtp_stem = [&](WorkspaceLayoutBuilder& layout, std::int32_t tokens,
@@ -1603,7 +1611,11 @@ ExecutionSchedule execution_schedule(const execution::Parameters& parameters,
                                            ? static_cast<std::int32_t>(options.max_context)
                                            : 0,
             .lossless_design         = {.active = options.reference, .kv = options.kv_cache},
-            .gumbel_sampling         = !options.fast_paths || options.lossless,
+            .gumbel_sampling         = !options.fast_paths || options.lossless ||
+                                       fast_paths.selected(FastPath::GumbelSampling),
+            .coupled_mtp_steps       = std::holds_alternative<MoeConfig>(parameters.model.config().text.ffn)
+                                           ? 1U
+                                           : std::numeric_limits<std::uint32_t>::max(),
             .logits                  = options.logits_dtype == LogitsDtype::BF16 ? DType::BF16 : DType::FP32};
 }
 // The fast INT8, NVFP4, VQ2 and K4V2 prompt kernels and the MXFP8 tiled kernel of FP8 and K8V4 KV

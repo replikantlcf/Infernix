@@ -25,6 +25,7 @@
 #include "models/qwen4_exp/execution/dflash2.h"
 #include "models/qwen4_exp/execution/forward.h"
 #include "models/qwen4_exp/program/ngram_tree_testing.h"
+#include "models/qwen4_exp/program/prefix/test_taps.h"
 #include "runtime/speculative/draft_length.h"
 #include "models/qwen4_exp/execution/parameters.h"
 #include "models/qwen4_exp/frontend/ngram_hash.h"
@@ -508,7 +509,9 @@ struct PairHead {
 
 class ProgramImpl {
 public:
-    enum class Phase : std::uint8_t { Free, Prefill, Decode, Finishable };
+    // Published: finished beside an open context transaction (finish_held). Its report and its prefix publication
+    // are done; the lane keeps its pages, state slot and pins until release_finished, after the transaction.
+    enum class Phase : std::uint8_t { Free, Prefill, Decode, Finishable, Published };
 
     struct Lane {
         Phase phase          = Phase::Free;
@@ -2374,7 +2377,9 @@ public:
     }
 
     // Penalty counts over the request's output so far (the sampler counts output tokens only),
-    // counted on the host: a binding may overlap a round that still uses the workspace.
+    // counted on the host: a binding may overlap a round that still uses the workspace. upload_pinned copies the
+    // table at the call (its staging ring), so the next lane's binding rewrites penalty_host_ without waiting for
+    // the device: no stream synchronization holds the Engine thread behind the queued rounds.
     void rebuild_token_counts(const Lane& lane) {
         const cudaStream_t s = device_.stream;
         auto* counts         = lane.sampling.token_counts;
@@ -2392,7 +2397,6 @@ public:
             if (token >= 0 && token < token_domain_) { ++host[static_cast<std::size_t>(token)]; }
         }
         upload_pinned(counts, host, bytes, s);
-        CUDA_CHECK(cudaStreamSynchronize(s)); // the table is read before the next lane's rewrites it
     }
 
     // Pauses a resident at its committed boundary (design §19.3.13): the prefix cache receives the
@@ -2499,10 +2503,10 @@ public:
             kv_busy();
             if (prefix_) { pc_make_room(missing); }
             if (pool_->available_pages() < missing) { (void)grow_kv(missing); }
-            if (pool_->available_pages() < missing && prefix_ && prefix_->transfers_pending()) {
-                // Blocks pinned only by their in-flight Host writes (a lane just paused or finished)
-                // become evictable once those land: wait for them before reporting a shortage.
-                prefix_->drain();
+            // Blocks pinned only by their in-flight Host writes (a lane just paused or finished) become evictable once
+            // those land: wait for them one at a time, oldest first, until the pages are there, before reporting a
+            // shortage (never for every transfer at once: another lane's restore is not waited for).
+            while (pool_->available_pages() < missing && prefix_ && prefix_->settle_oldest_transfer()) {
                 pc_make_room(missing);
             }
             auto reservation = pool_->reserve(missing);
@@ -2554,6 +2558,10 @@ public:
             out.advanced = true;
             if (!vision_encoded(admitted)) { return out; }
         }
+        if (testing::binding_held()) { // a test's longer binding (testing::set_binding_hold)
+            out.advanced = true;
+            return out;
+        }
         out.advanced  = true;
         out.complete  = true;
         out.published = true;
@@ -2583,11 +2591,9 @@ public:
         const std::uint32_t target = before + shortage.main_kv_pages;
         if (prefix_) {
             pc_make_room(target);
-            if (pool_->available_pages() == before && prefix_->transfers_pending()) {
-                // Blocks pinned only by in-flight Host writes become evictable once those land.
-                prefix_->drain();
-                pc_make_room(target);
-            }
+            // Blocks pinned only by in-flight Host writes become evictable once those land: the oldest first, one at a
+            // time, until the target is met.
+            while (pool_->available_pages() < target && prefix_->settle_oldest_transfer()) { pc_make_room(target); }
         }
         // A long prompt's stream ring and wide arena stay lent until its last call, and growth is
         // refused while frames are lent, so a request queued behind it waited out its prefill (issue
@@ -3248,7 +3254,34 @@ public:
         return out;
     }
 
-    FinishResult finish(SequenceHandle sequence) noexcept {
+    FinishResult finish(SequenceHandle sequence) noexcept { return finish_lane(sequence, true); }
+
+    // A finish beside an open context transaction (a vision binding's encode, which runs over several Engine
+    // cycles): everything finish() reports and publishes, the same prefix publication (a terminal lane runs no
+    // more units, and its endpoint capture and block writes are the Host-born snapshot and D2H copies a prefill
+    // tap of another lane takes during the transaction too), but the lane is not released: a release returns pages
+    // and frames the transaction's reservation was planned beside. The lane is Published until release_finished.
+    // Only a Finishable lane the transaction does not hold back (can_finish_held).
+    [[nodiscard]] bool can_finish_held(SequenceHandle sequence) const noexcept {
+        const std::uint32_t index = ContractAccess::lane(sequence);
+        return index < lanes_.size() && lanes_[index].phase == Phase::Finishable &&
+               lanes_[index].epoch == ContractAccess::epoch(sequence) && !context_blocks(sequence);
+    }
+    FinishResult finish_held(SequenceHandle sequence) noexcept { return finish_lane(sequence, false); }
+    void release_finished(SequenceHandle sequence) noexcept {
+        try {
+            const auto index = lane_of(sequence);
+            if (lanes_[index].phase != Phase::Published) {
+                diagnostic("Qwen4Exp: release of a lane that is not published", DiagnosticLevel::Error);
+                return;
+            }
+            release(index);
+        } catch (...) {
+            diagnostic("Qwen4Exp: release of a published lane failed", DiagnosticLevel::Error);
+        }
+    }
+
+    FinishResult finish_lane(SequenceHandle sequence, bool release_lane) noexcept {
         FinishResult out;
         try {
             const auto index = lane_of(sequence);
@@ -3279,7 +3312,12 @@ public:
                 const std::uint32_t deepest     = std::min(lane.prefix.deepest, lane.prompt_tokens);
                 out.cache_created_prompt_tokens = deepest > lane.prefix.reused ? deepest - lane.prefix.reused : 0U;
             }
-            release(index);
+            if (release_lane) {
+                release(index);
+            } else {
+                lanes_[index].phase = Phase::Published;
+                testing::count_held_finish();
+            }
             out.status = runtime::ConsumeStatus::Consumed;
         } catch (const std::exception& error) {
             // The Engine fails a terminal sequence that does not finish; say why.
@@ -3297,8 +3335,10 @@ public:
             out.timings      = timings(lanes_[index]);
             out.speculative  = lanes_[index].speculative;
             // A consistent abort (no unit in flight) leaves an endpoint a resend resumes from; inside
-            // a layer walk the layers are at different positions, so it leaves none.
-            if (pending_transaction_ == 0 && lanes_[index].phase != Phase::Free && !(walk_.active && walk_.lane == index)) {
+            // a layer walk the layers are at different positions, so it leaves none. A published lane
+            // has already published its endpoint.
+            if (pending_transaction_ == 0 && lanes_[index].phase != Phase::Free &&
+                lanes_[index].phase != Phase::Published && !(walk_.active && walk_.lane == index)) {
                 prefix_finish(lanes_[index], index);
             }
             release(index);

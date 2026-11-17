@@ -92,6 +92,23 @@ infernix_add_test(infernix_qwen4_exp_vision_lend_real_test
 set_tests_properties(infernix_qwen4_exp_vision_lend_real_test
   PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 3600)
 
+# A new chat asking about the same image resumes past it (a structural tap at the media's end) and encodes no
+# image (QC-01). Needs a Qwen4Exp artifact with the vision tower.
+infernix_add_test(infernix_qwen4_exp_media_reask_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_media_reask_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_media_reask_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
+# A request that finishes while another request's binding spans Engine cycles (a test hook holds it open, as a
+# Vision encode lent its window runs): its result arrives before the binding ends, with its usage fields, both
+# requests keep their solo ids, and its next turn resumes from the endpoint it published (QN-04).
+infernix_add_test(infernix_qwen4_exp_finish_beside_binding_real_test
+  SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_finish_beside_binding_real.cpp"
+  LIBRARIES infernix_engine infernix_model_runtime)
+set_tests_properties(infernix_qwen4_exp_finish_beside_binding_real_test
+  PROPERTIES SKIP_RETURN_CODE 77 RUN_SERIAL TRUE LABELS "gpu;real" TIMEOUT 1800)
+
 # Non-finite logits after a request published prefix-cache entries (a test hook): its entries are
 # withdrawn, a retry resumes from nothing and equals a cache-off run, and a saved cache file cannot
 # bring them back (hybrid-prefix-cache-spec §7.8, candidates SQ-01).
