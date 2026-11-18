@@ -71,6 +71,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -905,10 +906,15 @@ public:
         // exclusive layout's tier holds every expert VRAM does not, and with 64 slots its eight-column
         // verification calls lost the fork: IQ3_S struct decode 363.7 -> 419.4 tok/s with 80 (2026-10-28).
         // INFERNIX_TMP_STAGING_SLOTS fixes the count (a temporary A/B: n-gram 15 asks for 160 slots).
+        // A shared expert bank (MoeConfig::shared_bank) adds the call's last job, so a call of the widest width has one
+        // job more than it routes; the fork needs every job within the slots (ops::moe_experts), so it takes one slot
+        // more: without it NVIDIA NVFP4-QAD's eight-column verification calls lost the fork, MTP decode 15 % behind
+        // FP4-Local's (2026-11-17).
         const std::int32_t fixed_slots = temporary_switches::offload().staging_slots;
+        const std::int32_t shared_job  = c.moe.shared_bank ? 1 : 0;
         d.staging_slots = fixed_slots > 0                                     ? fixed_slots
                           : o.expert_ram_bytes != 0 && !o.expert_ram_exclusive ? kStagingSlots
-                                                                               : std::clamp(static_cast<std::int32_t>(c.moe.top_k) * d.max_width,
+                                                                               : std::clamp(static_cast<std::int32_t>(c.moe.top_k) * d.max_width + shared_job,
                                                                                             kStagingSlots, kMaxStagingSlots);
         d.staging       = static_cast<std::size_t>(d.staging_slots) * d.record_stride;
 
@@ -1264,7 +1270,7 @@ public:
         const auto kv_heads = dim(c_.attention.kv_heads);
         execution::ForwardKV kv;
         kv.block_tables  = tables_->matrix();
-        std::fill_n(unpackable_flag(0), kMaximumConcurrency, 0);
+        std::fill_n(unpackable_flag(0), kUnpackableFlags, 0);
         for (std::uint32_t l = 0; l < plan_.kv_layers; ++l) {
             const prefix::PlaneRange planes = prefix::kv_layer_planes(kv_geometry_, l);
             std::size_t plane               = planes.begin;
@@ -1302,6 +1308,15 @@ public:
         wide_work_     = plan_.wide_work;
         work_          = std::make_unique<WorkspaceArena>(work_capacity_);
         allocated += work_capacity_;
+        // The wide arena's planner (candidates QG-01), from the parameters alone: the load-time chunk fits below run
+        // before the Forward exists. The lossless route keeps its workspace formula.
+        if (!c_.lossless) {
+            planner_ = execution::Forward::planner(parameters_, device_, *work_, dim(options_.max_context),
+                                                   options_.fast_paths, options_.kv_cache);
+            // The chunk's wide arena by the forward's plan (the device plan's figure is the formula's, made before
+            // the parameters bound).
+            if (wide_work_ > 0) { wide_work_ = wide_need(chunk_); }
+        }
 
         // The promotions' copy sources: the banks where the device reads them (cudaMemcpyBatchAsync
         // faults on a registered block's host address where the device maps it elsewhere: WDDM).
@@ -1393,8 +1408,15 @@ public:
         if (options_.expert_cache) {
             const VramDemand demand = expert_frame_demand(residency_->frame_bytes());
             const VramSnapshot now  = vram_->query();
+            const auto fit_start    = Clock::now();
             fit_wide_work_to_cache(size_expert_frames(now, demand).frames,
                                    size_expert_frames(nominal_snapshot(now), demand).frames);
+            // The forward's plans are made here first (Forward::plan_run and its siblings, memoized per shape).
+            diagnostic("prefill chunk fitted to the expert cache in " +
+                           std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - fit_start).count()) +
+                           " ms (wide arena " + std::to_string(wide_work_ >> 20) + " MiB at " + std::to_string(chunk_) +
+                           " tokens)",
+                       DiagnosticLevel::Debug);
         }
         // The SSD expert tier (design §19.3.7): the banks were not pinned; RAM slots hold the
         // records the tier keeps and the rest are read from the artifact when a round needs them.
@@ -1690,11 +1712,14 @@ public:
             const std::uint32_t slack =
                 pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
             sizing_.frames = sizing_.frames > slack ? sizing_.frames - slack : 0U;
-            const auto grown = residency_->resize(sizing_.frames, device_.stream, *vram_);
+            const auto grown =
+                residency_->resize(sizing_.frames, device_.stream, *vram_, GrowthLimit{sizing_.headroom, sizing_.reserve});
             if (grown.spilled != 0) {
                 diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory "
                        "and given back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
                        std::to_string(sizing_.frames) + " frames", DiagnosticLevel::Warning);
+            } else if (grown.short_of_room) {
+                diagnostic(short_of_room_line(grown.frames, sizing_.frames), DiagnosticLevel::Info);
             } else if (grown.refused) {
                 diagnostic("the GPU refused expert-cache memory; the cache starts with " +
                                                      std::to_string(grown.frames) + " of " +
@@ -2422,6 +2447,25 @@ public:
         upload_pinned(counts, host, bytes, s);
     }
 
+    // Forced tokens are output tokens: the penalties count them (qwen3_5's append_forced_tokens), as the rebuild
+    // above counts them for a resumed request, so a request's logits do not depend on whether it was paused.
+    // Only a lane with penalties reads its counts (sampling_adjusts); the ids are the rebuild's (in the domain).
+    void count_forced_tokens(const Lane& lane, std::span<const TokenId> forced) {
+        if (lane.sampling.presence_penalty == 0.0F && lane.sampling.frequency_penalty == 0.0F) { return; }
+        std::vector<std::int32_t> ids;
+        ids.reserve(forced.size());
+        for (const TokenId token : forced) {
+            if (token >= 0 && token < token_domain_) { ids.push_back(static_cast<std::int32_t>(token)); }
+        }
+        if (ids.empty()) { return; }
+        const cudaStream_t s = device_.stream;
+        auto scope           = work_->scope();
+        Tensor device_ids    = work_->alloc(DType::I32, {static_cast<std::int32_t>(ids.size())});
+        upload_pinned(device_ids.data, ids.data(), 4ULL * ids.size(), s); // copied at the call (its staging ring)
+        Tensor counts(lane.sampling.token_counts, DType::I32, {token_domain_});
+        ops::increment_token_counts(device_ids, counts, s);
+    }
+
     // Pauses a resident at its committed boundary (design §19.3.13): the prefix cache receives the
     // lane's blocks and its state at the frontier, exactly as a consistent abort leaves them, the
     // lane is released and a Pause transaction hands the Engine the ResumeState.
@@ -3136,6 +3180,7 @@ public:
             if (lane.proposer) {
                 for (const auto token : forced) { lane.proposer->append(token); }
             }
+            count_forced_tokens(lane, forced);
             const auto begin = static_cast<std::int32_t>(lane.state_tokens);
             stage_sequence(index, begin, static_cast<std::int32_t>(stride), lane.history);
             const auto chunk = stage_mtp_chunk(lane, index, begin, static_cast<std::int32_t>(stride));
@@ -3415,6 +3460,7 @@ public:
                 if (lanes_[i].phase != Phase::Free) { release(i); }
             }
             transaction_lane_.reset();
+            pause_.reset(); // an open Pause the failure kept poll_context from collecting: in_transaction() would stay true
             pending_transaction_ = 0;
             round_width_         = 1;
             deferred_.pending    = false; // the failed round's cache update
@@ -3439,6 +3485,7 @@ public:
             if (lanes_[i].phase != Phase::Free) { release(i); }
         }
         transaction_lane_.reset();
+        pause_.reset(); // likewise an open Pause
         pending_transaction_ = 0;
         round_width_         = 1; // an abandoned verification round leaves no width behind (candidates QA-16)
         deferred_.pending    = false; // after a failure the last round's cache update is dropped (shutdown settles it first)
@@ -3708,6 +3755,13 @@ public:
 
 private:
     // ---------------------------------------------------------------- VRAM monitor (design §19.3.7)
+    // What a grow of the frames must still leave (memory_plan's growth_room): the elastic controller's bound now,
+    // else the startup sizing's headroom and reserve.
+    GrowthLimit growth_limit() {
+        if (control_) { return control_->growth_limit(vram_->query(), residency_->pool_bytes()); }
+        return GrowthLimit{sizing_.headroom, sizing_.reserve};
+    }
+
     void start_vram_monitor(const VramDemand& demand) {
         if (!options_.vram_monitor) { return; }
         const VramSnapshot now = vram_->query();
@@ -4391,14 +4445,15 @@ public:
         const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
         if (d.frames == frames_now_) { return; }
         const std::uint32_t before = frames_now_;
-        const auto resized         = residency_->resize(d.frames, device_.stream, *vram_);
+        const auto resized         = residency_->resize(d.frames, device_.stream, *vram_, growth_limit());
         frames_now_                = resized.frames;
         pool_now_                  = residency_->pool_bytes();
         const VramSnapshot after   = monitor_->refresh();
         diagnostic(std::string(d.shrink ? "free VRAM fell to " : "free VRAM rose to ") +
                    std::to_string(after.device_free >> 20) + " MiB: expert cache " + std::to_string(before) +
                    " -> " + std::to_string(frames_now_) + " frames" +
-                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : ""), DiagnosticLevel::Info);
+                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)"
+                    : resized.short_of_room ? " (free memory went while it grew)" : ""), DiagnosticLevel::Info);
         if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
             diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
                        std::to_string(startup_frames_) +
@@ -5099,25 +5154,16 @@ private:
         if (cpu_service_) { cpu_service_->wake(); } // its first request comes within this call
         settle_round(); // a deferred update precedes the next forward
         residency_->before_round(s);
+        // Declared first, so it outlives the stream's end and the route download; built after the stream begins.
+        std::optional<WideWork> wide;
         // A call the CPU can share (design §19.3.12) gates the stream on each layer's routing.
-        split_call_ = streamed && split_policy_ && batch * width <= split_columns();
-        if (streamed) {
-            expert_stream_->begin(ring_span(), residency_->host_table(), s, split_call_);
-            tier_losses_at_span_ = tier_losses();
-        }
-        const WideWork wide(*this, batch * width);
-        try {
-            forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
-            if (dflash2_) { dflash2_call_context(batch, width); }
-        } catch (...) {
-            // A failed call (an unreadable record, say) still returns the stream's slots: left
-            // active, the next streamed chunk could never begin and the release would refuse.
-            if (streamed) { expert_stream_->end(s); }
-            split_call_ = false;
-            throw;
-        }
-        if (streamed) { expert_stream_->end(s); }
-        split_call_ = false;
+        StreamSpan span(*this, streamed, streamed && split_policy_ && batch * width <= split_columns());
+        // Its fallback allocation can fail the call (RecoverableExecutionError). The plan reads the split flag.
+        wide.emplace(*this, batch * width, testing::WideSite::Call,
+                     batch * width > plan_.static_columns ? planned_call(batch * width, chunk) : 0);
+        forward_call(batch, width, logit_columns, nullptr, chunk, vision, gate, streamed);
+        if (dflash2_) { dflash2_call_context(batch, width); }
+        span.end();
         residency_->enqueue_route_download(s, batch * width);
     }
 
@@ -5181,8 +5227,9 @@ private:
     // lease also holds a layer walk's area after the ring (stream_walk_bytes_; zero when the
     // lendable frames do not cover it): the experts its frames evict widen each half by their
     // per-layer share. A walk's first call (walk_span_end, which checks the span's width) may be
-    // narrower than stream_min_columns.
-    bool stream_chunk(std::int32_t width, std::size_t walk_bytes = 0) {
+    // narrower than stream_min_columns. `walk_wide`: the walk's wide arena (its plan, with its MoE groups), when
+    // it exceeds the prompts' pending one.
+    bool stream_chunk(std::int32_t width, std::size_t walk_bytes = 0, std::size_t walk_wide = 0) {
         if (!expert_stream_ || (walk_bytes == 0 && width < stream_min_columns()) || residency_->frames() == 0) {
             return false;
         }
@@ -5207,29 +5254,33 @@ private:
                 const std::uint32_t layers = std::max(1U, residency_->lease_layers(lease));
                 return (lease.count + layers - 1) / layers;
             };
-            ExpertResidency::FrameLease wide, walk;
-            if (const std::size_t wide_bytes = pending_wide_bytes(width); wide_bytes > 0) {
+            // The leases taken here go back on every way out but the last: one left loaned would keep the KV pool
+            // from growing into the cache (leases_returnable) and the cache from resizing.
+            ExpertResidency::LeaseHold wide, walk;
+            if (const std::size_t wide_bytes = std::max(pending_wide_bytes(width), walk_wide); wide_bytes > 0) {
                 if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
-                wide = residency_->lend(wide_bytes, device_.stream, writers);
+                wide = ExpertResidency::LeaseHold(*residency_, residency_->lend(wide_bytes, device_.stream, writers),
+                                                  device_.stream);
             }
             if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
-                walk = residency_->lend(walk_bytes, device_.stream, writers);
+                walk = ExpertResidency::LeaseHold(*residency_, residency_->lend(walk_bytes, device_.stream, writers),
+                                                  device_.stream);
             }
-            const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide), per_layer(walk)));
+            const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide.get()), per_layer(walk.get())));
             // The ring as wide as the room left allows (at most 2 * half + 1 slots).
-            const auto room_slots = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
+            const auto room_slots    = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
             const std::uint32_t half = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
             if (half < kStreamHalfMin) {
-                if (walk.valid()) { residency_->give_back(walk, device_.stream); }
-                if (wide.valid()) { residency_->give_back(wide, device_.stream); }
+                walk.give_back();
+                wide.give_back();
                 return false;
             }
             stream_lease_      = residency_->lend((2ULL * half + 1) * slot, device_.stream, writers);
-            stream_wide_lease_ = wide;
-            stream_walk_lease_ = walk;
+            stream_wide_lease_ = wide.release();
+            stream_walk_lease_ = walk.release();
             stream_ring_bytes_ = stream_lease_.memory.bytes;
-            stream_wide_bytes_ = wide.memory.bytes;
-            stream_walk_bytes_ = walk.memory.bytes;
+            stream_wide_bytes_ = stream_wide_lease_.memory.bytes;
+            stream_walk_bytes_ = stream_walk_lease_.memory.bytes;
             stream_at_lease_   = expert_stream_->stats();
             split_at_lease_    = forward_->split_stats();
             prefetched_at_lease_ = walk_prefetched_chunks_;
@@ -5237,31 +5288,58 @@ private:
         return true;
     }
 
-    // The wide arena a call of `columns` needs (candidates BX-01), and the one the prefilling lanes' calls
-    // need from this call (`width` columns) on: the widest of it and every prefilling lane's remaining calls,
-    // so a short prompt no longer evicts the experts of a whole chunk's arena (the arena holds intermediates
-    // only, so no bit changes). Against a whole chunk's arena (Dense8, MTP 3, warm cache, 2026-10-24): a
-    // 1,024-token prompt then 128 tokens prefilled 1.038x and decoded 1.040x as fast (6 of 6 pairs); cold
-    // 512- and 4,096-token prompts unchanged.
-    [[nodiscard]] std::size_t wide_bytes_for(std::int32_t columns) const {
-        if (wide_work_ == 0 || columns >= chunk_) { return wide_work_; }
-        return std::min(wide_work_, workspace_bytes(c_, options_, plan_, plan_.lanes, columns));
+    // The wide arena a scope gets beyond its plan: the lease's base need not be aligned as the plan's offsets are
+    // (the builder aligns offsets, the arena addresses), which moves the arena's peak by less than its alignment.
+    static constexpr std::size_t kWideSlack = 1ULL << 20;
+    // The wide arena a call of `width` columns may need (candidates QG-01): the most of the forward's plans of the
+    // scopes such a call runs in (a chunk-major call with its MTP cells, logits and the copy-ahead's guess wherever
+    // the call is narrow enough to be gated; a layer walk's mixer steps, finish and a group of that one chunk; the
+    // DFlash2 drafter's context call), with kWideSlack. The chunk fits, the prompts' pending lease and the
+    // fallback allocation take it; a scope lends its own plan (WideWork). The lossless route keeps the formula.
+    [[nodiscard]] std::size_t wide_need(std::int32_t width) const {
+        if (!planner_) { return workspace_bytes(c_, options_, plan_, plan_.lanes, width); }
+        const std::int32_t cells = mtp_ ? width + 1 : 0;
+        const bool gate          = width <= ops::offloaded_moe::kMaxCpuCallColumns;
+        return std::max({planner_->plan_run({.columns = width, .mtp_cells = cells, .logits = true, .may_gate = gate}),
+                         planner_->plan_walk_mixer(width), planner_->plan_walk_finish(width, cells, true),
+                         planner_->plan_walk_moe(width), drafter_bytes()}) +
+               kWideSlack;
     }
+    // The wide arena the prefilling lanes' calls need from this call (`width` columns) on: the most of it and every
+    // prefilling lane's remaining calls (the last two as one pair call where its tail is short enough to pair), so a
+    // short prompt no longer evicts the experts of a whole chunk's arena (candidates BX-01: the arena holds
+    // intermediates only, so no bit changes; against a whole chunk's arena, Dense8, MTP 3, warm cache, 2026-10-24, a
+    // 1,024-token prompt then 128 tokens prefilled 1.038x and decoded 1.040x as fast, 6 of 6 pairs). A layer walk
+    // adds its MoE groups' plan when it takes its lease (walk_span_end).
     [[nodiscard]] std::size_t pending_wide_bytes(std::int32_t width) const {
         if (wide_work_ == 0) { return wide_work_; }
-        std::uint32_t widest = static_cast<std::uint32_t>(std::max(width, 0));
+        const auto need = [&](std::uint32_t columns) -> std::size_t {
+            if (columns <= static_cast<std::uint32_t>(plan_.static_columns)) { return 0; }
+            const std::size_t bytes = wide_need(static_cast<std::int32_t>(columns));
+            return planner_ ? bytes : std::min(wide_work_, bytes);
+        };
+        std::size_t most = need(static_cast<std::uint32_t>(std::max(width, 0)));
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             const Lane& lane = lanes_[i];
             if (lane.phase != Phase::Prefill) { continue; }
             // A call in flight has advanced next_call; its end is where the next call starts.
             std::uint32_t from = lane.next_call > 0 ? lane.calls[lane.next_call - 1] : lane.state_tokens;
             for (std::size_t k = lane.next_call; k < lane.calls.size(); ++k) {
-                widest = std::max(widest, lane.calls[k] - from);
-                from   = lane.calls[k];
+                most = std::max(most, need(lane.calls[k] - from));
+                // The pair call's chunks as pair_ready takes them (free cache resume only): a head and a tail of two or
+                // more tokens each.
+                const std::uint32_t tail = k + 2 == lane.calls.size() ? lane.calls[k + 1] - lane.calls[k] : 0;
+                if (planner_ && options_.free_cache_resume && tail >= 2 && tail <= static_cast<std::uint32_t>(kPairTailColumns) &&
+                    lane.calls[k] - from >= 2 &&
+                    lane.calls[k + 1] - from > static_cast<std::uint32_t>(plan_.static_columns)) {
+                    most = std::max(most, planned_pair(static_cast<std::int32_t>(lane.calls[k] - from),
+                                                       static_cast<std::int32_t>(lane.calls[k + 1] - lane.calls[k])) +
+                                              kWideSlack);
+                }
+                from = lane.calls[k];
             }
         }
-        return widest > static_cast<std::uint32_t>(plan_.static_columns) ? wide_bytes_for(static_cast<std::int32_t>(widest))
-                                                                         : 0;
+        return most;
     }
 
     // The ring (the stream lease) and the walk's area (its own lease).
@@ -5275,9 +5353,13 @@ private:
     // Forward keeps its arena reference; the arenas' contents are swapped for the call.
     class WideWork {
     public:
-        WideWork(ProgramImpl& program, std::int32_t columns) : program_(program) {
+        // `site`: where the scope is entered, for the wide scopes a test records (testing::record_wide_scopes);
+        // `planned`: the forward's plan of the scope (planned_call, planned_walk, planned_pair; 0 on the lossless
+        // route, whose arena keeps the formula). The arena holds the plan and kWideSlack.
+        WideWork(ProgramImpl& program, std::int32_t columns, testing::WideSite site, std::size_t planned)
+            : program_(program) {
             if (columns > program.plan_.static_columns && program.wide_work_ > 0) {
-                program.enter_wide(columns);
+                program.enter_wide(columns, site, planned);
                 active_ = true;
             }
         }
@@ -5286,6 +5368,42 @@ private:
         }
         WideWork(const WideWork&)            = delete;
         WideWork& operator=(const WideWork&) = delete;
+
+    private:
+        ProgramImpl& program_;
+        bool active_ = false;
+    };
+
+    // A call's expert stream (and its split flag), begun for a streamed call and ended on every way out of it: left
+    // active after a failed call (an unreadable record, the wide workspace's allocation), the next streamed chunk
+    // could never begin and the release would refuse. The call's success path ends it with end(), where the call's
+    // order puts it: before the route download, while the wide workspace still lives.
+    class StreamSpan {
+    public:
+        StreamSpan(ProgramImpl& program, bool streamed, bool split) : program_(program) {
+            program.split_call_ = split;
+            try {
+                if (streamed) {
+                    program.expert_stream_->begin(program.ring_span(), program.residency_->host_table(),
+                                                  program.device_.stream, split);
+                    active_                      = true;
+                    program.tier_losses_at_span_ = program.tier_losses();
+                }
+            } catch (...) {
+                end();
+                throw;
+            }
+        }
+        ~StreamSpan() { end(); }
+        StreamSpan(const StreamSpan&)            = delete;
+        StreamSpan& operator=(const StreamSpan&) = delete;
+        void end() noexcept {
+            if (active_) {
+                active_ = false;
+                program_.expert_stream_->end(program_.device_.stream);
+            }
+            program_.split_call_ = false;
+        }
 
     private:
         ProgramImpl& program_;
@@ -5333,8 +5451,7 @@ private:
     // with a frame to spare.
     [[nodiscard]] std::int32_t chunk_lent_by(std::int32_t limit, const ExpertResidency::LendCapacity& lends) const {
         return widest_fitting_chunk(limit, [&](std::int32_t chunk) {
-            return lends.pitch != 0 &&
-                   (workspace_bytes(c_, options_, plan_, plan_.lanes, chunk) + lends.pitch - 1) / lends.pitch < lends.frames;
+            return lends.pitch != 0 && (wide_need(chunk) + lends.pitch - 1) / lends.pitch < lends.frames;
         });
     }
 
@@ -5363,10 +5480,23 @@ private:
             smallest_chunk_ = std::min(smallest_chunk_, nominal_chunk_);
         }
         chunk_     = options_.free_cache_resume ? chunk_lent_by(chunk_, now) : smallest_chunk_;
-        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        wide_work_ = chunk_ > plan_.static_columns ? wide_need(chunk_) : 0;
         const bool nominal_binds = options_.reproducible && chunk_ == nominal_chunk_;
         const auto& lent         = options_.free_cache_resume ? now : nominal_binds ? nominal_lends : smallest;
+        // Without free cache resume the chunk never moves, nor do a walk's MoE groups: their budget is what this
+        // cache lends at its smallest (or nominal) beside a full span's walk area, the ring's least and a frame.
+        if (!options_.free_cache_resume) { walk_budget_ = walk_room(lent.frames * lent.pitch); }
         return lent.frames * lent.pitch;
+    }
+    // What a walk's MoE groups may plan out of `lendable` bytes: a kWalkMoeColumns group's plan at most, beside a full
+    // span's walk area, the ring's least and a frame to spare.
+    [[nodiscard]] std::size_t walk_room(std::uint64_t lendable) const {
+        if (!planner_ || residency_->frames() == 0) { return 0; }
+        const std::uint64_t reserve = walk_bytes(kWalkMaxTokens, static_cast<std::size_t>(kWalkMaxTokens) /
+                                                                     static_cast<std::size_t>(std::max(chunk_, 1)) + 2) +
+                                      (2ULL * (kStreamHalfMin + 1) + 1) * plan_.record_stride +
+                                      residency_->lend_pitch() + kWideSlack;
+        return std::min<std::size_t>(planner_->plan_walk_moe(kWalkMoeColumns), lendable > reserve ? lendable - reserve : 0);
     }
 
     // The reproducible route's nominal launch (expert_offload::nominal_snapshot); without the launch's
@@ -5389,14 +5519,14 @@ private:
         const std::size_t need       = pending_wide_bytes(0);
         if (need == 0 || need + pitch <= lendable) { return; }
         const std::int32_t chunk = widest_fitting_chunk(chunk_, [&](std::int32_t width) {
-            return workspace_bytes(c_, options_, plan_, plan_.lanes, width) + pitch <= lendable;
+            return wide_need(width) + pitch <= lendable;
         });
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) +
                        " for the prompts in progress: the expert cache can lend " + std::to_string(lendable >> 20) +
                        " MiB now",
                    DiagnosticLevel::Debug);
         chunk_     = chunk;
-        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        wide_work_ = chunk_ > plan_.static_columns ? wide_need(chunk_) : 0;
         std::vector<std::uint32_t> cuts;
         for (std::uint32_t i = 0; i < options_.max_concurrency; ++i) {
             Lane& lane = lanes_[i];
@@ -5434,27 +5564,34 @@ private:
         const std::uint64_t pitch    = residency_->lend_pitch();
         const std::uint64_t lendable = residency_->lendable_bytes();
         const std::int32_t chunk     = widest_fitting_chunk(loaded_chunk_, [&](std::int32_t width) {
-            return workspace_bytes(c_, options_, plan_, plan_.lanes, width) + pitch + reserved <= lendable;
+            return wide_need(width) + pitch + reserved <= lendable;
         });
         if (chunk == chunk_) { return; }
         diagnostic("prefill chunk " + std::to_string(chunk_) + " -> " + std::to_string(chunk) + ": the expert cache can lend " +
                        std::to_string(lendable >> 20) + " MiB now",
                    DiagnosticLevel::Debug);
         chunk_     = chunk;
-        wide_work_ = chunk_ > plan_.static_columns ? workspace_bytes(c_, options_, plan_, plan_.lanes, chunk_) : 0;
+        wide_work_ = chunk_ > plan_.static_columns ? wide_need(chunk_) : 0;
     }
 
-    void enter_wide(std::int32_t columns) {
+    void enter_wide(std::int32_t columns, testing::WideSite site, std::size_t planned) {
         DeviceSpan span{};
-        // This call's need, and a lease for the prefilling lanes' remaining calls (one too small for this
-        // call is lent again).
-        const std::size_t need = wide_bytes_for(columns);
+        // This scope's need (its plan with kWideSlack; on the lossless route the formula's for its columns), and a
+        // lease for the prefilling lanes' remaining calls (one too small for this scope is lent again).
+        const std::size_t need =
+            planner_ ? planned + kWideSlack
+                     : (columns >= chunk_ ? wide_work_
+                                          : std::min(wide_work_, workspace_bytes(c_, options_, plan_, plan_.lanes, columns)));
         if (stream_lease_.valid() && stream_wide_bytes_ >= need) {
             span = {stream_wide_lease_.memory.data, need};
         } else {
             if (work_lease_.valid() && work_lease_.memory.bytes < need) {
                 residency_->give_back(work_lease_, device_.stream);
                 work_lease_ = {};
+            }
+            if (wide_fallback_.p != nullptr && wide_fallback_.bytes < need) {
+                device_.synchronize(); // the earlier calls' kernels may still read it
+                wide_fallback_ = DeviceBuffer{};
             }
             if (!work_lease_.valid() && wide_fallback_.p == nullptr) {
                 const std::size_t lend = std::max(need, pending_wide_bytes(columns));
@@ -5463,32 +5600,80 @@ private:
                     work_lease_ = residency_->lend(lend, device_.stream, writers);
                 } else {
                     diagnostic("the prefill workspace could not be lent from the expert cache; " +
-                                   std::to_string(wide_work_ >> 20) + " MiB are allocated for the prompt",
+                                   std::to_string(lend >> 20) + " MiB are allocated for the prompt",
                                DiagnosticLevel::Warning);
                     // The cache shrank under VRAM pressure: a failed allocation fails this prompt's
                     // requests, not the Engine.
                     try {
-                        wide_fallback_ = DeviceBuffer(wide_work_);
+                        wide_fallback_ = DeviceBuffer(lend);
                     } catch (const std::exception& error) {
                         throw runtime::RecoverableExecutionError(
-                            "the prefill workspace (" + std::to_string(wide_work_ >> 20) +
+                            "the prefill workspace (" + std::to_string(lend >> 20) +
                             " MiB) could neither be lent from the expert cache nor allocated (" + error.what() +
                             "); a smaller --prefill-chunk needs less");
                     }
                 }
             }
-            span = work_lease_.valid() ? DeviceSpan{work_lease_.memory.data, need}
-                                       : DeviceSpan{wide_fallback_.p, wide_work_};
+            span = work_lease_.valid() ? DeviceSpan{work_lease_.memory.data, need} : DeviceSpan{wide_fallback_.p, need};
         }
         wide_arena_ = std::make_unique<WorkspaceArena>(span);
         std::swap(*work_, *wide_arena_);
         wide_active_ = true;
+        wide_scope_  = testing::WideScope{.site = site, .columns = columns, .inner = columns, .planned = planned};
     }
+
+    // ---- the wide workspace's plan (candidates QG-01) ----
+    // What the forward's own allocation code needs of the wide arena in a scope (Forward::plan_run and its siblings),
+    // with the DFlash2 drafter's context call where it runs inside the scope (DFlash2::workspace_bytes; its
+    // materialize resets the arena); 0 on the lossless route. Recorded beside each scope's peak
+    // (testing::WideScope::planned) while the loans keep their sizes.
+    [[nodiscard]] std::size_t drafter_bytes() const {
+        return dflash2_ ? execution::DFlash2::workspace_bytes(c_, *plan_.dflash2_config, plan_.lanes, plan_.dflash_k + 1,
+                                                              dim(plan_.dflash2_config->window), options_.max_context)
+                        : 0;
+    }
+    // A chunk-major call (run()): its MTP chunk's cells, the logits of its last column, and the copy-ahead's guess
+    // where the call is gated (split_call_).
+    [[nodiscard]] std::size_t planned_call(std::int32_t columns, const execution::MtpChunk* chunk) const {
+        if (!planner_) { return 0; }
+        const std::int32_t cells = chunk != nullptr ? (chunk->prepend ? 1 : 0) + chunk->columns : 0;
+        return std::max(planner_->plan_run({.columns = columns, .mtp_cells = cells, .logits = true, .may_gate = split_call_}),
+                        drafter_bytes());
+    }
+    // The pair call (pair_step): run_split's head and tail, and the drafter's context calls inside its scope.
+    [[nodiscard]] std::size_t planned_pair(std::int32_t head, std::int32_t tail) const {
+        if (!planner_) { return 0; }
+        return std::max(planner_->plan_split(head, tail), drafter_bytes());
+    }
+    // The layer walk's span (prefill_walk.cpp): its widest chunk's mixer steps and finish, and its widest MoE group.
+    [[nodiscard]] std::size_t planned_walk() const;
+    // The same plan for a span of chunks of these widths grouped as walk_groups groups them (`cells`: the MTP cells
+    // its finish may write).
+    [[nodiscard]] std::size_t planned_walk(std::span<const std::int32_t> widths,
+                                           std::span<const std::pair<std::size_t, std::size_t>> groups,
+                                           std::int32_t cells) const;
+    // A layer walk's MoE groups (design §19.3.29): consecutive chunks of at least kStreamMinColumns while their
+    // columns fit kWalkMoeColumns and the group's plan fits `budget`; a chunk too narrow to stream (the prompt's last,
+    // walk_span_end) is a group of its own, so its router takes the chunk-major call's form (router-mma acts on calls
+    // of kRouterMmaMinColumns or more). Groups of one chunk whatever their plan: the walk needs that much anyway.
+    [[nodiscard]] std::vector<std::pair<std::size_t, std::size_t>> walk_groups(std::span<const std::int32_t> widths,
+                                                                               std::size_t budget) const;
+    // The bytes a walk's MoE groups may plan: on the reproducible route a figure fixed when the chunk is fitted (the
+    // nominal cache's, walk_budget_), so a request's groups depend on nothing but its calls; elsewhere the plan of a
+    // kWalkMoeColumns group, as far as the expert cache can lend beside a frame to spare now.
+    [[nodiscard]] std::size_t walk_budget() const;
+    std::size_t walk_budget_ = 0; // the reproducible route's (fit_wide_work_to_cache)
 
     void leave_wide() noexcept {
         std::swap(*work_, *wide_arena_);
         wide_active_ = false;
+        wide_scope_.given = wide_arena_->capacity();
+        wide_scope_.peak  = wide_arena_->peak_used();
+        try {
+            testing::note_wide_scope(wide_scope_);
+        } catch (...) {} // a test's record only
     }
+    testing::WideScope wide_scope_; // the open wide scope (enter_wide .. leave_wide), for testing::note_wide_scope
     bool wide_active_ = false; // *work_ is the wide arena (enter_wide .. leave_wide)
 
     // After a prompt's last wide call is enqueued: the wide arena's own lease or allocation goes back
@@ -7503,7 +7688,16 @@ private:
         target = std::min(pool_->capacity_pages(), (target + kKvGrowPages - 1) / kKvGrowPages * kKvGrowPages);
         if (target - backed < need - pool_->available_pages()) { return false; }
         const std::lock_guard<std::mutex> lock(vram_mutex_);
-        const std::size_t added    = kv_mapped_bytes(plan_, target) - kv_vmm_->mapped_bytes();
+        // The bytes map_kv(target) will map: the chunks the target needs that are not mapped yet. Chunks an earlier
+        // failed growth kept (below) can sit in some planes while another plane still lacks one, so the difference of
+        // the two totals is not that amount (and wrapped below zero when a smaller target followed).
+        std::size_t added = 0;
+        {
+            const auto chunks = kv_chunks(plan_, target);
+            for (std::size_t c = 0; c < chunks.size(); ++c) {
+                if (chunks[c] != 0 && !kv_vmm_->mapped(c)) { added += kKvChunkBytes; }
+            }
+        }
         const std::uint64_t stride = residency_->frame_bytes();
         const std::uint32_t frames = residency_->frames();
         // Memory the sizing function would give the frames anyway comes first; the rest is taken from
@@ -7519,7 +7713,11 @@ private:
         device_.synchronize();
         if (give != 0) {
             const auto resized = residency_->resize(frames - give, device_.stream, *vram_);
-            if (resized.frames > frames - give) { return false; } // a lease holds the frames
+            if (resized.frames > frames - give) { // a lease holds the frames (it may have shrunk part-way)
+                frames_now_ = residency_->frames();
+                pool_now_   = residency_->pool_bytes();
+                return false;
+            }
         }
         const std::size_t mapped_before = kv_vmm_->mapped_bytes();
         if (!map_kv(target)) {
@@ -7529,7 +7727,7 @@ private:
             const std::size_t kept = kv_vmm_->mapped_bytes() - mapped_before;
             if (control_ && kept != 0) { control_->account_fixed(static_cast<std::int64_t>(kept)); }
             const auto held = static_cast<std::uint32_t>(std::min<std::uint64_t>(give, (kept + stride - 1) / stride));
-            if (give > held) { (void)residency_->resize(frames - held, device_.stream, *vram_); }
+            if (give > held) { (void)residency_->resize(frames - held, device_.stream, *vram_, growth_limit()); }
             frames_now_ = residency_->frames();
             pool_now_   = residency_->pool_bytes();
             return false;
@@ -7597,7 +7795,8 @@ private:
         const std::size_t freed   = before - kv_vmm_->mapped_bytes();
         const std::uint64_t stride = residency_->frame_bytes();
         const std::uint32_t frames = residency_->frames();
-        (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_);
+        (void)residency_->resize(frames + static_cast<std::uint32_t>(freed / stride), device_.stream, *vram_,
+                                 growth_limit());
         if (control_) { control_->account_fixed(-static_cast<std::int64_t>(freed)); }
         frames_now_ = residency_->frames();
         pool_now_   = residency_->pool_bytes();
@@ -7704,8 +7903,15 @@ private:
             const std::uint64_t reached = count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1U;
             std::int32_t* const nonfinite = nonfinite_flag(ContractAccess::lane(rows[row]));
             const bool nonfinite_row      = std::exchange(*nonfinite, 0) != 0;
-            // Likewise the packed BF16 KV's flag: a row with no packed form left the KV unlike the bf16 storage's.
-            const bool unpackable_row = std::exchange(*unpackable_flag(ContractAccess::lane(rows[row])), 0) != 0;
+            // Likewise the packed BF16 KV's flag: a row with no packed form left the KV unlike the bf16 storage's. A
+            // tree round (one lane) also wrote its side rows' KV through their own table rows, after the lanes'.
+            bool unpackable_row = std::exchange(*unpackable_flag(ContractAccess::lane(rows[row])), 0) != 0;
+            if (rows.size() == 1) {
+                for (std::int32_t side = plan_.lanes; side < plan_.lanes + std::max(0, plan_.tree_paths - 1); ++side) {
+                    unpackable_row = std::exchange(*unpackable_flag(static_cast<std::uint32_t>(side)), 0) != 0 ||
+                                     unpackable_row;
+                }
+            }
             ContractAccess::set_row_failure(pending, row,
                                             unpackable_row ? runtime::PendingRowFailure::UnpackableKv
                                             : nonfinite_row || runtime::testing::take_nonfinite_fault()
@@ -7724,7 +7930,10 @@ private:
     // Per KV table row (a lane's row is its index, tables_->acquire(index)): set by the packed BF16 KV's
     // append when a K or V row has no packed form (ops::kv_cache_append, ops::qsa_prepare), read and cleared by
     // the round's commit, which fails that request (PendingRowFailure::UnpackableKv).
-    PinnedHostBuffer unpackable_flags_{sizeof(std::int32_t) * kMaximumConcurrency};
+    // Indexed by table row (the kernels write a[table_rows[sequence]]): the lanes', then an n-gram tree round's side
+    // rows (lanes + r - 1, r < kNgramTreeMaximumPaths).
+    static constexpr std::uint32_t kUnpackableFlags = kMaximumConcurrency + kNgramTreeMaximumPaths - 1;
+    PinnedHostBuffer unpackable_flags_{sizeof(std::int32_t) * kUnpackableFlags};
     [[nodiscard]] std::int32_t* unpackable_flag(std::uint32_t lane) const noexcept {
         return static_cast<std::int32_t*>(unpackable_flags_.data()) + lane;
     }
@@ -7881,6 +8090,8 @@ private:
 
     [[nodiscard]] std::size_t walk_bytes(std::uint32_t tokens, std::size_t chunks) const noexcept;
     std::size_t walk_span_end(const Lane& lane, std::uint32_t index);
+    // The budget walk_span_end grouped the span's MoE by (walk_groups), which walk_begin groups it by again.
+    std::size_t walk_span_budget_ = 0;
     void walk_begin(Lane& lane, std::uint32_t index, std::size_t end);
     PrefillProgress walk_step(Lane& lane, std::uint32_t index, Clock::time_point start);
     // The pair call (design §19.3.1, the zero-split tap): the prompt's last two calls, a call too narrow
@@ -7894,13 +8105,19 @@ private:
     [[nodiscard]] Tensor walk_residual(std::size_t first, std::size_t end);
     void walk_mixer(std::size_t chunk, std::uint32_t layer);
     void walk_moe(std::size_t group, std::uint32_t layer);
+    // The columns of the span's widest MoE group (walk_.groups).
+    [[nodiscard]] std::int32_t walk_widest_group() const noexcept;
     // The span's taps: realizes the lane's taps due at its inner chunk ends (as prefix_after_prefill_call
     // would after chunk-major calls) by opening a staged capture each; committed by walk_commit_taps.
     void walk_plan_taps(Lane& lane);
     void walk_capture(std::size_t chunk, std::uint32_t layer);
+    // Commits the span's staged taps; a failure part-way abandons the rest (walk_abandon_taps).
     void walk_commit_taps(Lane& lane);
     void walk_enqueue(std::uint32_t to_layer);
     void walk_abandon() noexcept;
+    // The span's taps still staged go back (their Host-tier slabs and events), whether or not the walk is active:
+    // a walk that failed before it began, or after it ended in walk_commit_taps, holds them too.
+    void walk_abandon_taps() noexcept;
     std::unique_ptr<RouteTrace> trace_;
     std::unique_ptr<ops::offloaded_moe::CpuMissService> cpu_service_;
 
@@ -8006,6 +8223,8 @@ private:
     };
     OverlapResources overlap_;
     std::unique_ptr<execution::Forward> forward_;
+    // The wide arena's planner (Forward::planner; candidates QG-01): null on the lossless route.
+    std::unique_ptr<execution::Forward> planner_;
     std::array<DecodeGraph, kMaximumConcurrency> graphs_;
     std::vector<DecodeGraph> mtp_draft_graphs_; // (batch - 1) * mtp_k_ + steps - 1
     // With sampled drafts, the same for rounds with a sampled row (greedy rounds keep the argmax).

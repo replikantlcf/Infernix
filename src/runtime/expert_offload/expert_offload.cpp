@@ -538,7 +538,7 @@ std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
                              .nvfp4_a8   = options_.narrow_a16 == moe::NarrowA16::kA8, // the misses' route sets the rates
                              .shape      = shape,
                              .cpus       = placement_.cpus});
-    const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    ScopedThreadCpus pinned(placement_.cpus.empty() ? 0 : placement_.cpus.front()); // restored on every way out
     const auto H = static_cast<std::size_t>(shape.hidden);
     std::vector<std::uint16_t> x(H * kNarrowColumns);
     std::vector<std::uint16_t> y(H * kRateJobs * kNarrowColumns);
@@ -566,6 +566,12 @@ std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
     };
     cudaStream_t stream = nullptr;
     CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    struct StreamGuard { // the probe's stream, destroyed on every way out
+        cudaStream_t& stream;
+        ~StreamGuard() {
+            if (stream != nullptr) { (void)cudaStreamDestroy(stream); }
+        }
+    } stream_guard{stream};
     const std::uint64_t source_stride = front.planes.record_stride; // at most the staging pitch
     const auto rate = [&](int columns, int first_round) {
         fill(first_round + kRateRepeats * kRateRounds, columns); // warm-up round
@@ -608,8 +614,8 @@ std::optional<CpuRateReading> ExpertOffload::measure_cpu_rate() {
         if (quiet || std::chrono::steady_clock::now() - began >= kRetryBudget) { break; }
         std::this_thread::sleep_for(kRetryPause);
     }
-    (void)set_current_thread_cpus(caller_cpus);
-    CUDA_CHECK(cudaStreamDestroy(stream));
+    pinned.restore();
+    CUDA_CHECK(cudaStreamDestroy(std::exchange(stream, nullptr)));
     reading.note = tier_ ? "measured on the SSD tier's RAM copies" : "measured";
     char share[160];
     if (attempts > 1) {
@@ -726,7 +732,7 @@ void ExpertOffload::cpu_probe_detail() {
                              .ggml       = ggml_format(front).valid(),
                              .shape      = shape,
                              .cpus       = placement_.cpus});
-    const std::uint64_t caller_cpus = set_current_thread_cpus(placement_.cpus.empty() ? 0 : placement_.cpus.front());
+    ScopedThreadCpus pinned(placement_.cpus.empty() ? 0 : placement_.cpus.front()); // restored on every way out
     const auto H = static_cast<std::size_t>(shape.hidden);
     std::vector<std::uint16_t> x(H * kNarrowColumns);
     std::vector<std::uint16_t> y(H * kRateJobs * kNarrowColumns);
@@ -769,7 +775,7 @@ void ExpertOffload::cpu_probe_detail() {
                 std::max(narrow[static_cast<std::size_t>(memory)], timed(memory, kNarrowColumns));
         }
     }
-    (void)set_current_thread_cpus(caller_cpus);
+    pinned.restore();
     (void)cudaFreeHost(allocated);
     char text[512];
     std::snprintf(text, sizeof(text),
@@ -942,12 +948,14 @@ void ExpertOffload::size_frames(cudaStream_t compute) {
     // Each pool maps whole chunks: one chunk of slack per pool.
     const std::uint32_t slack = pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
     sizing_.frames            = sizing_.frames > slack ? sizing_.frames - slack : 0U;
-    const auto grown = residency_->resize(sizing_.frames, compute, *vram_);
+    const auto grown = residency_->resize(sizing_.frames, compute, *vram_, GrowthLimit{sizing_.headroom, sizing_.reserve});
     if (grown.spilled != 0) {
         diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory and given "
                        "back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
                        std::to_string(sizing_.frames) + " frames",
                    DiagnosticLevel::Warning);
+    } else if (grown.short_of_room) {
+        diagnostic(short_of_room_line(grown.frames, sizing_.frames), DiagnosticLevel::Info);
     } else if (grown.refused) {
         diagnostic("the GPU refused expert-cache memory; the cache starts with " + std::to_string(grown.frames) + " of " +
                        std::to_string(sizing_.frames) + " frames",
@@ -1092,13 +1100,14 @@ void ExpertOffload::apply_vram_target(cudaStream_t compute, bool idle) {
     const auto d = control_->decide(monitor_->latest(), pool_now_, frames_now_, vram_seconds(), idle);
     if (d.frames == frames_now_) { return; }
     const std::uint32_t before = frames_now_;
-    const auto resized         = residency_->resize(d.frames, compute, *vram_);
+    const auto resized         = residency_->resize(d.frames, compute, *vram_, growth_limit());
     frames_now_                = resized.frames;
     pool_now_                  = residency_->pool_bytes();
     const VramSnapshot after   = monitor_->refresh();
     diagnostic(std::string(d.shrink ? "free VRAM fell to " : "free VRAM rose to ") + std::to_string(after.device_free >> 20) +
                    " MiB: expert cache " + std::to_string(before) + " -> " + std::to_string(frames_now_) + " frames" +
-                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)" : ""),
+                   (resized.spilled != 0 ? " (a chunk placed in system memory was given back)"
+                    : resized.short_of_room ? " (free memory went while it grew)" : ""),
                DiagnosticLevel::Info);
     if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
         diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
@@ -1107,6 +1116,11 @@ void ExpertOffload::apply_vram_target(cudaStream_t compute, bool idle) {
         low_frames_warned_ = true;
     }
     if (frames_now_ * 4 >= startup_frames_) { low_frames_warned_ = false; }
+}
+
+GrowthLimit ExpertOffload::growth_limit() const {
+    if (control_) { return control_->growth_limit(vram_->query(), residency_->pool_bytes()); }
+    return GrowthLimit{sizing_.headroom, sizing_.reserve};
 }
 
 std::uint32_t ExpertOffload::spare_frames() const {
@@ -1143,7 +1157,8 @@ bool ExpertOffload::take_frames(std::uint64_t bytes, cudaStream_t compute) {
 void ExpertOffload::give_frames(std::uint64_t bytes, cudaStream_t compute) {
     const std::lock_guard<std::mutex> lock(vram_mutex_);
     const std::uint32_t frames = residency_->frames();
-    (void)residency_->resize(frames + static_cast<std::uint32_t>(bytes / residency_->frame_bytes()), compute, *vram_);
+    (void)residency_->resize(frames + static_cast<std::uint32_t>(bytes / residency_->frame_bytes()), compute, *vram_,
+                             growth_limit());
     if (control_) { control_->account_fixed(-static_cast<std::int64_t>(bytes)); }
     frames_now_ = residency_->frames();
     pool_now_   = residency_->pool_bytes();
@@ -1564,25 +1579,27 @@ bool ExpertOffload::lend_stream(std::int32_t width, std::uint64_t wide_bytes, st
         const std::uint32_t layers = std::max(1U, residency_->lease_layers(lease));
         return (lease.count + layers - 1) / layers;
     };
-    ExpertResidency::FrameLease wide, walk;
+    // Leases taken here go back on every way out but the last: a lease left loaned would stop every later resize
+    // of the cache (ExpertResidency::resize refuses while frames are loaned).
+    ExpertResidency::LeaseHold wide, walk;
     if (wide_bytes > 0) {
         if (wide_bytes + residency_->lend_pitch() > residency_->lendable_bytes()) { return false; }
-        wide = residency_->lend(wide_bytes, compute, writers);
+        wide = ExpertResidency::LeaseHold(*residency_, residency_->lend(wide_bytes, compute, writers), compute);
     }
     if (walk_bytes > 0 && walk_bytes + 2 * (kStreamHalfMin + 1) * slot <= residency_->lendable_bytes()) {
-        walk = residency_->lend(walk_bytes, compute, writers);
+        walk = ExpertResidency::LeaseHold(*residency_, residency_->lend(walk_bytes, compute, writers), compute);
     }
-    const std::uint32_t widened    = std::min(E, most + std::max(per_layer(wide), per_layer(walk)));
-    const auto room_slots          = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
-    const std::uint32_t half       = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
+    const std::uint32_t widened = std::min(E, most + std::max(per_layer(wide.get()), per_layer(walk.get())));
+    const auto room_slots       = static_cast<std::uint32_t>(residency_->lendable_bytes() / slot);
+    const std::uint32_t half    = std::min(widened, room_slots > 1 ? (room_slots - 1) / 2 : 0U);
     if (half < kStreamHalfMin) {
-        if (walk.valid()) { residency_->give_back(walk, compute); }
-        if (wide.valid()) { residency_->give_back(wide, compute); }
+        walk.give_back();
+        wide.give_back();
         return false;
     }
-    leases_.ring = residency_->lend((2ULL * half + 1) * slot, compute, writers);
-    leases_.wide = wide;
-    leases_.walk = walk;
+    leases_.ring     = residency_->lend((2ULL * half + 1) * slot, compute, writers);
+    leases_.wide     = wide.release();
+    leases_.walk     = walk.release();
     stream_at_lease_ = stream_->stats();
     return true;
 }

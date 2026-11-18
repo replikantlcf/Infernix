@@ -843,6 +843,77 @@ by the lossless route (`--lossless`). The persistent prefix
 cache's signature records the experts' activation precision, so a file saved under one setting is
 not loaded under the other.
 
+### 6.1.3 Recipes `qwen3_8_flash_next_nvfp4_qad` (E) and `qwen3_8_flash_next_nvfp4_qad_dense8`
+
+The source is [nvidia/Qwen3.8-Flash-Next-NVFP4-QAD](https://huggingface.co/nvidia/Qwen3.8-Flash-Next-NVFP4-QAD)
+(revision `a874339c`, published 2026-11-17, 129.7 GB in 36 shards): NVIDIA's quantization-aware distillation of
+its NVFP4 release, 100 optimizer updates, ModelOpt `MIXED_PRECISION` (`quantization_recipe.json`). It quantizes more
+than recipe A's source: the shared experts are NVFP4 too, and the GDN, QSA and indexer projections MXFP8, as
+FP4-Local's. Both recipes import every quantized tensor bit-exactly and run the experts **W4A4, as NVIDIA serves
+the checkpoint** (its vLLM command on GB300 uses the native NVFP4 kernels for the routed and shared experts; the
+owner chose this arithmetic on 2026-11-17 over FP4-Local's 16-bit default).
+
+| Tensor class | Source form | Recipe E | Dense8 | Reason |
+|---|---|---|---|---|
+| Routed experts (48 × 512) | ModelOpt NVFP4: E2M1 codes, plain E4M3 per 16 (no CSF), FP32 `weight_scale_2` and `input_scale` per matrix | **Exact import** as recipe A's: `nvfp4_mul` banks in `nvfp4_expert_rg16_v1`, `AllowA4`, W4A4 (§16.2) | Same | NVIDIA's weights and activation calibration |
+| Shared experts (48) | ModelOpt NVFP4 as the routed experts, at their width (640); gate and up share `weight_scale_2` and `input_scale` in every layer | **Exact import** as a one-record bank `moe/shared_expert` of the same layout, with its FP32 activation scales (`moe/shared_expert_input_scales`), `AllowA4`; device-resident (2.76 MB a layer) | Same | The routed call runs it as its last job (§8.6), in the routed experts' exact W4A4 arithmetic: x → A4 → gate/up → BF16 → SwiGLU → BF16 h → A4 → down → BF16, the structure of vLLM's dense NVFP4 shared expert |
+| GDN q/k/v (`in_proj_qkv`), z, `out_proj`; QSA q/gate, k, v, `o_proj`; indexer (`index_qk_proj`) | MXFP8: E4M3FN codes, UE8M0 scale per 32 K | **Exact import** as FP4-Local's (`fp8_e4m3fn_g32_e8m0`, W8A16; the QSA parent of 13,952 rows and the GDN one of 16,384) | Same | The checkpoint's words, on FP4-Local's 16-bit route. NVIDIA's serving helpers name native MXFP8 kernels, which suggests 8-bit activations there (inferred, not confirmed); `--a8-activations` runs these projections' prefill calls on two E4M3 terms per 32 values |
+| GDN a/b (`in_proj_a/b`) | MXFP8 | Their exact BF16 values, as FP4-Local's | Same | Exact |
+| HC mixers, PLE key/value projections, final mixer, `lm_head` | BF16 | BF16 | `q8_g32_fp16` (W8A16), as recipe C's BF16 classes | Recipe B's dense-byte saving where the checkpoint is still BF16 |
+| Router, shared-expert gate, embedding, vision tower, norms, `A_log`, `dt_bias`, convolutions | BF16 | BF16 | BF16 | As stored |
+| N-gram table (128 shards) | FP8 E4M3 per tensor, BF16 scale (frozen in QAD) | Recipe A's FP8 volume, bound with `--ngram-reuse` (the converter checks 512 rows, `verify_artifact` every row) | Same | The card calls the table frozen from NVIDIA's NVFP4 release |
+| MTP (block-FP8 experts, BF16 dense) | As recipe A's source | Recipe A's drafter (`q8_g32_fp16` dense, `q4_g64_fp16` MSE experts) | Same | Affects only acceptance; NVIDIA did not validate MTP on these weights |
+
+**The shared job on W4A4 banks.** The routed experts' call already ran a shared expert as its last job for
+Qwen3.5-122B's NVFP4 W4A16 banks: expert E (one past the routed ones) with entries `k*T + t`, its record a resident
+device pointer that no copy, CPU job or tail skip ever takes, and its scalars `scales[E]`. Four A4 sites read an
+entry's column as `entry / top_k` (the wide route's A4 quantizer, the one-column narrow kernels and the tensor-core
+narrow kernels' two encoders) and now map it through `entry_column`; `moe_experts` accepts a shared job on any
+NVFP4 bank. The shared job has the call's T columns, so it takes the exact narrow route in every call of at most
+eight columns and the wide route (F1: the FP4 tensor cores' FP32 accumulation, held to its FP64 oracle, bit-equal to
+the narrow route on NVIDIA's real scales but not on every word) in wider ones, by the routed experts' rule. Flash-Next's
+decode and verification calls have at most 1 + the draft length columns (8 with MTP, DFlash2 or n-gram drafts of up to
+seven; a lane per column in plain rounds of up to eight lanes), so the shared expert decodes on the exact narrow route
+whatever the other requests: request invariance is unchanged. Prefill chunks take the wide route, as their wide
+routed experts do (verification rounds wider than eight columns, `--ngram-draft-tokens` above 7 or n-gram trees, too).
+Where an expert is computed never changes a bit. The `--lossless` route runs the shared job on its exact expert pass. `infernix_offloaded_moe_shared_a4_test` compares
+every routed and shared output with the CPU engine's W4A4 bits at 1-300 columns, staged, forked and CPU-served.
+Qwen4Exp binds the bank when the artifact stores `moe/shared_expert` (`MoeConfig::shared_bank`, every layer or none)
+and runs no dense shared projections then.
+
+**Fast paths.** The configuration is read from the GDN projection's format and the experts' activations (MXFP8
+dense, 4-bit expert activations), FP4-Local's `--expert-a4-activations` configuration, so these artifacts inherit
+its qualified paths (model-quality §6.7). The fast paths change the same kernels there; the only kernel these
+artifacts add on those routes is the shared job, which runs the routed experts' exact W4A4 kernels. Dense8's Q8
+mixers and head are recipe B's kernels.
+
+**One job more than the routed ones.** The shared job adds one job to every call, and three limits sized for a
+layer's routed jobs had to take it (2026-11-17, found by the first measurements):
+- the SSD tier's fetch plan held `kMaxFetch` (512) jobs, so a call of 52+ columns on the tier (the exclusive layout's
+  default) failed with "experts fetch channel is incomplete"; its per-job arrays hold `kMaxFetchJobs` (513) now, while
+  a request still names at most 512 experts (the shared job is resident, never fetched).
+  `test_offloaded_moe_layer`'s shared-fetch case routes all 512 experts of a 64-column call beside the shared job
+  through the fetch channel (64 and 3 staging slots) against the CPU engine and a zero-copy reference; without the
+  extra job it fails with that message;
+- Qwen4Exp's staging held `top_k x max_width` (80) records and the fork route needs every job within the slots, so
+  every eight-column verification call lost the fork (and its landings): MTP decode after a 4K prompt was 14-16 %
+  behind FP4-Local in every mode until a shared bank's staging took one slot more (+16-19 %, level with FP4-Local).
+  The fork takes calls of at most eight columns, so it needs at most 81 slots and the 512-slot cap never binds. No
+  test guards the slot: a forked call is not observable apart from speed (the landed count stays above zero when
+  only the eight-column calls lose the fork), so the bench's MTP decode is its check;
+- the wide route's WarpTile64 rule reads the mean columns per job, which the shared job's T columns raised (the rule
+  then switched at about 23,900 instead of 26,200 columns a call; the bits are the same either way); it reads the
+  routed jobs' mean now.
+
+**`--a16-activations` and `--a8-activations`.** Both run the W4A4 banks as 16-bit banks (`LoadOptions::
+expert_a16_activations`), the routed and the shared bank alike: the shared job then takes the routed experts' W4A16
+routes (narrow ring, row and tensor-core kernels, the exact wide route), and with `--a8-activations` their 8-bit
+route (the 8-bit narrow kernels through 128 columns, the int8 tiles beyond), the MXFP8 projections' prefill on two
+E4M3 terms per 32 values. `--a16-activations` gives FP4-Local's default configuration (16-bit experts), where
+`expert-a4-residual` and its decode candidate are registered; they then also take the shared job. Every one of these
+routes maps a shared job's entries to their columns (`entry_column`), and `infernix_offloaded_moe_shared_a4_test`
+checks the shared outputs in each arithmetic against the same record run as a routed expert of the same width.
+
 ### 6.2 Expert storage layout `nvfp4_expert_rg16_v1`
 
 The pinned host bank is read by the GPU (DMA into a frame, then the expert kernels) and by the CPU
@@ -7548,6 +7619,22 @@ measured results are under "Status" at the end of this section.
   shrinking before VidMm contention (device free is the primary signal; budget and `Demoted` are
   secondary). Infernix never changes driver settings; the docs mention "Prefer No Sysmem Fallback" as
   optional.
+- **Other processes' memory** (issue #68, 2026-11-17): the budget and cudaMemGetInfo need not see it (they
+  ignored a 3 GiB holder below; a 6 GiB one later cut the budget to 24,882 MiB before loading).
+  RTX 5090, no display, a probe process holding 3 GiB: the DXGI budget (31,419 MiB) and free memory
+  stayed as on an empty card while NVML's free fell by 3.5 GiB, so FP4-Local sized 9,108 frames (as on
+  the empty card), Windows cut the budget as the card filled (to 27,527 MiB) and the grow mapped past it:
+  "55 MiB … placed in system memory", 7,912 of 9,108 frames (8 MiB free after: the free figure clamped at
+  0 before the last chunk). The same without `--vram-past-budget` (7,670 of 8,866). A grow now reads
+  free memory before every chunk and maps it only while `growth_room` (the sizing's room with nothing
+  left to allocate: min(F − headroom, B − 64 MiB) − reserve) covers it; the elastic controller's target
+  is the same bound, so it does not regrow toward a target the stop left. The reporter's signature (a
+  whole 64 MiB chunk lost with 3.6 GiB counted free, display attached) is not reproduced on a headless
+  card; the sizing and ledger lines now give NVML's device-wide used and free, which see other
+  processes, to tell a physically full card from a budget cut. NVML sizes nothing: on the quiet card its
+  figures and the budget's differ by a few hundred MiB either way (at idle 198 MiB in use beyond the one
+  process's budget usage; after startup 362 MiB free against the engine's 161), so it stays a diagnostic
+  until a physically full card is measured.
 
 #### Feature 2: the SSD expert tier
 
@@ -8297,8 +8384,9 @@ the 8-column rate of those readings stayed normal (47,100-48,400 against 48,400-
 the same saved state and so the same fill order, and 18 later starts of this build in three orders (same-build runs,
 alternated, the reference rewritten or fixed) read 19,600-21,000: the cause was not found. The 122B with
 `--expert-ram-mib 40000` needs every copy's slot, so it releases them all, as before (7,449 experts in RAM, 2,402 on
-the SSD, both builds). Not run: an artifact with several record sizes (IQ3_S), where the per-class release has only
-the unit tests.
+the SSD, both builds). IQ3_S (several record sizes; the deploy flags with `--expert-ram-mib`, one start a build):
+at 30,000 MiB every slot is needed and both builds hold 14,388 experts in RAM with 3,708 on the SSD; at 40,000 MiB
+both hold 18,096 in RAM and copies of the 1,398 least-used seeds, none on the SSD (read in 7.4 against 7.9 s).
 
 ### 19.3.8 Prefill (proposed track M8, steps F0 and F1)
 
@@ -8613,7 +8701,9 @@ the drive's knee) remains open.
   - **MoE groups (2026-10-12).** The walk runs each layer in two halves: `layer_mixer` per chunk
     (everything before the MoE; its input and inject weights go to the span area), then
     `layer_moe` once over a group of consecutive chunks (up to `kWalkMoeColumns` = 32,768 columns
-    since 2026-10-19, 16,384 before, and what the active arena holds, `Forward::moe_workspace_bytes`).
+    since 2026-10-19, 16,384 before, and as far as the group's plan, `Forward::plan_walk_moe`, fits the walk's
+    budget: what the expert cache can lend now beside the walk area and the ring, or on the reproducible route a
+    figure fixed when the chunk is fitted; the span's wide arena is lent for its groups, §19.3.7).
     Every MoE step acts column by column, so the outputs are the chunk-major ones; the expert calls
     see 2-8x the columns (the IQ3_S expert tiles run 33-50 % more effective TOPS at 16,384 tokens
     than at 4,096, and 7-14 % more again at 32,768; §19.3.29). The route log keeps the group's last
@@ -8956,6 +9046,51 @@ end-to-end effect is not measured yet.
 - The ~40K prompt's ids are identical in all three runs.
 - The tg512 and pp16384 differences are within one run's spread at this short context, so they
   are not claimed as gains.
+
+**Sizing by the forward's plan (2026-11-17).** The wide arena was sized by `Forward::workspace_bytes`, a sum of
+every buffer a call could hold, 2.0-3.9 times what a call uses (FP4-Local, a 16,384-token walk: 2,632 MiB peak in
+a 7,792 MiB arena). It is now the forward's own plan:
+- The prefill steps (`run`, `run_split`, `embed`, the layer and its mixer and MoE halves, `finish`, the MTP block's
+  K/V-only form) are templates on an allocator: `WorkspaceArena` runs them, `WorkspaceLayoutBuilder` places their
+  allocations and runs nothing. Every allocation's guard reads the parameters, the fast paths, the KV storage or the
+  call's shape (`CallShape`, `FinishShape`, `AttentionShape`); an Op's scratch is its capacity query.
+- A planner `Forward` (`Forward::planner`: no state, KV or experts) is built from the parameters before the chunk is
+  fitted at load, and memoizes `plan_run`, `plan_split`, `plan_walk_mixer`, `plan_walk_moe` and `plan_walk_finish` per
+  shape. The lossless route keeps the formula.
+- Each wide scope lends its own plan and 1 MiB (`kWideSlack`: the lease's base need not be aligned as the plan's
+  offsets are): a chunk-major call's, the pair call's (with the DFlash2 drafter's context call), a walk's (its widest
+  chunk's steps and its MoE groups). The chunk fits, the prompts' pending lease and the fallback allocation take
+  `wide_need(width)`, the most of a width's scopes.
+- A walk's MoE groups are formed before its lease is taken, by a budget: what the cache can lend now beside the walk
+  area and the ring, or on the reproducible route a figure fixed when the chunk is fitted, so a request's groups
+  depend only on its calls. A span of chunks the static arena holds groups by that arena.
+- `infernix_qwen4_exp_wide_plan_real_test` checks every scope against its plan: every KV storage, MTP, DFlash2,
+  scoring, two lanes, the A4 and A8 routes, `--reproducible`, a pair call, a 32,768-column group and chunks cut below
+  the prefill chunk. On the final build (FP4-Local 21 scenarios, IQ3_S 17, Dense8 6, both NVFP4-QAD conversions 12;
+  the planner in shadow also on recipe A, recipe C and FP8) no scope peaked above its plan. Each scenario's heaviest
+  scope plans 1.00x its peak, except 1.02x on FP4-Local with BF16 KV (plain or packed: the projections' capacity
+  queries cover f16-accumulate-prefill's scratch that the call does not take) and 1.07x for IQ3_S's 139 MiB pair
+  call. Lighter scopes (peaking at half their plan or more) plan up to 1.52x on the 16,384-token scenarios, 1.66x on
+  the cut chunks and 1.79x on the 48,000-token prompt; they borrow within the lease the heaviest scope sizes. Dense8's mixer planned
+  319 MiB above its peak until the hyper-connection mix's workspace query left out the `u` that its up + collapse
+  route keeps on chip.
+
+| RTX 5090, INT8 KV, chunk 16384, plain decode | Arena or lease (MiB) | pp32768 (tok/s) | tg256 after it | pp4096 | tg256 after it |
+|---|---:|---:|---:|---:|---:|
+| FP4-Local, sum formula | 7,792 | 12,503 | 104.5 | 2,769 | 127.4 |
+| FP4-Local, plan | 3,944 lease, 2,636 a walk scope | 12,562 (+0.5 %) | 112.3 (+7.4 %) | 2,826 (+2.1 %) | 129.7 (+1.8 %) |
+| IQ3_S, sum formula | under 5,804 (16,384 needed 6,998; chunk cut to 13,440) | 8,326 | 110.4 | 3,309 | 103.7 |
+| IQ3_S, plan | 3,336 lease, 2,143 a walk scope (chunk 16,384) | 8,393 (+0.8 %) | 114.4 (+3.6 %) | 3,367 (+1.8 %) | 104.6 (+0.9 %) |
+
+- `infernix_bench -pg P,256 -r 3 --warmup 1`, two runs an arm rotated A B B A, every B run above every A run; the
+  merged tree before and after the change (48e11c33 against its successor). The decode after a long prompt gains most:
+  fewer experts are evicted for the prefill's loan.
+- Bits: the replies of the planner built in shadow equal the build before it on the reproducible route (FP4-Local,
+  IQ3_S, Dense8) and the default route (plain, MTP, DFlash2; FP4-Local). With the loans by the plan, FP4-Local and
+  Dense8 reply the same on the reproducible route; IQ3_S's prefill chunk now fits at 16,384 where the formula cut it
+  (11,008 on that launch), which moves its call grid: one of six prompts replied otherwise (16,565 tokens).
+- The pending lease is the most any remaining call may need, a chunk-major call's (FP4-Local 3,944 MiB at 16,384),
+  though a walk's scopes use less (2,636 MiB).
 
 #### VRAM item 2: the ~1.6 GB "in use before loading" (2026-10-05)
 
@@ -11664,7 +11799,8 @@ corpus in 49,152-token windows at 8,192-token chunks (MoE groups of two chunks b
   7,009 MiB, more than the cache lends, so it prefills at 8,192): on Dense8, which lends a 16K
   arena, 16K chunks ran −0.6 % at 32K and −0.1 % at 64K tokens against 8K (two rounds), and the BF16
   dense tiles gain 1-4 % per column at 16K over 8K (the shared expert loses 5 %), about 1 µs per
-  token in all.
+  token in all. Built since by sizing each loan by the forward's plan (VRAM item 1, 2026-11-17): IQ3_S
+  prefills at 16,384.
 - The BF16 expert route over planes below 14,336 columns (above; superseded by the stage-decode
   tiles below).
 - A two-limb expert codec: not built once the BF16 tiles measured faster than the exact tiles from

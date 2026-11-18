@@ -16,6 +16,7 @@
 #include "core/device.h"
 #include "core/startup.h"
 #include "runtime/prefix_cache/block_hash.h"
+#include "runtime/prefix_cache/prefix_holds.h"
 #include "runtime/prefix_cache/source_policy.h"
 
 #include <algorithm>
@@ -43,6 +44,28 @@ namespace pc = runtime::prefix_cache;
 namespace {
 
 constexpr std::uint32_t kBlock = pc::kBlockTokens;
+
+// Runs its (non-throwing) rollback on every way out of a scope but the one that dismisses it: a return as well as a
+// throw. run() rolls back at once, where what follows reads the rolled-back state.
+template <class F>
+class ScopeRollback {
+public:
+    explicit ScopeRollback(F rollback) noexcept : rollback_(std::move(rollback)) {}
+    ScopeRollback(const ScopeRollback&)            = delete;
+    ScopeRollback& operator=(const ScopeRollback&) = delete;
+    ~ScopeRollback() { run(); }
+    void run() noexcept {
+        if (armed_) {
+            armed_ = false;
+            rollback_();
+        }
+    }
+    void dismiss() noexcept { armed_ = false; }
+
+private:
+    F rollback_;
+    bool armed_ = true;
+};
 
 // Blocks one prefetch batch copies (§6.6): about 20 ms of PCIe for 27B INT8, the longest a quote
 // may wait for blocks it is about to resume over.
@@ -104,6 +127,33 @@ HistoryKeys history_keys(const PreparedPromptData& prompt, std::span<const Token
     out.tokens = ledger;
     pc::extend_history_keys(ledger, out.hashes, out.extras, trailing_extra);
     return out;
+}
+
+// A block's transfer destinations, the text pool's and (with `backend`) the backend pool's: a failure of the second
+// returns the first, which no one would own otherwise (an occupied page outside every list).
+HybridBlockPages materialize_destinations(LogicalKVPageStore& text, DeviceKVPageReservation& text_reservation,
+                                          LogicalKVPageStore* backend, DeviceKVPageReservation* backend_reservation,
+                                          std::uint32_t columns) {
+    HybridBlockPages pages{.text = text.materialize_transfer_destination(text_reservation, columns)};
+    if (backend != nullptr) {
+        try {
+            pages.backend = backend->materialize_transfer_destination(*backend_reservation, columns);
+        } catch (...) {
+            text.abort_transfer_destination(pages.text, text_reservation);
+            throw;
+        }
+    }
+    return pages;
+}
+
+// Destinations not adopted by the cache (restore_block, register_tail_copy) go back to their reservations.
+void abort_destinations(const HybridBlockPages& pages, LogicalKVPageStore& text,
+                        DeviceKVPageReservation& text_reservation, LogicalKVPageStore* backend,
+                        DeviceKVPageReservation* backend_reservation) noexcept {
+    text.abort_transfer_destination(pages.text, text_reservation);
+    if (backend != nullptr && pages.backend) {
+        backend->abort_transfer_destination(*pages.backend, *backend_reservation);
+    }
 }
 
 } // namespace
@@ -497,7 +547,8 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
     // never waits for a transfer and never drops a block's last copy. For a request that is not the
     // next to bind (`spare_only`) it never takes a block a queue hold names either: those are what the
     // requests ahead of it, and it, resume over.
-    index.acquire_path(path);
+    // Declared before the try: on a failure the catch aborts the restore before the pins go.
+    const pc::PathPin pinned(index, path);
     std::uint32_t started = 0;
     try {
         DeviceKVPagePool& text_pool = text_kv_pages->physical_pool();
@@ -530,13 +581,11 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
         if (text_pages && (backend_pool == nullptr || backend_pages)) {
             hybrid_->open_restore(device.stream);
             for (const pc::NodeRef node : host_only) {
-                HybridBlockPages pages{
-                    .text = text_kv_pages->materialize_transfer_destination(*text_pages, kBlock)};
-                if (backend_pool != nullptr) {
-                    pages.backend =
-                        backend_kv_pages->materialize_transfer_destination(*backend_pages, kBlock);
-                }
-                hybrid_->restore_block(node, pages);
+                // restore_block adopts the pages (and returns them on its own failure).
+                hybrid_->restore_block(node, materialize_destinations(
+                                                 *text_kv_pages, *text_pages,
+                                                 backend_pool != nullptr ? backend_kv_pages.get() : nullptr,
+                                                 backend_pages ? &*backend_pages : nullptr, kBlock));
                 ++started;
             }
             hybrid_->submit_restore();
@@ -544,10 +593,8 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_prefetch(const RequestBasePlan&
         }
     } catch (...) {
         hybrid_->abort_restore();
-        index.release_path(path);
         throw;
     }
-    index.release_path(path);
     return started;
 }
 
@@ -871,6 +918,20 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
     auto& binding                = transaction.hybrid.emplace();
     binding.quote                = candidate.hybrid;
     binding.path_hash            = path_hash;
+    // Every way out before the transaction is the Program's (context_transaction_, below) unwinds it, a shortage
+    // return as well as a throw. Armed before plan_binding_units, which sets the lane's request: a throw after it
+    // would otherwise leave the lane Prefilling, refused by every later binding until a recovery swept it.
+    ScopeRollback unwind([&]() noexcept {
+        abort_hybrid_binding(transaction);
+        // The state slot reserved below goes back here: the transaction is not the Program's yet, so abort_context
+        // never sees it, and a staging failure (a vision encoder, an allocation, the prompt's copy) would otherwise
+        // lose a slot for good until admission reported a state-slot shortage.
+        if (transaction.reserved_state) {
+            (void)state_store->release(*transaction.reserved_state);
+            transaction.reserved_state.reset();
+        }
+        requests[lane] = {};
+    });
     plan_binding_units(transaction, base, resume, resume_kind, resume_tokens);
     const UnitDemand& demand = transaction.reservation_demand;
 
@@ -899,11 +960,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
         cache->pin_snapshot(quote.snapshot);
         binding.snapshot_pinned = true;
     }
-    const auto unwind = [&] {
-        abort_hybrid_binding(transaction);
-        requests[lane] = {};
-    };
-    try {
+    {
         runtime::ContextResourceUsage shortage;
         // While another lane holds KV, a binding the pools cannot hold even with every evictable cached
         // Device block evicted and every transfer landed (hybrid_cache_room) makes no room: it would evict
@@ -937,7 +994,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             }
         }
         if (shortage.main_kv_pages || shortage.backend_kv_pages) {
-            unwind();
+            unwind.run(); // before the pools' usage is read
             // Waiting helps only when the binding fits the pools at all.
             const auto usage = physical_usage();
             const bool capacity_possible =
@@ -946,10 +1003,7 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             return {.capacity_possible = capacity_possible, .shortage = shortage, .reclaim_cache = possible};
         }
         transaction.reserved_state = state_store->reserve_destination();
-        if (!transaction.reserved_state) {
-            unwind();
-            return {.shortage = {.state_slots = 1}};
-        }
+        if (!transaction.reserved_state) { return {.shortage = {.state_slots = 1}}; }
         // The request's prefill state is staged only now that the binding has its room: an attempt that reports
         // a shortage, which the Engine repeats on later admission passes, copies no prompt and encodes no image.
         // A resumed request brings its own (install_binding), so it stages none.
@@ -962,12 +1016,10 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             // Offloaded experts: the replay's routes credit the cache from zero, as a prompt's do.
             offload->engine().clear_prompt_uses(lane);
         }
-    } catch (...) {
-        unwind();
-        throw;
     }
 
     context_transaction_.emplace(std::move(transaction));
+    unwind.dismiss();
     auto& tx = *context_transaction_;
     auto& hb = *tx.hybrid;
     try {
@@ -993,13 +1045,8 @@ ProgramImpl::start_hybrid_binding(const RequestBasePlan& base, std::uint32_t lan
             hybrid_->open_restore(device.stream);
             hb.restore_staged      = true;
             const auto destination = [&](std::uint32_t columns) {
-                HybridBlockPages pages{
-                    .text = text_kv_pages->materialize_transfer_destination(*text_pages, columns)};
-                if (backend_kv_pages) {
-                    pages.backend =
-                        backend_kv_pages->materialize_transfer_destination(*backend_pages, columns);
-                }
-                return pages;
+                return materialize_destinations(*text_kv_pages, *text_pages, backend_kv_pages.get(),
+                                                backend_pages ? &*backend_pages : nullptr, columns);
             };
             for (const pc::NodeRef node : host_only) {
                 hybrid_->restore_block(node, destination(kBlock));
@@ -1085,6 +1132,14 @@ void ProgramImpl::abort_hybrid_binding(ContextTransaction& tx) noexcept {
             hybrid_->abort_restore();
             hb.restore_staged = false;
         }
+        // A restore that landed for a binding the lane never adopted (a later step of complete_hybrid_binding
+        // failed): its batch keeps its own pages and pins until it lands, but its copies may still be writing the
+        // reserved state slot, which the abort releases next.
+        if (hb.landed_ticket != 0 && !tx.adopted) {
+            const std::span<const cudaEvent_t> layers = hybrid_->restore_layer_events(hb.landed_ticket);
+            if (!layers.empty()) { (void)cudaEventSynchronize(layers.back()); }
+        }
+        hb.landed_ticket            = 0;
         pc::PrefixCacheIndex& index = hybrid_->index();
         if (hb.snapshot_pinned && index.valid(hb.quote->snapshot)) {
             index.unpin_snapshot(hb.quote->snapshot);
@@ -1110,6 +1165,7 @@ void ProgramImpl::complete_hybrid_binding(ContextTransaction& tx, ContextProgres
     if (hb.restore_staged) {
         ticket            = hybrid_->land_restore(device.stream);
         hb.restore_staged = false;
+        hb.landed_ticket  = ticket;
     }
     const auto commit = [&](KVAddressSpaceStore& addresses, LogicalKVPageStore& pages,
                             std::optional<KVPagePrefixForkReservation>& fork,
@@ -1296,19 +1352,23 @@ std::optional<std::uint32_t> ProgramImpl::hybrid_copy_tail(const HybridBlockPage
         backend_reservation = backend_kv_pages->physical_pool().reserve(1U);
         if (!backend_reservation) { return std::nullopt; }
     }
-    HybridBlockPages copy{
-        .text = text_kv_pages->materialize_transfer_destination(*text_reservation, columns)};
-    if (backend_pool) {
-        copy.backend =
-            backend_kv_pages->materialize_transfer_destination(*backend_reservation, columns);
-    }
-    // Each tail owns its bundle, so evicting any cache entry returns exactly one page per pool.
-    text_kv_pages->physical_pool().copy_page(text_kv_pages->physical(source.text),
-                                             text_kv_pages->physical(copy.text), device.stream);
-    if (backend_pool) {
-        backend_kv_pages->physical_pool().copy_page(backend_kv_pages->physical(*source.backend),
-                                                    backend_kv_pages->physical(*copy.backend),
-                                                    device.stream);
+    LogicalKVPageStore* const backend = backend_pool ? backend_kv_pages.get() : nullptr;
+    DeviceKVPageReservation* const backend_held = backend_reservation ? &*backend_reservation : nullptr;
+    const HybridBlockPages copy = materialize_destinations(*text_kv_pages, *text_reservation, backend, backend_held, columns);
+    try {
+        // Each tail owns its bundle, so evicting any cache entry returns exactly one page per pool.
+        text_kv_pages->physical_pool().copy_page(text_kv_pages->physical(source.text),
+                                                 text_kv_pages->physical(copy.text), device.stream);
+        if (backend_pool) {
+            backend_kv_pages->physical_pool().copy_page(backend_kv_pages->physical(*source.backend),
+                                                        backend_kv_pages->physical(*copy.backend),
+                                                        device.stream);
+        }
+    } catch (...) {
+        // A copy that could not be enqueued (a failed device): the destinations go back, behind what was.
+        (void)cudaStreamSynchronize(device.stream);
+        abort_destinations(copy, *text_kv_pages, *text_reservation, backend, backend_held);
+        throw;
     }
     return hybrid_->register_tail_copy(copy, columns);
 }
@@ -1317,9 +1377,9 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
     HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
     pc::PrefixCacheIndex& index   = hybrid_->index();
     HybridCacheCounters& counters = hybrid_->counters();
-    const auto drop               = [&](const HybridPendingTap& tap) {
-        (void)state_store->release(tap.image);
-        index.release_device_slot(tap.slot);
+    // A tap taken off the pending list holds its staging slot and image below until the publication takes the slot
+    // and the snapshot (or a release) the image: a dropped tap needs only its supersession undone.
+    const auto drop = [&](const HybridPendingTap& tap) {
         hybrid_undo_supersession(lane, tap.superseded);
         ++counters.taps_skipped;
     };
@@ -1346,13 +1406,15 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
                 tail_source = own;
             }
         }
-        if (!anchored || (tail != 0 && !tail_source)) {
-            if (!finishing) { return; }
-            lane.pending.erase(lane.pending.begin());
+        const bool publishable = anchored && (tail == 0 || tail_source);
+        if (!publishable && !finishing) { return; }
+        lane.pending.erase(lane.pending.begin());
+        StateSlotHold image(*state_store, tap.image);
+        pc::DeviceSlotHold slot(index, tap.slot);
+        if (!publishable) {
             drop(tap);
             continue;
         }
-        lane.pending.erase(lane.pending.begin());
         std::optional<std::uint32_t> tail_id;
         if (tail != 0) {
             try {
@@ -1369,18 +1431,25 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
         const pc::NodeRef anchor = full == 0 ? pc::NodeRef{} : lane.path[full - 1U];
         const std::span<const TokenId> tail_tokens(
             sequence.ledger.data() + static_cast<std::size_t>(full) * kBlock, tail);
-        // publish_snapshot consumes the staging slot and the tail id on every outcome.
-        const std::uint64_t evicted       = counters.evicted_blocks;
-        const pc::PublishResult published = index.publish_snapshot(
-            anchor, tap.frontier, tail_tokens, tail_id, tap.slot,
-            tap.boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap, std::nullopt, /*adopt=*/true);
+        // publish_snapshot consumes the staging slot and the tail id on every outcome, a throw included (nothing
+        // between the tail's copy and the call can throw).
+        const std::uint64_t evicted = counters.evicted_blocks;
+        pc::PublishResult published;
+        try {
+            published = index.publish_snapshot(anchor, tap.frontier, tail_tokens, tail_id, slot.release(),
+                                               tap.boundary ? pc::SnapshotKind::Boundary : pc::SnapshotKind::Tap,
+                                               std::nullopt, /*adopt=*/true);
+        } catch (...) {
+            drop(tap);
+            throw;
+        }
         if (!published.created) {
             // The tail copy came back through release_device_block, which counts evictions: it was none.
             counters.evicted_blocks = evicted;
             ++counters.taps_skipped;
             if (!published.snapshot.valid()) {
                 // A full snapshot table: the superseded snapshots stay the lineage's resume point.
-                (void)state_store->release(tap.image);
+                image.reset();
                 hybrid_undo_supersession(lane, tap.superseded);
                 continue;
             }
@@ -1388,9 +1457,10 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
             // staging slot, so the image is its own now (a resume from it then needs no Host restore);
             // otherwise the copy goes.
             if (published.device_adopted) {
-                hybrid_->attach_image(published.snapshot, tap.image);
+                hybrid_->attach_image(published.snapshot, image.get());
+                (void)image.release();
             } else {
-                (void)state_store->release(tap.image);
+                image.reset();
             }
             // It is the lineage's snapshot at this frontier as one the lane created would be, so a deeper
             // one supersedes it; the lane did not create it, so a withdrawal leaves it.
@@ -1406,7 +1476,8 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
             }
             continue;
         }
-        hybrid_->attach_image(published.snapshot, tap.image);
+        hybrid_->attach_image(published.snapshot, image.get());
+        (void)image.release();
         lane.created.push_back(published.snapshot);
         lane.deepest_snapshot = std::max(lane.deepest_snapshot, tap.frontier);
         if (tap.frontier >= lane.latest_frontier) {
@@ -1441,15 +1512,32 @@ void ProgramImpl::hybrid_publish_pending(SequenceState& sequence, bool finishing
 
 bool ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t frontier,
                                      bool boundary, bool retry) {
-    HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
-    pc::PrefixCacheIndex& index   = hybrid_->index();
-    HybridCacheCounters& counters = hybrid_->counters();
     // A tap no prefill plan foresaw (a coalescing sibling's) may find the DFlash2 ring missing
     // positions YE-01 skipped: a snapshot always carries a whole ring, so the tap is passed over.
     if (frontier == 0 || frontier > sequence.text_kv_valid || !dflash_ring_whole(sequence, frontier)) {
-        if (!retry) { ++counters.taps_skipped; }
+        if (!retry) { ++hybrid_->counters().taps_skipped; }
         return false;
     }
+    bool no_room = false;
+    const std::optional<HybridPendingTap> reserved = hybrid_reserve_tap(sequence, frontier, boundary, retry, no_room);
+    if (!reserved) { return no_room; }
+    try {
+        state_images->copy_slot(state_store->physical_slot(sequence.state.write),
+                                state_store->physical_slot(reserved->image), device.stream);
+    } catch (...) {
+        hybrid_release_reserved(sequence, *reserved);
+        throw;
+    }
+    hybrid_publish_reserved(sequence, *reserved, retry);
+    return false;
+}
+
+std::optional<HybridPendingTap> ProgramImpl::hybrid_reserve_tap(SequenceState& sequence, std::uint32_t frontier,
+                                                                bool boundary, bool retry, bool& no_room) {
+    HybridLaneState& lane         = hybrid_lanes_[sequence.lane];
+    pc::PrefixCacheIndex& index   = hybrid_->index();
+    HybridCacheCounters& counters = hybrid_->counters();
+    no_room                       = true;
     // Superseded first so the slot can come from the lineage; undone if the tap is not taken.
     const HybridSupersession superseded{
         .resume = hybrid_supersede_resume(lane, frontier, sequence.ledger),
@@ -1463,34 +1551,38 @@ bool ProgramImpl::hybrid_capture_tap(SequenceState& sequence, std::uint32_t fron
             ++counters.taps_skipped;
             ++counters.taps_skipped_no_slot;
         }
-        return true;
+        return std::nullopt;
     }
     const std::optional<StateImageHandle> image = state_store->reserve_destination();
     if (!image) {
         index.release_device_slot(*slot);
         hybrid_undo_supersession(lane, superseded);
         if (!retry) { ++counters.taps_skipped; }
-        return true;
+        return std::nullopt;
     }
+    no_room = false;
+    return HybridPendingTap{
+        .frontier = frontier, .image = *image, .slot = *slot, .boundary = boundary, .superseded = superseded};
+}
+
+void ProgramImpl::hybrid_publish_reserved(SequenceState& sequence, const HybridPendingTap& reserved, bool retry) {
+    HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     try {
-        state_images->copy_slot(state_store->physical_slot(sequence.state.write),
-                                state_store->physical_slot(*image), device.stream);
-        state_store->publish_copied_snapshot(*image);
-        lane.pending.push_back(HybridPendingTap{.frontier   = frontier,
-                                                .image      = *image,
-                                                .slot       = *slot,
-                                                .boundary   = boundary,
-                                                .superseded = superseded});
+        state_store->publish_copied_snapshot(reserved.image);
+        lane.pending.push_back(reserved);
     } catch (...) {
-        (void)state_store->release(*image);
-        index.release_device_slot(*slot);
-        hybrid_undo_supersession(lane, superseded);
+        hybrid_release_reserved(sequence, reserved);
         throw;
     }
-    lane.last_capture = frontier;
-    if (retry) { ++counters.taps_retried; }
+    lane.last_capture = reserved.frontier;
+    if (retry) { ++hybrid_->counters().taps_retried; }
     hybrid_publish_pending(sequence, false);
-    return false;
+}
+
+void ProgramImpl::hybrid_release_reserved(SequenceState& sequence, const HybridPendingTap& reserved) {
+    (void)state_store->release(reserved.image);
+    hybrid_->index().release_device_slot(reserved.slot);
+    hybrid_undo_supersession(hybrid_lanes_[sequence.lane], reserved.superseded);
 }
 
 void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint32_t cursor,
@@ -1498,14 +1590,32 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     if (!hybrid_ || sequence.lane >= max_concurrency) { return; }
     HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     if (!lane.active || !lane.publish || cursor >= prompt_tokens) { return; }
+    const std::optional<HybridTapDue> due = hybrid_tap_due(sequence, cursor, prompt_tokens);
+    if (!due) { return; }
+    const bool no_room = hybrid_capture_tap(sequence, cursor, due->boundary, due->retry_only);
+    lane.tap_retry     = false;
+    if (no_room) { hybrid_tap_no_room(sequence, *due); }
+}
+
+void ProgramImpl::hybrid_tap_no_room(SequenceState& sequence, const HybridTapDue& due) {
+    HybridLaneState& lane = hybrid_lanes_[sequence.lane];
+    lane.tap_retry        = due.last_flexible.has_value();
+    if (due.last_flexible) { lane.next_tap = *due.last_flexible; }
+}
+
+std::optional<ProgramImpl::HybridTapDue> ProgramImpl::hybrid_tap_due(SequenceState& sequence, std::uint32_t cursor,
+                                                                     std::uint32_t prompt_tokens, bool apply) {
+    HybridLaneState& lane = hybrid_lanes_[sequence.lane];
     // Without free cache resume prefill splits only on the chunk grid, every tap is realized at a
     // grid boundary, and blocks publish up to the last one reached.
     const bool invariant = execution_schedule.grid_cache;
     const bool on_grid   = cursor % prefill_chunk == 0;
     if (invariant) {
-        if (!on_grid) { return; }
-        lane.publish_frontier = cursor;
-        hybrid_publish_blocks(sequence);
+        if (!on_grid) { return std::nullopt; }
+        if (apply) {
+            lane.publish_frontier = cursor;
+            hybrid_publish_blocks(sequence);
+        }
     }
     // The next chunk reaches the prompt end, so a flexible tap inside it is realized here.
     const bool final_chunk_next = prompt_tokens - cursor <= prefill_chunk;
@@ -1517,9 +1627,10 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
     // the DFlash2 ring whole for it (YE-01 projects from the earliest planned read on).
     const std::optional<std::size_t> pending = lane.tap_retry ? std::optional<std::size_t>(lane.next_tap) : std::nullopt;
     std::optional<std::size_t> last_flexible;
-    bool fresh = false; // a tap is due here for the first time
-    while (lane.next_tap < lane.taps.size()) {
-        const pc::PlannedTap& tap = lane.taps[lane.next_tap];
+    bool fresh       = false; // a tap is due here for the first time
+    std::size_t next = lane.next_tap;
+    while (next < lane.taps.size()) {
+        const pc::PlannedTap& tap = lane.taps[next];
         if (tap.placement == pc::TapPlacement::Exact && !invariant) {
             if (tap.position > cursor) { break; }
             exact    = exact || tap.position == cursor;
@@ -1529,31 +1640,27 @@ void ProgramImpl::hybrid_after_prefill_chunk(SequenceState& sequence, std::uint3
             break;
         } else {
             flexible      = true;
-            last_flexible = lane.next_tap;
-            fresh         = fresh || !pending || lane.next_tap != *pending;
+            last_flexible = next;
+            fresh         = fresh || !pending || next != *pending;
             // On the grid a coalescing tap (VR-01) lands at its grid boundary and stays a boundary, so
             // the sibling's deeper taps do not supersede the snapshot the waiting request resumes from.
             boundary = boundary || (invariant && tap.boundary && tap.position == cursor);
         }
-        ++lane.next_tap;
+        ++next;
     }
-    if (!exact && !flexible) { return; }
+    if (apply) { lane.next_tap = next; }
+    if (!exact && !flexible) { return std::nullopt; }
     // A retried tap counts no second skip; one taken counts in taps_retried.
-    const bool retry_only = pending.has_value() && !fresh;
-    const auto keep_planned = [&] {
-        lane.tap_retry = last_flexible.has_value();
-        if (last_flexible) { lane.next_tap = *last_flexible; }
-    };
+    const HybridTapDue due{.boundary = boundary, .retry_only = pending.has_value() && !fresh,
+                           .last_flexible = last_flexible};
     if (inside_exclusion(cursor, lane.exclusions) || cursor <= lane.last_capture ||
         (!exact && cursor - lane.last_capture < pc::kMinimumTapSeparation)) {
-        if (!retry_only) { ++hybrid_->counters().taps_skipped; }
+        if (apply && !due.retry_only) { ++hybrid_->counters().taps_skipped; }
         // A retried tap waits for a boundary it may take.
-        if (pending) { keep_planned(); }
-        return;
+        if (apply && pending) { hybrid_tap_no_room(sequence, due); }
+        return std::nullopt;
     }
-    const bool no_room = hybrid_capture_tap(sequence, cursor, boundary, retry_only);
-    lane.tap_retry     = false;
-    if (no_room && flexible) { keep_planned(); }
+    return due;
 }
 
 void ProgramImpl::hybrid_after_begin(SequenceState& sequence) {
@@ -1794,27 +1901,25 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
                 if (!slot) { skipped(); }
                 if (slot) {
                     try {
+                        // The slot and the registered tail go back on every way out until publish_snapshot, which
+                        // consumes both on every outcome, a throw included.
+                        pc::DeviceSlotHold staging(index, *slot);
+                        pc::DeviceBlockHold tail_hold;
                         const std::uint32_t tail = frontier % kBlock;
-                        std::optional<std::uint32_t> tail_id;
-                        try {
-                            if (tail != 0) {
-                                // The finishing lane hands its last partial page to the snapshot.
-                                HybridBlockPages pages{.text = text_kv_addresses->logical_page(
-                                                           sequence.kv->text, anchor_blocks)};
-                                std::uint32_t backend_columns = 0;
-                                if (sequence.kv->backend) {
-                                    pages.backend = backend_kv_addresses->logical_page(
-                                        *sequence.kv->backend, anchor_blocks);
-                                    backend_columns =
-                                        backend_frontier > anchor_blocks * kBlock
-                                            ? backend_frontier - anchor_blocks * kBlock
-                                            : 0U;
-                                }
-                                tail_id = hybrid_->register_tail(pages, tail, backend_columns);
+                        if (tail != 0) {
+                            // The finishing lane hands its last partial page to the snapshot.
+                            HybridBlockPages pages{.text = text_kv_addresses->logical_page(
+                                                       sequence.kv->text, anchor_blocks)};
+                            std::uint32_t backend_columns = 0;
+                            if (sequence.kv->backend) {
+                                pages.backend = backend_kv_addresses->logical_page(
+                                    *sequence.kv->backend, anchor_blocks);
+                                backend_columns =
+                                    backend_frontier > anchor_blocks * kBlock
+                                        ? backend_frontier - anchor_blocks * kBlock
+                                        : 0U;
                             }
-                        } catch (...) {
-                            index.release_device_slot(*slot);
-                            throw;
+                            tail_hold = pc::DeviceBlockHold(*hybrid_, hybrid_->register_tail(pages, tail, backend_columns));
                         }
                         const StateImageHandle image = sequence.state.write;
                         state_store->freeze(image);
@@ -1826,10 +1931,12 @@ pc::SnapshotRef ProgramImpl::hybrid_publish_endpoint(SequenceState& sequence, bo
                                                        ? pc::NodeRef{}
                                                        : lane_state.path[anchor_blocks - 1U];
                         const std::uint64_t evicted = hybrid_->counters().evicted_blocks;
+                        std::optional<std::uint32_t> tail_id;
+                        if (tail_hold.held()) { tail_id = tail_hold.release(); }
                         // A pause's resume point is admitted to a full snapshot table as it is to the Device
                         // slots and the Host tier: over any snapshot that is not pinned or held.
                         const pc::PublishResult published = index.publish_snapshot(
-                            anchor, frontier, tail_tokens, tail_id, *slot, kind,
+                            anchor, frontier, tail_tokens, tail_id, staging.release(), kind,
                             pausing ? std::optional<double>(pc::kResumePointClaim) : std::nullopt, /*adopt=*/true);
                         if (published.created) {
                             endpoint_published = true;
