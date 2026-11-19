@@ -74,6 +74,7 @@ jobs:
 
 #####
       - name: Temp fix zlib library name mismatch (z.lib vs libz.lib)
+        continue-on-error: true
         shell: pwsh
         run: |
           $vcpkgRoot = "${{ github.workspace }}\vcpkg"
@@ -128,6 +129,7 @@ jobs:
           cmake --build $env:BUILD_DIR --config Release --parallel
 #####
       - name: Show dependencies of infernix-serve.exe (diagnostic)
+        continue-on-error: true
         shell: pwsh
         run: |
           $exe = "$env:BUILD_DIR\apps\Release\infernix-serve.exe"
@@ -136,6 +138,7 @@ jobs:
           }
 #####
       - name: Stage runtime DLLs for smoke test (skip existing)
+        continue-on-error: true
         shell: pwsh
         run: |
           $vcpkgBin   = "${{ github.workspace }}\vcpkg\installed\x64-windows\bin"
