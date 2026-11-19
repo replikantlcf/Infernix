@@ -398,6 +398,11 @@ add_test(NAME infernix_sparse_moe_wide_test
   COMMAND ${infernix_sparse_moe_test_COMMAND} --wide-only)
 set_tests_properties(infernix_sparse_moe_wide_test
   PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 600 RUN_SERIAL TRUE)
+# Routes over every expert (the token-oriented prefill route) and every job-tile residue, per-token inputs.
+add_test(NAME infernix_sparse_moe_routed_test
+  COMMAND ${infernix_sparse_moe_test_COMMAND} --routed-only)
+set_tests_properties(infernix_sparse_moe_routed_test
+  PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 900 RUN_SERIAL TRUE)
 
 foreach(mode IN ITEMS ngram-only onehot-distribution mtp-onehot mtp-distribution ngram-negative-penalties wide-accept wide-distribution)
   string(REPLACE "-" "_" test_suffix "${mode}")
@@ -499,7 +504,7 @@ infernix_add_family_op_test(infernix_offloaded_moe_team_test FAMILY offloaded_mo
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_team.cpp"
   LIBRARIES infernix_offloaded_moe_cpu)
 
-# The GPU narrow route against the golden hashes and the CPU engine, bit for bit.
+# The narrow route's canonical scalar functions and E2M1 decoders on the GPU against the CPU header.
 infernix_add_family_op_test(infernix_offloaded_moe_cuda_test FAMILY offloaded_moe
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/test_offloaded_moe_cuda.cu"
   LIBRARIES infernix_ops)

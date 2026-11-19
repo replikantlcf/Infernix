@@ -3,6 +3,7 @@
 #include "product/logging/logging.h"
 #include "product/speculative_options.h"
 #include "serve/anthropic_messages.h"
+#include "serve/cors_headers.h"
 #include "serve/http_transport.h"
 #include "serve/openai_common.h"
 #include "serve/request_log.h"
@@ -25,11 +26,7 @@ namespace infernix::serve {
 namespace {
 
 void write_exception(httplib::Response& res, const std::exception& ex) {
-    ApiError error;
-    error.status  = 500;
-    error.type    = "internal_error";
-    error.message = ex.what();
-    write_openai_error(res, error);
+    write_openai_error(res, internal_server_error(ex));
 }
 
 bool is_anthropic_path(std::string_view path) {
@@ -405,9 +402,13 @@ void HttpServer::run_stats_reporter() {
     // runtime_stats, and an exception leaving this thread would terminate the server.
     infernix::GpuTelemetrySample gpu_previous;
     infernix::RuntimeStats previous;
+    // Whether `previous` holds a real sample: until one is taken, an interval only takes it (reporting the
+    // cumulative counters as one interval's would show a rate spike).
+    bool have_previous = false;
     try {
-        gpu_previous = telemetry.sample();
-        previous     = service_->runtime_stats();
+        gpu_previous  = telemetry.sample();
+        previous      = service_->runtime_stats();
+        have_previous = true;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[infernix-serve] throughput report failed: %s; reporting continues\n", error.what());
     } catch (...) {
@@ -437,14 +438,19 @@ void HttpServer::run_stats_reporter() {
         try {
             const infernix::RuntimeStats current = service_->runtime_stats();
             const Clock::time_point now        = Clock::now();
-            ThroughputReport report            = make_throughput_report(
-                previous, current, std::chrono::duration<double>(now - previous_time).count());
-            report.gpu_previous = gpu_previous;
-            report.gpu_current  = telemetry.sample();
-            gpu_previous        = report.gpu_current;
+            if (have_previous) {
+                ThroughputReport report = make_throughput_report(
+                    previous, current, std::chrono::duration<double>(now - previous_time).count());
+                report.gpu_previous = gpu_previous;
+                report.gpu_current  = telemetry.sample();
+                gpu_previous        = report.gpu_current;
+                if (report_has_activity(report)) { record_throughput(report); }
+            } else {
+                gpu_previous = telemetry.sample(); // the first sample: the next interval reports from here
+            }
             previous      = current;
             previous_time = now;
-            if (report_has_activity(report)) { record_throughput(report); }
+            have_previous = true;
             if (console_stats_) { console_stats_->runtime(current); }
         } catch (const std::exception& error) {
             note_failure(error.what());
@@ -456,6 +462,7 @@ void HttpServer::run_stats_reporter() {
         if (next_deadline <= after_write) { next_deadline = after_write + interval; }
     }
 
+    if (!have_previous) { return; } // no sample to measure the tail from
     try {
         const infernix::RuntimeStats current = service_->runtime_stats();
         const Clock::time_point now        = Clock::now();
@@ -498,7 +505,8 @@ void HttpServer::register_routes() {
     // (--max-http-clients), not by the window.
     server_.set_keep_alive_timeout(options_.keep_alive_timeout_sec);
     server_.set_keep_alive_timeout_buffer(kKeepAliveBufferSec);
-    // A response write waits up to kWriteTimeoutSec for a client that stops reading (5 s by default).
+    // A response write waits up to kWriteTimeoutSec (60 s) for a client that stops reading (cpp-httplib's own default
+    // is 5 s).
     server_.set_write_timeout(static_cast<time_t>(kWriteTimeoutSec));
     server_.set_error_handler([this](const httplib::Request& request, httplib::Response& response) {
         return handle_unrendered_http_error(options_, request, response);
@@ -507,9 +515,7 @@ void HttpServer::register_routes() {
         server_.set_default_headers(
             {{"Access-Control-Allow-Origin", "*"},
              {"Access-Control-Expose-Headers", "x-request-id, request-id"},
-             {"Access-Control-Allow-Headers",
-              "Authorization, Content-Type, X-API-Key, anthropic-version, anthropic-beta, "
-              "anthropic-user-profile-id"},
+             {"Access-Control-Allow-Headers", std::string(kCorsAllowHeaders)},
              {"Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS"}});
         // CORS preflight: browsers send OPTIONS with no credentials before the real
         // request; answer it without auth so the actual GET/POST can carry the key.

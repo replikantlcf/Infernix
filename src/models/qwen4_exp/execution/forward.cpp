@@ -295,7 +295,13 @@ std::size_t Forward::memoized(int kind, std::int32_t a, std::int32_t b, std::int
     const auto key = std::make_tuple(kind, a, b, c);
     if (const auto it = plans_.find(key); it != plans_.end()) { return it->second; }
     if (config_.lossless) { throw std::logic_error("Qwen4Exp forward: the lossless route keeps its workspace formula"); }
-    eager_chunk_ = true; // prefill steps (dense_routes adds the prefill routes)
+    // The plan places prefill steps (dense_routes adds the prefill routes); the forward's own flag comes back after it,
+    // whatever the plan throws.
+    struct EagerScope {
+        bool& flag;
+        bool saved;
+        ~EagerScope() { flag = saved; }
+    } eager{eager_chunk_, std::exchange(eager_chunk_, true)};
     WorkspaceLayoutBuilder layout;
     plan(layout);
     return plans_[key] = layout.peak_bytes();
@@ -407,6 +413,11 @@ std::size_t Forward::workspace_bytes(const TextConfig& c, std::int32_t columns, 
 }
 
 void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
+    eager_chunk_ = check_call(batch, logits);
+    work_.reset();
+}
+
+bool Forward::check_call(const ForwardBatch& batch, const Tensor* logits) const {
     const std::int32_t T = batch.ids.ne[0];
     if (batch.verify != nullptr && (batch.width < 2 || batch.verify->gdn.spec.width != batch.width ||
                                     batch.verify->gdn.spec.record_capacity < batch.batch)) {
@@ -430,8 +441,7 @@ void Forward::begin_call(const ForwardBatch& batch, const Tensor* logits) {
     // streamed call is a prefill chunk at any width: a layer walk's one-token chunk run as a decode call
     // took its experts beside the span's stream ring and read 2.6-12 nats off its cold prefill
     // (candidates SA-12; the walk keeps a one-token last call on its own for coalescing).
-    eager_chunk_ = batch.verify == nullptr && (batch.width > 1 || batch.stream);
-    work_.reset();
+    return batch.verify == nullptr && (batch.width > 1 || batch.stream);
 }
 
 void Forward::wait_layer(const ForwardBatch& batch, std::size_t entry) {
@@ -480,14 +490,14 @@ void Forward::run_split(const ForwardBatch& head, const ForwardBatch& tail, Tens
             throw std::invalid_argument("Qwen4Exp forward: a pair call takes two plain one-row prefill chunks");
         }
     }
-    // Each chunk's steps run as its own call's: eager or not by its own width (begin_call).
-    begin_call(head, nullptr);
-    const bool head_eager = eager_chunk_;
-    begin_call(tail, &logits);
-    const bool tail_eager = eager_chunk_;
+    // Each chunk's steps run as its own call's would: eager or not by its own width (check_call).
+    const bool head_eager = check_call(head, nullptr);
+    const bool tail_eager = check_call(tail, &logits);
     if (!head_eager || !tail_eager) {
         throw std::invalid_argument("Qwen4Exp forward: a pair call's chunks are prefill chunks of two or more columns");
     }
+    eager_chunk_ = true;
+    work_.reset();
     run_split_impl(work_, &head, &tail, call_shape(head), call_shape(tail), logits, draft_features, &at_split);
 }
 
@@ -514,13 +524,15 @@ void Forward::run_split_impl(A& a, const ForwardBatch* head, const ForwardBatch*
         // One MoE over both chunks: its routing, routed experts and combine act column by column, and its router and
         // shared expert, whose routes go by width (a Q8 projection is SIMT to 8 columns and tensor-core beyond), run
         // on each chunk on their own, so every column has its own call's bits. The last layer's runs over the tail's
-        // trailing columns alone where the tail's own call would trim it (YC-01): no other final residual is read.
+        // trailing columns alone where the tail's own call would trim it (YC-01; its dense shared expert over the tail
+        // chunk, as that call runs it): no other final residual is read.
         const std::int32_t kept = l + 1 == L && tail_shape.trim_last_layer ? last_layer_kept(T1) : 0;
         if (kept > 0) {
             const Tensor xm_kept     = xm.slice(1, T - kept, kept);
             const Tensor inject_kept = inject.slice(1, T - kept, kept);
             Tensor residual_kept     = residual.slice(1, T - kept, kept);
-            layer_moe_impl(a, l, tail, tail_shape, xm_kept, inject_kept, residual_kept, -1, T - kept, 0);
+            layer_moe_impl(a, l, tail, tail_shape, xm_kept, inject_kept, residual_kept, -1, T - kept, 0,
+                           SharedCalls{.x = &xm_tail});
         } else {
             layer_moe_impl(a, l, tail, tail_shape, xm, inject, residual, -1, 0, T0);
         }
@@ -605,8 +617,9 @@ void Forward::layer_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, c
             Tensor xm_kept       = xm.slice(1, T - kept, kept);
             Tensor inject_kept   = inject.slice(1, T - kept, kept);
             Tensor residual_kept = residual.slice(1, T - kept, kept);
+            // The dense shared expert over the whole call, as the untrimmed call runs it.
             (void)moe_impl(a, block.moe, xm_kept, layer, nullptr, batch, shape, -1, &inject_kept, &residual_kept, T - kept,
-                           nullptr, 0);
+                           nullptr, 0, SharedCalls{.x = &xm});
         } else {
             // The combine injects its output directly unless a tap records it.
             const bool fused_inject = tap == nullptr || tap->moe_outputs == nullptr;
@@ -773,19 +786,19 @@ void Forward::layer_mixer_impl(A& a, std::uint32_t layer, const ForwardBatch* ba
 
 void Forward::layer_moe(std::uint32_t layer, const ForwardBatch& batch, const Tensor& xm, const Tensor& inject,
                         Tensor& residual, std::int32_t route_columns, std::int32_t route_skipped,
-                        std::int32_t chunk_columns) {
+                        std::int32_t chunk_columns, SharedCalls shared) {
     layer_moe_impl(work_, layer, &batch, call_shape(batch), xm, inject, residual, route_columns, route_skipped,
-                   chunk_columns);
+                   chunk_columns, shared);
 }
 
 template <class A>
 void Forward::layer_moe_impl(A& a, std::uint32_t layer, const ForwardBatch* batch, const CallShape& shape,
                              const Tensor& xm, const Tensor& inject, Tensor& residual, std::int32_t route_columns,
-                             std::int32_t route_skipped, std::int32_t chunk_columns) {
+                             std::int32_t route_skipped, std::int32_t chunk_columns, SharedCalls shared) {
     try {
         auto scope = a.scope();
         Tensor ym  = moe_impl(a, parameters_.layers[layer].moe, xm, layer, nullptr, batch, shape, route_columns, nullptr,
-                              nullptr, route_skipped, &residual, chunk_columns);
+                              nullptr, route_skipped, &residual, chunk_columns, shared);
         if constexpr (kRuns<A>) { ops::hyper_connection_inject(ym, inject, residual, device_.stream); }
     } catch (const std::exception&) {
         runtime::rethrow_with_context("qwen4_exp/layers/" + std::to_string(layer) + ": ");
@@ -797,6 +810,9 @@ std::int32_t Forward::last_layer_kept(std::int32_t columns) const noexcept {
     if (config_.lossless || scan_ != nullptr || std::find(draft_taps_.begin(), draft_taps_.end(), last) != draft_taps_.end()) {
         return 0;
     }
+    // The router keeps its form: its MMA form needs kRouterMmaMinColumns columns. A dense shared expert runs over the
+    // whole call (the callers' SharedCalls::x): keeping it to these columns moved the first token's logits by up to
+    // 0.038 at 17 to 1,000 columns (NVIDIA Dense8 and IQ3_S's Q8 and GGUF, recipe A's BF16; 2026-11-18).
     const std::int32_t kept = fast_.router_mma && columns >= kRouterMmaMinColumns ? kRouterMmaMinColumns : 1;
     return kept < columns ? kept : 0;
 }
@@ -955,13 +971,14 @@ Tensor Forward::ple_embedding_impl(A& a, const PleParameters& p, const ForwardBa
         if constexpr (kRuns<A>) {
             // BF16 rows are the embedding itself: rows [W, heads] of a column are e[h * W + j] (ple_embed's
             // order), so the rows are read in place.
+            // Checked before the gated upload is enqueued: a refused call leaves nothing on the stream.
+            if (batch->ngram_rows.ne[0] != 2 * dim(config_.ple.head_width())) {
+                throw std::invalid_argument("Qwen4Exp forward: BF16 n-gram rows must be 2 x head width bytes");
+            }
             if (const NgramRowGate* gate = batch->ngram_gate) {
                 const DeviceFault fault{.word = experts_.error, .value = config_.ple.layer << 16U | kErrorRowGateTimeout};
                 upload_pinned_when(batch->ngram_rows.data, gate->pinned_rows, batch->ngram_rows.bytes(), gate->ready,
                                    gate->expected, gate->wait_stats, gate->wait_row, fault, device_.stream);
-            }
-            if (batch->ngram_rows.ne[0] != 2 * dim(config_.ple.head_width())) {
-                throw std::invalid_argument("Qwen4Exp forward: BF16 n-gram rows must be 2 x head width bytes");
             }
             return Tensor(batch->ngram_rows.data, DType::BF16, {dim(config_.ple.embed_dim), T});
         } else {
@@ -1256,7 +1273,11 @@ Tensor Forward::attention_impl(A& ws, const AttentionParameters& p, const Tensor
     const std::int32_t QW = dim(a.query_width()), KW = dim(a.key_width()), D = dim(a.head_dim);
     const std::int32_t IH = dim(config_.qsa.index_heads), ID = dim(config_.qsa.index_head_dim);
     const std::int32_t index_rows = IH * ID + ID;
-    if constexpr (kRuns<A>) { scan_input(x, scan_layer_, ActivationScan::Site::QsaInput); }
+    // The MTP block's K/V-only chunk (in a prefill chunk, after the last layer) is no layer's attention input:
+    // scan_layer_ still names the last layer.
+    if constexpr (kRuns<A>) {
+        if (!shape.kv_only) { scan_input(x, scan_layer_, ActivationScan::Site::QsaInput); }
+    }
     Tensor q = ws.alloc(DType::BF16, {D, dim(a.heads), T});
     Tensor gate = ws.alloc(DType::BF16, {QW, T});
     Tensor k = ws.alloc(DType::BF16, {D, dim(a.kv_heads), T});
@@ -1450,7 +1471,7 @@ template <class A>
 Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uint32_t layer, Tensor* route_tap,
                          const ForwardBatch* batch, const CallShape& shape, std::int32_t route_columns,
                          const Tensor* inject, Tensor* residual, std::int32_t route_skipped, const Tensor* streams,
-                         std::int32_t chunk_columns) {
+                         std::int32_t chunk_columns, SharedCalls shared_calls) {
     const cudaStream_t s = device_.stream;
     const auto& m        = config_.moe;
     const std::int32_t T = x.ne[1], H = dim(config_.hidden_size), E = dim(m.experts), K = dim(m.top_k);
@@ -1635,9 +1656,36 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
     const DeviceSpan expert_ws = a.alloc_bytes(ops::moe_experts_workspace_bytes(source.shape, max_jobs, (K + SJ) * T, T,
                                                                                 p.bank->activation, source.wide_a16));
     const std::int32_t I = dim(m.shared_intermediate);
-    // The dense shared expert's product and output; a shared job's output is the call's last T columns.
-    Tensor product = shared_job ? Tensor{} : a.alloc(DType::BF16, {I, T});
-    Tensor shared  = shared_job ? outputs.slice(1, K * T, T) : a.alloc(DType::BF16, {H, T});
+    // The dense shared expert's input and calls: x, as one call or a pair call's two chunks, else a trimmed last
+    // layer's whole call (SharedCalls::x), whose trailing T columns are x.
+    const Tensor& sx      = shared_calls.x != nullptr ? *shared_calls.x : x;
+    const std::int32_t SW = sx.ne[1];
+    std::vector<std::pair<std::int32_t, std::int32_t>> shared_chunks;
+    if (shared_calls.x == nullptr && chunk_columns > 0) {
+        shared_chunks = {{0, chunk_columns}, {chunk_columns, T - chunk_columns}};
+    } else {
+        shared_chunks = {{0, SW}};
+    }
+    if (SW < T || (shared_calls.x != nullptr && sx.dtype != DType::BF16)) {
+        throw std::invalid_argument("Qwen4Exp MoE: the shared expert's input must hold the MoE's columns");
+    }
+    // The dense shared expert's product and output (over its input), and the trailing T columns the combine reads; a
+    // shared job's output is the call's last T columns.
+    Tensor product    = shared_job ? Tensor{} : a.alloc(DType::BF16, {I, SW});
+    Tensor shared_all = shared_job ? Tensor{} : a.alloc(DType::BF16, {H, SW});
+    Tensor shared     = shared_job ? outputs.slice(1, K * T, T) : shared_all.slice(1, SW - T, T);
+    // Each call of the dense shared expert as that call alone runs it: every gate/up projection, then every down.
+    const auto run_shared = [&](cudaStream_t stream) {
+        for (const auto [from, n] : shared_chunks) {
+            Tensor product_chunk = product.slice(1, from, n);
+            shared_swiglu(sx.slice(1, from, n), p.shared_gate_up, product_chunk, a, stream, dense_routes());
+        }
+        if constexpr (kRuns<A>) { scan_input(product, layer, ActivationScan::Site::SharedDown); }
+        for (const auto [from, n] : shared_chunks) {
+            Tensor shared_chunk = shared_all.slice(1, from, n);
+            project(product.slice(1, from, n), p.shared_down, shared_chunk, a, stream, dense_routes());
+        }
+    };
     // The shared expert runs while the host computes the CPU-served misses, and in decode and
     // verification calls on its own stream while the routed experts compute too. It reads only x,
     // and its scoped workspace lies past every buffer the routed experts use; this stream allocates
@@ -1664,8 +1712,7 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
             CUDA_CHECK(cudaEventRecord(experts_.shared_events[3], experts_.shared_stream));
         }
         if (shared_early) {
-            shared_swiglu(x, p.shared_gate_up, product, a, experts_.shared_stream, dense_routes());
-            project(product, p.shared_down, shared, a, experts_.shared_stream, dense_routes());
+            run_shared(experts_.shared_stream);
             CUDA_CHECK(cudaEventRecord(experts_.shared_events[1], experts_.shared_stream));
         }
     }
@@ -1849,18 +1896,8 @@ Tensor Forward::moe_impl(A& a, const MoeParameters& p, const Tensor& x, std::uin
     }
     }
     if (!shared_early && !shared_job) {
-        if constexpr (kRuns<A>) { scan_input(x, layer, ActivationScan::Site::SharedInput); }
-        for (const auto [from, n] : chunks) {
-            if (n == 0) { continue; }
-            Tensor product_chunk = product.slice(1, from, n);
-            shared_swiglu(x.slice(1, from, n), p.shared_gate_up, product_chunk, a, shared_s, dense_routes());
-        }
-        if constexpr (kRuns<A>) { scan_input(product, layer, ActivationScan::Site::SharedDown); }
-        for (const auto [from, n] : chunks) {
-            if (n == 0) { continue; }
-            Tensor shared_chunk = shared.slice(1, from, n);
-            project(product.slice(1, from, n), p.shared_down, shared_chunk, a, shared_s, dense_routes());
-        }
+        if constexpr (kRuns<A>) { scan_input(sx, layer, ActivationScan::Site::SharedInput); }
+        run_shared(shared_s);
     }
     // y = bf16(sum_i w_i y_i + s y_shared): the routed entries (a shared job's T columns follow them).
     const Tensor routed = shared_job ? outputs.slice(1, 0, K * T) : outputs;
@@ -1933,7 +1970,8 @@ void Forward::run_mtp(const MtpCall& call) {
         throw std::logic_error("Qwen4Exp forward: the MTP drafter is not loaded");
     }
     if (call.batch <= 0 || call.width <= 0 || call.ids.numel() != call.batch * call.width ||
-        call.residuals.ne[1] != call.batch * call.width || (!call.kv_only && call.width != 1) ||
+        call.residuals.ne[0] != dim(config_.residual_width()) || call.residuals.ne[1] != call.batch * call.width ||
+        (!call.kv_only && call.width != 1) ||
         call.rope_positions.ne[0] != call.batch * call.width || call.rope_positions.ne[1] != 3 ||
         call.block_start_rope.ne[0] != call.batch || call.block_start_rope.ne[1] != 3) {
         throw std::invalid_argument("Qwen4Exp forward: MTP call geometry is invalid");

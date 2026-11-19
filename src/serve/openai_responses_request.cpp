@@ -108,11 +108,6 @@ std::string lower_function_identity(
     return engine_name;
 }
 
-void add_wire_function_identity(Json& object, const OpenAIResponsesFunctionIdentity& identity) {
-    object["name"] = identity.name;
-    if (identity.wire_namespace) { object["namespace"] = *identity.wire_namespace; }
-}
-
 std::string item_id(const Json& item, const char* prefix) {
     if (!item.contains("id") || item.at("id").is_null()) {
         return new_openai_response_item_id(prefix);
@@ -121,6 +116,20 @@ std::string item_id(const Json& item, const char* prefix) {
         bad_request("input Item id must be a non-empty string", "input");
     }
     return item.at("id").get<std::string>();
+}
+
+// A media part's source: a data URI or an HTTP(S) URL; anything else is refused naming `field`.
+infernix::product::media_acquire::Source media_source(std::string value, const char* field) {
+    infernix::product::media_acquire::Source source;
+    source.value = std::move(value);
+    if (source.value.starts_with("data:")) {
+        source.kind = infernix::product::media_acquire::SourceKind::Data;
+    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
+        source.kind = infernix::product::media_acquire::SourceKind::Url;
+    } else {
+        bad_request(std::string(field) + " must use HTTP(S) or a data URI", "input");
+    }
+    return source;
 }
 
 infernix::product::media_acquire::Source parse_image_source(const Json& part) {
@@ -144,17 +153,7 @@ infernix::product::media_acquire::Source parse_image_source(const Json& part) {
                         "image_detail_not_supported");
         }
     }
-
-    infernix::product::media_acquire::Source source;
-    source.value = part.at("image_url").get<std::string>();
-    if (source.value.starts_with("data:")) {
-        source.kind = infernix::product::media_acquire::SourceKind::Data;
-    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = infernix::product::media_acquire::SourceKind::Url;
-    } else {
-        bad_request("input_image.image_url must use HTTP(S) or a data URI", "input");
-    }
-    return source;
+    return media_source(part.at("image_url").get<std::string>(), "input_image.image_url");
 }
 
 infernix::product::media_acquire::Source parse_video_source(const Json& part) {
@@ -162,16 +161,7 @@ infernix::product::media_acquire::Source parse_video_source(const Json& part) {
         part.at("video_url").get_ref<const std::string&>().empty()) {
         bad_request("input_video must contain a non-empty video_url", "input");
     }
-    infernix::product::media_acquire::Source source;
-    source.value = part.at("video_url").get<std::string>();
-    if (source.value.starts_with("data:")) {
-        source.kind = infernix::product::media_acquire::SourceKind::Data;
-    } else if (source.value.starts_with("http://") || source.value.starts_with("https://")) {
-        source.kind = infernix::product::media_acquire::SourceKind::Url;
-    } else {
-        bad_request("input_video.video_url must use HTTP(S) or a data URI", "input");
-    }
-    return source;
+    return media_source(part.at("video_url").get<std::string>(), "input_video.video_url");
 }
 
 void apply_shared_breakpoint(ContentPart& part, const Json& wire, std::size_t& breakpoint_count) {
@@ -708,8 +698,13 @@ parse_loaded_tools(const Json& tools,
         } else if (type == "namespace") {
             reject_nonnull_unknown_members(tool, namespace_members, "input");
             const std::string name = require_namespace_tool_name(tool);
+            // As the tools array's namespaces (parse_tools): a description that is neither a string nor null is
+            // refused, not ignored (audit 2026-11-18 F-23).
             std::string description;
-            if (tool.contains("description") && tool.at("description").is_string()) {
+            if (tool.contains("description") && !tool.at("description").is_null()) {
+                if (!tool.at("description").is_string()) {
+                    bad_request("namespace description must be a string", "input");
+                }
                 description = tool.at("description").get<std::string>();
             }
             if (!tool.contains("tools") || !tool.at("tools").is_array()) {
@@ -1357,12 +1352,21 @@ void filter_allowed_tools(const Json& choice, ParsedPromptFields& out) {
         const OpenAIResponsesFunctionIdentity identity =
             item.at("type").get<std::string>() == "custom" ? custom_identity(item, "tool_choice")
                                                            : function_identity(item, "tool_choice");
+        const std::string wire_name =
+            identity.wire_namespace ? *identity.wire_namespace + "." + identity.name : identity.name;
+        // A tool declared as the other kind (a function named by a custom entry, or the reverse) is a wrong tool
+        // choice, not a duplicate declaration (audit 2026-11-18 F-23).
+        const std::string engine_name =
+            identity.wire_namespace ? *identity.wire_namespace + "__" + identity.name : identity.name;
+        if (const auto found = out.tool_identities.find(engine_name);
+            found != out.tool_identities.end() && found->second != identity) {
+            bad_request("allowed_tools names '" + wire_name + "' as a " + (identity.custom ? "custom" : "function") +
+                            " tool, but it is declared as another kind",
+                        "tool_choice", "invalid_tool_choice");
+        }
         const std::string name =
             lower_function_identity(identity, out.tool_identities, "tool_choice");
         if (!declared.contains(name)) {
-            const std::string wire_name = identity.wire_namespace
-                                              ? *identity.wire_namespace + "." + identity.name
-                                              : identity.name;
             bad_request("allowed_tools references undeclared function '" + wire_name + "'",
                         "tool_choice", "invalid_tool_choice");
         }
@@ -1544,7 +1548,6 @@ ParsedPromptFields parse_prompt_fields(const Json& body, const RequestLimits& li
     parse_text(body, out.prompt.generation);
     parse_truncation(body);
     parse_preserve_thinking(body, out.prompt);
-    parse_openai_thinking_budget(body, out.prompt.generation);
     out.prompt.generation.max_tokens = limits.default_max_tokens;
     return out;
 }
@@ -1663,6 +1666,7 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
     const OpenAIPromptCachePolicy cache_policy = parse_openai_prompt_cache_policy(body);
 
     ParsedPromptFields parsed  = parse_prompt_fields(body, limits);
+    parse_openai_thinking_budget(body, parsed.prompt.generation);
     parsed.prompt.cache_policy = cache_policy;
     OpenAIResponsesCreateRequest out;
     out.prompt = std::move(parsed.prompt);
@@ -1693,7 +1697,8 @@ OpenAIResponsesCreateRequest parse_openai_responses_create_request(const Json& b
                         "background_not_supported");
         }
     }
-    if (body.contains("include")) {
+    // Nullable in OpenAI's schema, as every other optional field here: null is absent (audit 2026-11-18 F-19).
+    if (body.contains("include") && !body.at("include").is_null()) {
         if (!body.at("include").is_array()) { bad_request("include must be an array", "include"); }
         for (const Json& field : body.at("include")) {
             if (!field.is_string()) { bad_request("include entries must be strings", "include"); }
@@ -1834,6 +1839,8 @@ parse_openai_responses_input_tokens_request(const Json& body, const RequestLimit
     }
     auto parsed                          = parse_prompt_fields(body, limits);
     parsed.prompt.cache_policy.automatic = OpenAIPromptCacheAutomatic::Disabled;
+    // As create refuses it (audit 2026-11-18 F-20): a count for a request create would refuse is no count.
+    validate_declared_tool_choice(parsed.prompt.generation);
     return std::move(parsed.prompt);
 }
 

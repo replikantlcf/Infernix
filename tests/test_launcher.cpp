@@ -6,13 +6,16 @@
 #include "launcher/args.h"
 #include "launcher/artifact_scan.h"
 #include "launcher/chats.h"
+#include "launcher/downloads.h"
 #include "launcher/event_log.h"
 #include "launcher/events.h"
+#include "launcher/http_access.h"
 #include "launcher/launch_script.h"
 #include "launcher/launcher.h"
 #include "launcher/load_advice.h"
 #include "launcher/log_buffer.h"
 #include "launcher/model_defaults.h"
+#include "launcher/process.h"
 #include "launcher/router.h"
 #include "launcher/routing.h"
 #include "launcher/serve_help.h"
@@ -98,6 +101,64 @@ void test_args() {
     // The first argument's inner quote leaves cmd in its quotes at each later opening one.
     check(batch_command_line({"a\"b&c", "R&D", "x|y"}) == "\"a\\\"b^&c\" \"R^&D\" \"x^|y\"",
           "metacharacters the line's quotes leave outside cmd's are escaped");
+}
+
+// The update hand-over's command line (audit 2026-11-18 F-5): cmd /d /s /c ""script"" runs a batch file from a folder
+// whose name holds a space, parentheses and & (a plain /c "script" split it at the first space and ran nothing).
+void test_batch_spawn() {
+    check(windows_command_line("C:\\Program Files\\x.exe", {"a b", "c"}) == "\"C:\\Program Files\\x.exe\" \"a b\" c",
+          "windows_command_line quotes the program and each argument");
+    const std::string script = "C:\\Users\\Jo Bloggs (work) & co\\Infernix\\apply-update.bat";
+    check(cmd_batch_command_line("C:\\Windows\\System32\\cmd.exe", script) ==
+              "C:\\Windows\\System32\\cmd.exe /d /s /c \"\"" + script + "\"\"",
+          "cmd_batch_command_line wraps the script in one outer quote pair for /s");
+#ifdef _WIN32
+    const std::filesystem::path folder =
+        std::filesystem::temp_directory_path() / ("infernix launcher (spawn) & test " + std::to_string(GetCurrentProcessId()));
+    std::filesystem::remove_all(folder);
+    std::filesystem::create_directories(folder);
+    const std::filesystem::path marker = folder / "ran.txt";
+    {
+        std::ofstream bat(folder / "apply-update.bat", std::ios::binary);
+        bat << "@echo off\r\necho ran> \"%~dp0ran.txt\"\r\n";
+    }
+    wchar_t system[MAX_PATH] = {};
+    const UINT length        = GetSystemDirectoryW(system, MAX_PATH);
+    const std::filesystem::path cmd = std::filesystem::path(std::wstring(system, length)) / L"cmd.exe";
+    const bool spawned = spawn_detached_command_line(
+        cmd, cmd_batch_command_line(path_utf8(cmd), path_utf8(folder / "apply-update.bat")));
+    const auto limit = std::chrono::steady_clock::now() + 10s;
+    while (spawned && !std::filesystem::exists(marker) && std::chrono::steady_clock::now() < limit) {
+        std::this_thread::sleep_for(20ms);
+    }
+    check(spawned && std::filesystem::exists(marker), "a batch file in a folder with ( ) & did not run");
+    std::this_thread::sleep_for(200ms); // cmd has closed the file
+    std::error_code ignored;
+    std::filesystem::remove_all(folder, ignored);
+#endif
+}
+
+// Host and Origin checks of the management API (audit 2026-11-18 F-1): a DNS name that begins "127." is not this
+// computer, so a DNS-rebound page on 127.evil.com is refused in Host and in Origin.
+void test_http_access() {
+    check(!loopback_host("127.evil.com"), "127.evil.com is not loopback");
+    check(!loopback_host("127.0.0.1.evil.com"), "a dotted name past an address is not loopback");
+    check(loopback_host("127.0.0.1") && loopback_host("127.1.2.3") && loopback_host("localhost") &&
+              loopback_host("a.localhost") && loopback_host("::1") && loopback_host("::ffff:127.0.0.1"),
+          "numeric 127/8, localhost and its subdomains, ::1 and mapped 127 are loopback");
+    check(authority_host("127.evil.com:8000") == "127.evil.com" && authority_host("[::1]:80") == "::1",
+          "authority_host drops the port and the brackets");
+    check(page_refusal("127.evil.com:8000", "", false).has_value(), "Host 127.evil.com is refused");
+    check(page_refusal("127.0.0.1:8000", "http://127.evil.com:8000", false).has_value(),
+          "Origin 127.evil.com is refused beside a numeric Host");
+    check(!page_refusal("127.0.0.1:8000", "http://127.0.0.1:8000", false) &&
+              !page_refusal("localhost:8000", "http://localhost:8000", false) &&
+              !page_refusal("[::1]:8000", "", false),
+          "the launcher's own page by address or localhost is allowed");
+    check(!page_refusal("box.lan:8000", "", true) && page_refusal("box.lan:8000", "", false).has_value(),
+          "a DNS Host needs an admin key");
+    check(page_refusal("127.0.0.1:8000", "http://evil.example", true).has_value(),
+          "another page's Origin is refused even with an admin key");
 }
 
 void test_records() {
@@ -1008,6 +1069,71 @@ void test_router_cancel() {
     check(!router.load_cancelled(), "a forced load of the loaded model cancels nothing");
 }
 
+// A cancel that races a failure (audit 2026-11-18 F-7): the job the user cancelled stays cancelled (and is not
+// reported failed), whatever failure the worker meets after the cancel. Here the job's folder cannot be created (it
+// lies under a file) and the cancel lands as the job starts, before run_job fails it.
+void test_download_cancel_race() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-cancel";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    std::filesystem::create_directories(dir);
+    { std::ofstream(dir / "blocker") << "a file, so no folder under it"; }
+    std::atomic<Downloads*> self{nullptr};
+    std::atomic<bool> cancelled{false};
+    std::atomic<int> failures_reported{0};
+    Downloads::Hooks hooks;
+    hooks.load_state = [&] {
+        return Json::array({{{"id", "job"}, {"repo", "org/model"}, {"state", "queued"},
+                             {"target_dir", path_utf8(dir / "blocker" / "model")},
+                             {"files", Json::array({{{"path", "weights.bin"}, {"bytes", 1}}})}}});
+    };
+    hooks.failed  = [&](const std::string&, const std::string&) { ++failures_reported; };
+    hooks.changed = [&](const Json& jobs) {
+        for (const Json& job : jobs) {
+            if (job.value("id", "") != "job" || job.value("state", "") != "running" || cancelled.exchange(true)) {
+                continue;
+            }
+            const auto limit = std::chrono::steady_clock::now() + 10s;
+            while (self.load() == nullptr && std::chrono::steady_clock::now() < limit) { std::this_thread::yield(); }
+            if (Downloads* downloads = self.load()) { downloads->cancel("job"); }
+        }
+    };
+    std::string state;
+    {
+        Downloads downloads(hooks);
+        self.store(&downloads);
+        const auto limit = std::chrono::steady_clock::now() + 10s;
+        do {
+            std::this_thread::sleep_for(20ms);
+            const Json jobs = downloads.list();
+            state           = jobs.empty() ? std::string() : jobs[0].value("state", "");
+        } while ((state == "queued" || state == "running" || !cancelled.load()) && std::chrono::steady_clock::now() < limit);
+        downloads.shutdown();
+    }
+    check(cancelled.load() && state == "cancelled" && failures_reported.load() == 0,
+          ("a cancel racing a failure left the job " + state).c_str());
+    std::filesystem::remove_all(dir, ignored);
+}
+
+// A download error in the system's code page (audit 2026-11-18 F-6: std::error_code::message() on a non-English
+// Windows) is not valid UTF-8; the job holding it must not stop every later save of the memory file.
+void test_store_invalid_utf8() {
+    const std::filesystem::path dir = std::filesystem::temp_directory_path() / "infernix-launcher-test-utf8";
+    std::error_code ignored;
+    std::filesystem::remove_all(dir, ignored);
+    {
+        Store store(dir);
+        store.set_downloads(Json::array({{{"id", "job"}, {"state", "failed"},
+                                          {"error", std::string("cannot rename x: Zugriff verweigert \xE4")}}}));
+        store.set_last_model(std::string("after"));
+        check(!store.take_save_failure().has_value(), "a download error that is not UTF-8 failed the save");
+    }
+    Store store(dir);
+    check(store.last_model() == std::optional<std::string>("after"),
+          "a change saved after a download error that is not UTF-8 was lost");
+    std::filesystem::remove_all(dir, ignored);
+}
+
 // The memory file survives a torn write (audit 2026-11-17 LN-01): each save keeps the previous file as its backup,
 // and a memory file that is not valid JSON (a power loss after the rename, before the data reached the disk) or is
 // missing (a crash between the backup's rename and the new file's) loads the backup instead of defaults. The
@@ -1206,9 +1332,13 @@ int main(int argc, char** argv) {
     test_models_list_body();
     test_json_nesting();
     test_args();
+    test_http_access();
+    test_batch_spawn();
     test_blob_ids();
     test_chats();
     test_store_durability();
+    test_store_invalid_utf8();
+    test_download_cancel_race();
     test_records();
     test_help();
     test_help_cache();

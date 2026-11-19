@@ -37,6 +37,17 @@ struct ApiError {
     std::uint32_t retry_after_seconds = 0;
 };
 
+// The 500 for an exception a request's handling did not expect, with its message. `type` is the protocol's name for
+// it: OpenAI Chat Completions' internal_error, the Responses API's server_error.
+[[nodiscard]] inline ApiError internal_server_error(const std::exception& exception,
+                                                    std::string type = "internal_error") {
+    ApiError error;
+    error.status  = 500;
+    error.type    = std::move(type);
+    error.message = exception.what();
+    return error;
+}
+
 class ApiException : public std::runtime_error {
 public:
     explicit ApiException(ApiError error)
@@ -326,6 +337,18 @@ struct GenerationRequest {
         for (auto tool = tools.rbegin(); tool != tools.rend(); ++tool) {
             if (!tool->deferred) { return &*tool; }
         }
+        return nullptr;
+    }
+
+    // Where a request-level (automatic) prompt-cache boundary goes, or nullptr: after the last turn that has tool
+    // calls or loaded tools, else after the last turn's last content part, else after the last listed tool.
+    [[nodiscard]] std::optional<CacheBoundary>* automatic_cache_boundary_target() noexcept {
+        for (auto turn = messages.rbegin(); turn != messages.rend(); ++turn) {
+            // Calls and loaded tool definitions render after the turn's content parts.
+            if (!turn->tool_calls.empty() || !turn->loaded_tools.empty()) { return &turn->cache_boundary_after; }
+            if (!turn->content.empty()) { return &turn->content.back().cache_boundary_after; }
+        }
+        if (ToolDefinition* listed = last_listed_tool()) { return &listed->cache_boundary_after; }
         return nullptr;
     }
 };

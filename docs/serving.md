@@ -618,8 +618,8 @@ their spelling. Generated reasoning ends at the model's `</think>` token whereve
 without a following line break, and `<tool_call>` opens a call only as the model's `<tool_call>`
 token, on both the constrained and the unconstrained route and in the recovery from unclosed
 thinking. A `</think>` token after the reasoning has closed (or in a turn without reasoning) is
-stray framing and publishes nothing, so it never enters the history a client sends back; raw output
-(`--raw`, preserved special tokens) keeps its bytes. The same spellings written with ordinary text
+stray framing and publishes nothing, so it never enters the history a client sends back; the CLI's raw
+output (`--raw-output`, preserved special tokens; the server has none) keeps its bytes. The same spellings written with ordinary text
 tokens (for example while the model discusses a chat template) stay text in their channel. The model writes the marker tokens when it
 quotes them too: a quoted `</think>` token ends the reasoning, and a quoted `<tool_call>` token stays
 text only by the Markdown code rule above or when its region does not parse. Leading whitespace of
@@ -643,7 +643,8 @@ The three protocols share one constrained tool implementation:
 | Anthropic named `tool` | One or more calls to that tool |
 | OpenAI `parallel_tool_calls:false` / Anthropic `disable_parallel_tool_use:true` | At most one call; exactly one when a call is required |
 
-OpenAI `allowed_tools` supports `auto` and `required`. Selection changes generation permissions,
+OpenAI `allowed_tools` supports `auto` and `required`; an entry naming a tool as the other kind (a
+declared function as `custom`, or the reverse) is a 400 `invalid_tool_choice`. Selection changes generation permissions,
 while all declarations retain their original order in the prompt. Requests with tools enable
 **basic structural constraints by default**, including ordinary `auto` calls without `strict`.
 The model can answer normally or start a tool call; a call must use the model's tool framing and a
@@ -1172,7 +1173,7 @@ wire response contains typed `output` Items.
 | `top_logprobs` | omitted or `0` |
 | `service_tier` | omitted, `auto`, or `default`; the response reports `default` |
 | `background` | omitted or `false` |
-| `include` | omitted, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
+| `include` | omitted, null, empty, or `["reasoning.encrypted_content"]`; the supported value requests the local raw-reasoning mirror described below |
 | `stream_options.include_obfuscation` | optional boolean; accepted as a transport hint, but this local server emits no padding |
 | cache and client hints | `prompt_cache_key`, `prompt_cache_options`, `prompt_cache_retention`, and explicit breakpoints follow [OpenAI prompt caching](#openai-prompt-caching); `safety_identifier` and `user` are accepted as client hints |
 
@@ -1282,7 +1283,8 @@ sends its result back as a `custom_tool_call_output` Item.
 
 Functions and custom tools, top-level or in a namespace, accept `defer_loading:true` together with a
 `tool_search` tool; `tool_search_call`, `tool_search_output` and `additional_tools` Items are accepted
-as input. See [Deferred tools and tool search](#deferred-tools-and-tool-search). A hosted
+as input (a loaded namespace's `description` is a string or null, else a 400 `input`). See
+[Deferred tools and tool search](#deferred-tools-and-tool-search). A hosted
 `web_search` declaration (`{"type":"web_search", ...}`, which Codex sends on every turn unless its
 configuration sets `web_search = "disabled"`) is accepted and echoed in the response's `tools`, but
 the model is not offered it, since Infernix runs no search; a `tool_choice` naming it is a 400.
@@ -1425,7 +1427,8 @@ larger `--response-store-max-mib`.
 It accepts `model`, `input`, `instructions`, `previous_response_id`, reasoning, function tools and
 tool choice, supported text/truncation values, and the `preserve_thinking` extension. Parent lookup,
 call-ID normalization, template rendering, and media expansion are therefore identical to the
-corresponding Create request:
+corresponding Create request, and so is the tool choice check: a choice Create refuses (an undeclared
+tool, `required` without a callable tool) is a 400 `tool_choice` here too:
 
 ```bash
 curl http://127.0.0.1:8080/v1/responses/input_tokens \
@@ -2039,6 +2042,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--expert-ram-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): Host RAM in MiB for the routed experts; less than all of them need (~64.5 GiB on Flash-Next, 60.75 GiB on the 122B) keeps that many in RAM and reads the rest from the artifact ([SSD expert tier](qwen3_8-flash-next.md#ssd-expert-tier)); more than is free is an error | `auto` (what the ledger leaves) |
 | `--expert-ram-layout exclusive\|full` | Qwen3.8-Flash-Next and the Qwen3.5-122B-A10B, when VRAM cannot hold every routed expert: `exclusive` keeps in RAM only the experts VRAM does not hold (plus copies of the ones a prefill borrows and the KV may take), `full` keeps a RAM copy of every expert whenever RAM allows. Same output bits either way. Flash-Next: `full` takes 4-6 GiB more RAM for the Dense8 and IQ3_S experts at 16K on an RTX 5090, at the same decode speed. 122B: `exclusive` holds 56.9 instead of 60.8 GiB of experts and decodes about 1 % slower after a 32K prompt (equal at short ones), prefill 0.4 % slower. Ignored with `--expert-ram-mib N` | `exclusive` (Flash-Next), `full` (122B) |
 | `--expert-csf` | Qwen3.8-Flash-Next and the Qwen3.5-122B-A10B, NVFP4 experts offloaded to RAM: their RAM copies (the pinned banks, or the SSD tier's slots) keep the block scales compressed (CSF: 4-bit offsets from per-row bases, ~5 % fewer bytes, about 3 GiB on Flash-Next), so each copy to VRAM and each CPU walk reads less. Same output bits. Measured on an RTX 5090 (2026-11-09): prompts 2-5 % faster on Dense8, FP4-Local and the 122B, decode 0.6-2 % slower (the CPU decodes the scales of the experts it computes) | off |
+| `--ngram-volume FILE` | Qwen3.8-Flash-Next: the PLE n-gram embedding volume, the artifact's own or any FP8, IQ4_NL, BF16 or NVFP4 volume of the same table in place of its own ([formats](qwen3_8-flash-next.md#n-gram-table-formats)) | the artifact path + `.ngram` |
 | `--ngram-residency auto\|ram\|volume` | Qwen3.8-Flash-Next: where the PLE n-gram table lives. `ram` reads the whole table into Host RAM at startup, locked for the CPU but not page-locked for the GPU (27.1 GiB for a GGUF import's IQ4_NL table, 48.8 GiB for the FP8 table) and never reads the volume again; `volume` reads rows on demand through a 2^20-row cache; `auto` takes RAM only when the RAM ledger still keeps every expert in RAM beside it ([details](qwen3_8-flash-next.md#n-gram-table-in-ram)) | `auto` |
 | `--expert-pin-mib N\|auto` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): at most N MiB of the experts' RAM page-locked for the GPU; the rest stays in RAM unpinned and the CPU serves it ([Page-locking limit](qwen3_8-flash-next.md#page-locking-limit)) | `auto` (what Windows lets the GPU page-lock) |
 | `--context-cost-presets FILE` | optional runtime context-cost preset registry | generic + compiled defaults |

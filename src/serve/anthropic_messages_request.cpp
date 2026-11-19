@@ -819,11 +819,14 @@ std::string drop_claude_bullets(std::string_view text) {
     return result;
 }
 
-// Removes an Environment heading left with nothing before the next heading or the end.
+// Removes an Environment heading left with nothing before the next heading or the end. A heading quoted in a code
+// fence is text, as next_top_level_heading reads it.
 std::string drop_empty_environment(std::string text) {
+    bool fenced = false;
     for (std::size_t line = 0; line < text.size();) {
         const std::string_view rest = std::string_view(text).substr(line);
-        if (rest.starts_with(kEnvironmentHeading)) {
+        if (rest.starts_with("```")) { fenced = !fenced; }
+        if (!fenced && rest.starts_with(kEnvironmentHeading)) {
             std::size_t end = line + kEnvironmentHeading.size();
             while (end < text.size() && text[end] == '\n') { ++end; }
             if (end == text.size() || std::string_view(text).substr(end).starts_with("# ")) {
@@ -1826,15 +1829,21 @@ std::vector<ParsedTool> parse_tool_definitions(const Json& body) {
 
 // Whether a mid-conversation system message adds a tool (ToolTimeline): Anthropic then accepts every top-level tool
 // deferred, and the tool tool_choice names may be one the history defines.
+// It runs before parse_messages, so a malformed item (a role or type that is not a string) is skipped here and left
+// for parse_messages to refuse with its 400 (json::value threw type_error, a 500).
 bool messages_add_tools(const Json& body) {
+    const auto string_member = [](const Json& object, const char* name) {
+        const auto found = object.find(name);
+        return found != object.end() && found->is_string() ? found->get<std::string>() : std::string();
+    };
     if (!body.contains("messages") || !body.at("messages").is_array()) { return false; }
     for (const Json& item : body.at("messages")) {
-        if (!item.is_object() || item.value("role", std::string()) != "system" || !item.contains("content") ||
+        if (!item.is_object() || string_member(item, "role") != "system" || !item.contains("content") ||
             !item.at("content").is_array()) {
             continue;
         }
         for (const Json& block : item.at("content")) {
-            if (block.is_object() && block.value("type", std::string()) == "tool_addition") { return true; }
+            if (block.is_object() && string_member(block, "type") == "tool_addition") { return true; }
         }
     }
     return false;
@@ -2106,23 +2115,7 @@ void apply_anthropic_prompt_cache_policy(const Json& body, GenerationRequest& re
     if (!automatic_ttl) { return; }
     request.allow_engine_automatic_shared_prefixes = false;
 
-    std::optional<CacheBoundary>* automatic_target = nullptr;
-    for (auto turn = request.messages.rbegin(); turn != request.messages.rend(); ++turn) {
-        // Calls and loaded tool definitions render after the turn's content parts.
-        if (!turn->tool_calls.empty() || !turn->loaded_tools.empty()) {
-            automatic_target = &turn->cache_boundary_after;
-            break;
-        }
-        if (!turn->content.empty()) {
-            automatic_target = &turn->content.back().cache_boundary_after;
-            break;
-        }
-    }
-    if (automatic_target == nullptr) {
-        if (ToolDefinition* listed = request.last_listed_tool()) {
-            automatic_target = &listed->cache_boundary_after;
-        }
-    }
+    std::optional<CacheBoundary>* const automatic_target = request.automatic_cache_boundary_target();
     if (automatic_target == nullptr) { return; }
 
     if (*automatic_target) {

@@ -411,6 +411,15 @@ int test_claude_code_prompt() {
                           interactive_text.find("Claude") == std::string::npos,
                       "the interactive Claude Code prompt was not rewritten section by section");
 
+    // A heading quoted in a code fence is text: an Environment heading there, with another heading after it inside the
+    // fence, is not an empty Environment section.
+    const std::string fenced = "\n\n# Plan mode\nAn example:\n```markdown\n# Environment\n\n# Example\n```\n"
+                               "Plan before you edit.";
+    const std::string quoted =
+        system_text(parse_with(claude_code_request({identity + fenced}), ClaudeCodePrompt::Local).generation);
+    failures += check(quoted.starts_with(opening) && quoted.ends_with(fenced),
+                      "the local rewrite removed an Environment heading quoted in a code fence");
+
     // Anything without both the attribution block and the identity line stays as sent.
     const auto unchanged = [&](const Json& request_body, const std::string& message) {
         const std::string sent = system_text(parse(request_body).generation);
@@ -959,6 +968,28 @@ GenerationOutcome sample_outcome() {
     outcome.matched_stop_string             = "STOP";
     outcome.reused_prompt_tokens            = 60;
     return outcome;
+}
+
+// A role or content-block type that is not a string is the client's error, a 400 (audit 2026-11-18 F-18): the
+// mid-conversation tool scan ran first and threw json's type_error, which the server answered with a 500.
+int test_non_string_role_and_type() {
+    Json role                         = base_request();
+    role["messages"]                  = Json::array({{{"role", 5}, {"content", "x"}}});
+    Json type                         = base_request();
+    type["messages"]                  = Json::array({{{"role", "system"}, {"content", Json::array({{{"type", 5}}})}},
+                                                     {{"role", "user"}, {"content", "x"}}});
+    // A request error (HTTP 400; its code may be empty), not another exception (a 500).
+    const auto request_error = [](const std::function<void()>& action) {
+        try {
+            action();
+        } catch (const ApiException& error) { return error.error().status == 400; } catch (...) {
+            return false;
+        }
+        return false;
+    };
+    int failures = check(request_error([&] { (void)parse(role); }), "a non-string role was not a request error");
+    failures += check(request_error([&] { (void)parse(type); }), "a non-string content block type was not a request error");
+    return failures;
 }
 
 int test_aggregate_and_errors() {
@@ -2319,6 +2350,32 @@ int test_multi_round_cache_creation() {
     failures +=
         check(totals.reused_prompt_tokens == 52 + 90 && totals.cached_block_tokens == 64 + 90,
               "three generations did not sum their cached block tokens");
+
+    // The per-request counters every round reports: n-gram archive drafts, tree rounds, the per-position and
+    // per-round records, and the expert cache's lookups (audit 2026-11-18 F-14: the archive and expert-cache
+    // counters were the last generation's alone).
+    GenerationOutcome a, b, c;
+    a.speculative.ngram_archive_drafted_tokens  = 5;
+    a.speculative.ngram_archive_accepted_tokens = 3;
+    a.speculative.tree_rounds                   = 2;
+    a.speculative.accepted_per_position         = {4, 2};
+    a.speculative.round_steps                   = {{.drafted = 3, .accepted = 2, .ngram = false}};
+    a.expert_cache = infernix::ExpertCacheStats{.routed = 100, .hits = 60, .decode_routed = 40, .decode_hits = 20};
+    c.speculative.ngram_archive_drafted_tokens  = 7;
+    c.speculative.ngram_archive_accepted_tokens = 1;
+    c.speculative.accepted_per_position         = {1, 1, 1};
+    c.speculative.round_steps                   = {{.drafted = 4, .accepted = 1, .ngram = true}};
+    c.expert_cache = infernix::ExpertCacheStats{.routed = 10, .hits = 5, .decode_routed = 4, .decode_hits = 2};
+    const std::vector<ServerToolRound> counted{ServerToolRound{.outcome = a}, ServerToolRound{.outcome = b}};
+    const GenerationOutcome sum = combine_round_outcomes(counted, c);
+    failures += check(sum.speculative.ngram_archive_drafted_tokens == 12 &&
+                          sum.speculative.ngram_archive_accepted_tokens == 4 && sum.speculative.tree_rounds == 2 &&
+                          sum.speculative.accepted_per_position == std::vector<std::uint64_t>{5, 3, 1} &&
+                          sum.speculative.round_steps.size() == 2 && sum.speculative.round_steps[0].drafted == 3 &&
+                          sum.speculative.round_steps[1].ngram && sum.expert_cache && sum.expert_cache->routed == 110 &&
+                          sum.expert_cache->hits == 65 && sum.expert_cache->decode_routed == 44 &&
+                          sum.expert_cache->decode_hits == 22,
+                      "server tool rounds did not sum their speculative and expert-cache counters");
     return failures;
 }
 
@@ -2522,6 +2579,7 @@ int main() {
     failures += test_thinking_history_transport_metadata();
     failures += test_content_and_cache_hints();
     failures += test_aggregate_and_errors();
+    failures += test_non_string_role_and_type();
     failures += test_timings();
     failures += test_tool_call_presentation();
     failures += test_streamed_tool_calls();

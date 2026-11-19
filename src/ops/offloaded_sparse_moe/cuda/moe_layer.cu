@@ -38,6 +38,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -179,6 +180,9 @@ bool forked(const MoeExpertSource& source, std::int32_t max_jobs, std::int32_t c
     return source.fork_stream != nullptr && source.staging_slots > 0 &&
            max_jobs <= std::min(source.staging_slots, 512) && columns <= moe::kMaxColumns;
 }
+
+// testing::moe_forked_calls and moe_lost_forks, by column count.
+std::atomic<std::uint64_t> g_forked_calls[moe::kMaxColumns + 1] = {}, g_lost_forks[moe::kMaxColumns + 1] = {};
 
 // Which jobs a pass launch computes: all of them, only those resident in frames (their record is
 // resolved directly, so they need not wait for the stage kernel), or only the others.
@@ -1379,17 +1383,16 @@ void launch_expert_pass(const bf16* x, const MoeDispatch& dispatch, const MoeExp
                         canon::A4Block* h_blocks, int columns_out, bf16* outputs, cudaStream_t stream,
                         PassPhase phase = PassPhase::All, PassPart part = PassPart::Both) {
     static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpShared)));
-        cudaFuncSetAttribute(down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownShared)));
-        cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
+        return cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(GateUpShared))) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(DownShared))) == cudaSuccess &&
+               cudaFuncSetAttribute(gate_up_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess;
     }();
-    (void)configured;
+    if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the W4A4 narrow kernels' shared memory"); }
     if (part != PassPart::Down) {
         gate_up_kernel<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpShared), stream>>>(
             x, moe::kHidden, dispatch, source, top_k, job_records, flags, base, h_blocks, phase);
@@ -1720,16 +1723,16 @@ void launch_expert_pass_a16(const bf16* x, const MoeDispatch& dispatch, const Mo
     static_assert(kGateUpBytes <= 99 * 1024 && kDownBytes <= 99 * 1024, "an A16 CTA must fit an SM");
     static_assert(G::kGateUpRowGroups / kGateUpGroups == G::kHBlocks, "a gate/up CTA produces one h block");
     static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             kGateUpBytes);
-        cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize, kDownBytes);
-        cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
+        return cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kGateUpBytes) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    kDownBytes) == cudaSuccess &&
+               cudaFuncSetAttribute(gate_up_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_a16<G, Columns>, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess;
     }();
-    (void)configured;
+    if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the A16 narrow kernels' shared memory"); }
     if (part != PassPart::Down) {
         CUDA_CHECK(pdl::launch_with(
             pdl::Dependency::Serialized,
@@ -2008,17 +2011,16 @@ void launch_expert_pass_a4r(const bf16* x, const MoeDispatch& dispatch, const Mo
                             std::uint16_t* h_plane, bf16* outputs, cudaStream_t stream, PassPhase phase,
                             PassPart part) {
     static const bool configured = [] {
-        cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(GateUpSharedA4r)));
-        cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(sizeof(DownSharedA4r)));
-        cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
-                             cudaSharedmemCarveoutMaxShared);
-        return true;
+        return cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(GateUpSharedA4r))) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                    static_cast<int>(sizeof(DownSharedA4r))) == cudaSuccess &&
+               cudaFuncSetAttribute(gate_up_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess &&
+               cudaFuncSetAttribute(down_kernel_a4r, cudaFuncAttributePreferredSharedMemoryCarveout,
+                                    cudaSharedmemCarveoutMaxShared) == cudaSuccess;
     }();
-    (void)configured;
+    if (!configured) { throw std::runtime_error("offloaded_sparse_moe: the two-term narrow kernels' shared memory"); }
     if (part != PassPart::Down) {
         gate_up_kernel_a4r<<<dim3(kGateUpCtas, jobs), kThreads, sizeof(GateUpSharedA4r), stream>>>(
             x, dispatch, source, top_k, job_records, flags, base, h_plane, phase);
@@ -2948,6 +2950,7 @@ bool masked_call(const MoeColumnMask& mask, int columns, bool shared_job) {
 
 void moe_dispatch(const MoeRouting& routing, std::int32_t experts, MoeDispatch& dispatch,
                   std::int32_t* route_log, cudaStream_t stream, bool shared_job) {
+    require(contiguous(routing.ids, DType::I32), "dispatch requires contiguous I32 routed ids");
     const int routed = static_cast<int>(routing.ids.numel()), columns = routing.ids.ne[1];
     const int top_k  = routing.ids.ne[0];
     // A shared job is expert E with one entry per column after the routed ones.
@@ -3348,7 +3351,11 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
         if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
         return;
     }
-    if (forked(source, max_jobs, x.ne[1])) {
+    const bool fork = forked(source, max_jobs, x.ne[1]);
+    if (source.fork_stream != nullptr && source.staging_slots > 0 && x.ne[1] <= moe::kMaxColumns) {
+        (fork ? g_forked_calls : g_lost_forks)[x.ne[1]].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (fork) {
         // One pass: the misses are staged and then computed on the fork stream while this stream
         // computes the resident experts; both write disjoint outputs and h blocks, and every
         // expert's arithmetic is the same as in a serial pass.
@@ -3420,6 +3427,15 @@ void moe_experts(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSo
     if (wait_for_cpu) { moe_experts_cpu_wait(x, dispatch, source, max_jobs, workspace, outputs, stream); }
 }
 
+namespace testing {
+std::uint64_t moe_forked_calls(std::int32_t columns) noexcept {
+    return columns >= 1 && columns <= moe::kMaxColumns ? g_forked_calls[columns].load(std::memory_order_relaxed) : 0;
+}
+std::uint64_t moe_lost_forks(std::int32_t columns) noexcept {
+    return columns >= 1 && columns <= moe::kMaxColumns ? g_lost_forks[columns].load(std::memory_order_relaxed) : 0;
+}
+} // namespace testing
+
 namespace offloaded_moe::wide {
 
 std::size_t lossless_experts_bytes(const ExpertShape& shape, std::int32_t max_jobs, std::int32_t entries) {
@@ -3430,11 +3446,14 @@ std::size_t lossless_experts_bytes(const ExpertShape& shape, std::int32_t max_jo
 
 void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared, Tensor& y,
                  cudaStream_t stream) {
-    require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16),
-            "combine requires contiguous BF16 tensors");
+    require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) && contiguous(y, DType::BF16) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
+            "combine requires contiguous BF16 tensors and FP32 routing weights");
     const int hidden = y.ne[0], columns = y.ne[1], top_k = routing.weights.ne[0];
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && shared.ne[0] == hidden &&
-                shared.ne[1] == columns && routing.weights.ne[1] == columns,
+                shared.ne[1] == columns && routing.weights.ne[1] == columns &&
+                routing.weights.numel() == static_cast<std::int64_t>(top_k) * columns &&
+                routing.shared_gate.numel() == columns,
             "combine shapes disagree");
     // The dispatch checked the mask's rows and shared job; the combine needs only its rows.
     const bool masked = routing.mask.valid != nullptr;
@@ -3458,14 +3477,17 @@ void moe_combine(const Tensor& outputs, const MoeRouting& routing, const Tensor&
 void moe_combine_inject(const Tensor& outputs, const MoeRouting& routing, const Tensor& shared,
                         const Tensor& inject, Tensor& residual, cudaStream_t stream) {
     require(contiguous(outputs, DType::BF16) && contiguous(shared, DType::BF16) &&
-                contiguous(residual, DType::BF16) && contiguous(inject, DType::FP32),
-            "combine inject requires contiguous BF16 tensors and FP32 inject");
+                contiguous(residual, DType::BF16) && contiguous(inject, DType::FP32) &&
+                contiguous(routing.weights, DType::FP32) && contiguous(routing.shared_gate, DType::FP32),
+            "combine inject requires contiguous BF16 tensors and FP32 inject and routing weights");
     require(routing.mask.valid == nullptr, "combine inject takes no column mask");
     const int hidden = shared.ne[0], columns = shared.ne[1], top_k = routing.weights.ne[0];
     const int streams = inject.ne[0];
     require(outputs.ne[0] == hidden && outputs.ne[1] == columns * top_k && routing.weights.ne[1] == columns &&
-                inject.ne[1] == columns && streams > 0 && streams <= kCombineInjectMaxStreams && top_k > 0 &&
-                top_k <= kCombineInjectMaxTopK && residual.ne[0] == streams * hidden && residual.ne[1] == columns,
+                routing.weights.numel() == static_cast<std::int64_t>(top_k) * columns &&
+                routing.shared_gate.numel() == columns && inject.ne[1] == columns && streams > 0 &&
+                streams <= kCombineInjectMaxStreams && top_k > 0 && top_k <= kCombineInjectMaxTopK &&
+                residual.ne[0] == streams * hidden && residual.ne[1] == columns,
             "combine inject shapes disagree (at most 4 streams and top-16)");
     CUDA_CHECK(pdl::launch_consumer({dim3((hidden + kThreads - 1) / kThreads, grid_rows(columns)),
                                      dim3(kThreads), 0, stream},

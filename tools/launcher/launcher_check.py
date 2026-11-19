@@ -230,6 +230,16 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         listen = call(port, "GET", "/launcher/api/state")[1].get("listen", {})
         check("the state names the address in use", listen == {"host": "127.0.0.1", "port": port}, str(listen))
 
+    with section("CORS preflight"):
+        # A page on another origin that sends an API key asks for Authorization in its preflight, and a wildcard
+        # Access-Control-Allow-Headers does not cover Authorization (Fetch), so it is named (audit 2026-11-18 F-2).
+        status, _, response = call(port, "OPTIONS", "/v1/chat/completions", full=True,
+                                   headers={"Origin": "http://example.com", "Access-Control-Request-Method": "POST",
+                                            "Access-Control-Request-Headers": "authorization, content-type"})
+        allowed = [h.strip().lower() for h in (response.getheader("Access-Control-Allow-Headers") or "").split(",")]
+        check("a preflight asking for Authorization and Content-Type is allowed both",
+              status == 204 and "authorization" in allowed and "content-type" in allowed, f"{status} {allowed}")
+
     with section("Model listing for coding tools"):
         # The fields other servers' clients read (llama.cpp, llama-swap, vLLM, LM Studio, OpenRouter).
         status, listed = call(port, "GET", "/v1/models")
@@ -270,6 +280,20 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
               and last.get("model_key") == key, f"{status} {last.get('routed_by')} {last.get('model_key')}")
         check("/v1/health answers", call(port, "GET", "/v1/health")[0] == 200)
         # Nothing stays loaded: the next section starts the model with its own configuration.
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+
+    with section("A route that never streams, asked to stream while its model loads"):
+        # count_tokens answers JSON whatever `stream` says: the launcher used to start an event stream for the load
+        # and relay only stream chunks, so the client got an empty stream (audit 2026-11-18 F-8).
+        status, counted, response = call(port, "POST", "/v1/messages/count_tokens",
+                                         {"model": default_alias, "stream": True,
+                                          "messages": [{"role": "user", "content": "hi"}]},
+                                         headers={"anthropic-version": "2023-06-01"}, full=True)
+        check("count_tokens with stream true during a load answers its JSON",
+              status == 200 and "application/json" in (response.getheader("Content-Type") or "")
+              and isinstance(counted, dict) and counted.get("input_tokens") == 56,
+              f"{status} {response.getheader('Content-Type')} {str(counted)[:120]}")
         call(port, "POST", "/launcher/api/unload", {})
         wait_for(lambda: instance(port)["state"] == "idle", 30)
 
@@ -482,15 +506,24 @@ def features(launcher: Launcher, port: int, data: Path) -> None:
         served += "message_stop" in text
         check("an Anthropic stream gets ping events while it loads", status == 200 and "event: ping" in text and
               text.index("event: ping") < text.find("message_start") and "message_stop" in text, text[:160])
-        # The server answers a stream that waited for the load with a JSON error (it refuses compaction): the
-        # error event carries the server's message, not only its status.
+        # The server answers a stream that waited for the load with a JSON error (it refuses a negative output
+        # limit): the error event carries the server's message, not only its status.
+        call(port, "POST", "/launcher/api/unload", {})
+        wait_for(lambda: instance(port)["state"] == "idle", 30)
+        status, kind, headers_at, pieces = stream(port, "/v1/chat/completions", chat("fake-main", -1, True))
+        text = "".join(piece for _, piece in pieces)
+        check("a server's error answer to a stream that waited for the load keeps its message",
+              status == 200 and '"error"' in text and "max_tokens must be at least 1" in text, text[:200])
+        # Compaction never streams (the server refuses it): asked to stream during a load, it gets the server's
+        # own answer, its status and message, not a stream.
         call(port, "POST", "/launcher/api/unload", {})
         wait_for(lambda: instance(port)["state"] == "idle", 30)
         status, kind, headers_at, pieces = stream(port, "/v1/responses/compact",
                                                   {"model": "fake-main", "input": "hello", "stream": True})
         text = "".join(piece for _, piece in pieces)
-        check("a server's error answer to a stream that waited for the load keeps its message",
-              status == 200 and '"error"' in text and "compaction is not supported" in text, text[:200])
+        check("compaction asked to stream during a load gets the server's own error answer",
+              status == 400 and "text/event-stream" not in kind and "compaction is not supported" in text,
+              f"{status} {kind} {text[:160]}")
         call(port, "PUT", f"{cfg}/config", {"args": base + ["--fake-load-ms", "300", "--fake-fail-load",
                                                                "cudaMalloc failed: out of memory"]})
         call(port, "POST", "/launcher/api/unload", {})
