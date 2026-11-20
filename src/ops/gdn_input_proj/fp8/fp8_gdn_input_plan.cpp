@@ -19,6 +19,8 @@ enum class Fp8GdnInputRoute : std::uint8_t {
 Fp8GdnInputRoute resolve_route(LinearPolicy policy, std::int32_t tokens) {
     if (tokens <= 0) { throw std::invalid_argument("fp8 gdn_input_proj: T must be positive"); }
     if (column_invariant(policy)) { return Fp8GdnInputRoute::ColumnInvariantA16; }
+    // `--a8-activations`: the one-term 8-bit route at every width.
+    if (a8_only(policy)) { return Fp8GdnInputRoute::A8; }
     if (policy == LinearPolicy::A16Only || allows_a4_residual(policy)) {
         return Fp8GdnInputRoute::A16;
     }
@@ -53,13 +55,17 @@ std::size_t fp8_gdn_input_partial_capacity_bytes(std::int32_t input_rows,
                               : fp8_gdn_input_partial_capacity_bytes(max_tokens);
 }
 
-std::size_t fp8_gdn_input_workspace_capacity_bytes(LinearPolicy policy, std::int32_t input_rows,
+std::size_t fp8_gdn_input_workspace_capacity_bytes(QType qtype, LinearPolicy policy, std::int32_t input_rows,
                                                    std::int32_t min_tokens,
                                                    std::int32_t max_tokens) {
     if (min_tokens <= 0 || max_tokens < min_tokens) {
         throw std::invalid_argument("fp8 gdn_input_proj workspace: invalid token interval");
     }
-    (void)resolve_route(policy, min_tokens);
+    for (const std::int32_t tokens : {min_tokens, max_tokens}) {
+        if (qtype == QType::FP8_E4M3FN_ROW_F32 && resolve_route(policy, tokens) == Fp8GdnInputRoute::A8Residual) {
+            throw std::invalid_argument("fp8 gdn_input_proj: a static input scale has no A8 residual route");
+        }
+    }
     switch (resolve_route(policy, max_tokens)) {
     case Fp8GdnInputRoute::A8:
         return fp8_a8_workspace_capacity_bytes(
@@ -110,6 +116,9 @@ void fp8_gdn_input_a8_residual_dispatch(const Tensor& x, const Weight& weight, T
                                         Tensor& z, WorkspaceArena& workspace,
                                         cudaStream_t stream) {
     require_residual_profile(weight.k);
+    if (weight.qtype == QType::FP8_E4M3FN_ROW_F32) {
+        throw std::invalid_argument("fp8 gdn_input_proj: a static input scale has no A8 residual route");
+    }
     auto scope = workspace.scope();
     fp8_gdn_input_a8_residual_launch(
         x, weight, qkv, z, allocate_fp8_a8_workspace(workspace, x.ne[1], weight.k, 0, true),

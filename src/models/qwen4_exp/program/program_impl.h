@@ -1714,12 +1714,15 @@ public:
             const std::uint32_t slack =
                 pool_slack_frames(residency_->pools(), ExpertResidency::kChunkBytes, residency_->frame_bytes());
             sizing_.frames = sizing_.frames > slack ? sizing_.frames - slack : 0U;
+            diagnostic(sizing_.describe(), DiagnosticLevel::Debug); // its frames are the "of M frames" below
             const auto grown =
                 residency_->resize(sizing_.frames, device_.stream, *vram_, GrowthLimit{sizing_.headroom, sizing_.reserve});
             if (grown.spilled != 0) {
                 diagnostic(std::to_string(grown.spilled >> 20) + " MiB of the expert frames were placed in system memory "
                        "and given back; the expert cache starts with " + std::to_string(grown.frames) + " of " +
                        std::to_string(sizing_.frames) + " frames", DiagnosticLevel::Warning);
+                diagnostic("expert frames: the chunk read as placed in system memory: " + grown.spill_readings,
+                           DiagnosticLevel::Debug);
             } else if (grown.short_of_room) {
                 diagnostic(short_of_room_line(grown.frames, sizing_.frames), DiagnosticLevel::Info);
             } else if (grown.refused) {
@@ -2804,14 +2807,7 @@ public:
     // A pair call passes its head: the residency runs the two calls' rounds (ExpertResidency::after_round), each
     // with the promotions its own call starts.
     void apply_prompt_routes(Lane& lane, std::int32_t width, std::size_t promotions, PairHead head = {}) {
-        static const double continuing = [] {
-            const auto value = temporary_switches::value("INFERNIX_TMP_CONTINUING_PROMPT");
-            const double fraction = value ? std::stod(*value) : 0.0;
-            if (value && !(fraction > 0.0 && fraction <= 1.0)) {
-                throw std::invalid_argument("INFERNIX_TMP_CONTINUING_PROMPT must be a fraction in (0, 1]");
-            }
-            return fraction;
-        }();
+        const double continuing = temporary_switches::continuing_prompt();
         if (continuing > 0.0 && lane.prompt_tokens != 0 &&
             static_cast<double>(lane.prefix.reused) >= continuing * static_cast<double>(lane.prompt_tokens)) {
             prompt_silent_.assign(static_cast<std::size_t>(width), 0);
@@ -4460,6 +4456,10 @@ public:
                    " -> " + std::to_string(frames_now_) + " frames" +
                    (resized.spilled != 0 ? " (a chunk placed in system memory was given back)"
                     : resized.short_of_room ? " (free memory went while it grew)" : ""), DiagnosticLevel::Info);
+        if (resized.spilled != 0) {
+            diagnostic("expert frames: the chunk read as placed in system memory: " + resized.spill_readings,
+                       DiagnosticLevel::Debug);
+        }
         if (d.shrink && frames_now_ * 4 < startup_frames_ && !low_frames_warned_) {
             diagnostic("another program holds VRAM: the expert cache is down to " + std::to_string(frames_now_) + " of " +
                        std::to_string(startup_frames_) +

@@ -13,7 +13,8 @@
 // columns): its router, routed experts and combine act column by column, and its dense shared
 // expert, whose projections pick their routes by width, gave each chunk's bits over a group of
 // streamed chunks in every walk infernix_qwen4_exp_forward_real_test --trim-last-layer runs, so
-// grouping changes no bit either.
+// on the exact routes grouping changes no bit either (a fast path that routes an expert job by its
+// entry count gives a group's jobs the group's routes).
 //
 // The span's residual stream (BF16 [S*H, tokens]) and every chunk's staged io image live in the
 // stream lease after the ring. Each advance_prefill call enqueues about one call's work (a few
@@ -455,17 +456,21 @@ void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
     // The group's last chunk's call opens it (its release_stream ends the span's last layer copies);
     // the route log keeps that chunk's columns, the span's last as walk_step downloads them.
     const execution::ForwardBatch fb = walk_batch(end - 1);
-    // YC-01 (forward_call's trim): the last layer's MoE only over the span's last chunk's trailing columns, as that
-    // chunk's chunk-major call runs it (Forward::last_layer_kept of its width; its dense shared expert over the whole
-    // chunk); no other final residual is read, so earlier groups run no MoE in the last layer. The span's last chunk
-    // still opens the layer's stream release.
+    // YC-01 (forward_call's trim): the last layer's MoE only over the span's last chunk's trailing columns
+    // (Forward::last_layer_kept of its width), as the untrimmed walk's MoE over the group gives them: its dense shared
+    // expert over the group, its routed experts on the group call's routes (TrimmedCall); no other final residual is
+    // read, so earlier groups run no MoE in the last layer. The span's last chunk still opens the layer's stream
+    // release. The kept columns' router takes the form the group's takes (Forward::last_layer_kept goes by the last
+    // chunk's width) because a group of several chunks holds chunks of kStreamMinColumns or more only (walk_groups;
+    // a narrower last chunk is a group of its own).
+    static_assert(kStreamMinColumns >= execution::kRouterMmaMinColumns,
+                  "a walk group of several chunks must take the router's MMA form in each of its chunks");
     const std::int32_t last_width = walk_.widths.back();
     const std::int32_t kept       = l + 1 == L && trims_last_layer() ? forward_->last_layer_kept(last_width) : 0;
     if (kept > 0) {
         if (end == walk_.widths.size()) {
             const std::int32_t chunk = walk_.offsets[end - 1] - walk_.offsets[first];
             const std::int32_t at    = chunk + last_width - kept;
-            const Tensor xm_chunk(moe + static_cast<std::size_t>(chunk) * 2ULL * H, DType::BF16, {H, last_width});
             Tensor xm_kept(moe + static_cast<std::size_t>(at) * 2ULL * H, DType::BF16, {H, kept});
             Tensor inject_kept(moe + walk_align(static_cast<std::size_t>(kWalkMoeColumns) * 2ULL * H) +
                                    static_cast<std::size_t>(at) * 4ULL * S,
@@ -473,7 +478,7 @@ void ProgramImpl::walk_moe(std::size_t g, std::uint32_t l) {
             Tensor residual_kept = walk_residual(end - 1, end).slice(1, last_width - kept, kept);
             forward_->begin_call(fb, nullptr);
             forward_->layer_moe(l, fb, xm_kept, inject_kept, residual_kept, last_width, last_width - kept, 0,
-                                execution::SharedCalls{.x = &xm_chunk});
+                                execution::TrimmedCall{.shared = &xm, .routes = &xm});
         }
     } else {
         forward_->begin_call(fb, nullptr);

@@ -10,6 +10,7 @@ target_sources(infernix_ops PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_small_t.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a16.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a4.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a8.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_plan.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_decode.cu"
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_snapshot_small_t.cu"
@@ -29,4 +30,5 @@ target_sources(infernix_ops PRIVATE
 
 target_sources(infernix_nvfp4_non_rdc PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a4_tma.cu"
+  "${CMAKE_CURRENT_LIST_DIR}/nvfp4/nvfp4_gdn_input_a8_ring.cu"
 )
