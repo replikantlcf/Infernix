@@ -2152,10 +2152,11 @@ tok/s (older build) against 72 aggregate for plain C = 2.
   expert banks, which are only read at load.
 - The artifact's `ngram_table` names the row format: `fp8_e4m3fn` (above), `iq4_nl` (the GGUF
   import, 90 B rows), `q8_0` (a Q8_0 GGUF's or a .basalt pack's rows verbatim, 170 B, 24 per block;
-  `ops::ple_embed_q8_0` decodes them exactly) or `bf16` (Qwen's unquantized table, 320 B rows, 12 per block, 109.2 GB, no
-  scale parameter). FP8 F-A binds `bf16`: `--ngram-reuse` with a BF16 volume checks that sampled
-  rows quantize to the checkpoint's FP8 codes by ModelOpt's per-tensor rule. A BF16 volume may also
-  replace a quantized table at run time (`resolve_ngram_volume`); nothing replaces a `bf16` table.
+  `ops::ple_embed_q8_0` decodes them exactly), `bf16` (Qwen's unquantized table, 320 B rows, 12 per block, 109.2 GB, no
+  scale parameter) or `nvfp4` (§12.5). FP8 F-A binds `bf16`: `--ngram-reuse` with a BF16 volume checks that sampled
+  rows quantize to the checkpoint's FP8 codes by ModelOpt's per-tensor rule. A volume of any format may
+  replace the artifact's own table at run time (`resolve_ngram_volume`, §12.5), including BF16 P12, which no
+  artifact binds.
 
 ### 12.3 Host-hashed row cache and gated reads
 
@@ -2256,10 +2257,11 @@ and a trap names no site (#48's `cudaErrorIllegalInstruction`). The GGUF token e
 
 ### 12.5 Row formats and RAM residency (2026-10-11)
 
-Four row formats share the volume layout of §12.2 and the read paths above; the engine reads the
+Six row formats share the volume layout of §12.2 and the read paths above; the engine reads the
 format from the volume header's format tag (byte 62, written since 2026-10-19: 1 FP8, 2 IQ4_NL,
-3 BF16, 4 NVFP4) or, for a volume written before the tag, from its row size (`resolve_ngram_volume`,
-`config.h`). NVFP4 rows have IQ4_NL's 90 bytes, so an NVFP4 volume always carries the tag:
+3 BF16, 4 NVFP4, 5 Q8_0, 6 BF16 P12) or, for a volume written before the tag, from its row size
+(`resolve_ngram_volume`, `config.h`). NVFP4 rows have IQ4_NL's 90 bytes, so an NVFP4 volume always
+carries the tag, as do Q8_0 and BF16 P12 volumes (both came after it):
 
 | Format | Row | Rows per 4 KiB block | Volume | Source |
 |---|---:|---:|---:|---|
@@ -2267,11 +2269,33 @@ format from the volume header's format tag (byte 62, written since 2026-10-19: 1
 | IQ4_NL (llama.cpp blocks: fp16 d, 16 nibble bytes) | 90 B | 45 | 29.1 GB (27.1 GiB) | the GSQ-RCO GGUF's shard 2, byte for byte |
 | BF16 | 320 B | 12 | 109.2 GB | Qwen's unquantized table (`tools/flash_next/ngram_bf16.py`) |
 | NVFP4 (80 E2M1 code bytes, 10 E4M3FN block scales; one FP32 multiplier) | 90 B | 45 | 29.1 GB | NVIDIA FP4-Local's table (recipe D, §6.1.2), byte for byte |
+| Q8_0 (blocks of 32: fp16 scale, 32 int8 codes) | 170 B | 24 | 54.6 GB | a Q8_0 GGUF's or a .basalt pack's table, byte for byte |
+| BF16 P12 (sign-and-mantissa bytes, 4-bit exponent offsets, base, up to 4 escapes) | 256 B | 16 | 81.9 GB | the BF16 volume repacked losslessly (`tools/flash_next/ngram_p12.py`); run time only |
 
 - **IQ4_NL.** `ple_embed` decodes each value as `bf16_rn(fl32(d) · kvalue)`: the product is exact in
   FP32 and rounds once at the BF16 boundary the FP8 rows have. Nibble order is llama.cpp's (elements
   0-15 low nibbles, 16-31 high). `ngram_scale` does not apply.
 - **BF16.** The PLE takes the rows as its embedding with no decode.
+- **BF16 P12 (2026-11-20, PR #72).** A row of W values is W sign-and-mantissa bytes (sign << 7 |
+  mantissa7), W/2 bytes of 4-bit exponent offsets q from the row's base b, then b, the escape count K
+  (0-4) and K 3-byte escapes (column, BF16 bits) in a 16-byte tail; q = 15 marks an escaped value.
+  The packer picks the b whose window [b, b+14] holds the most of the row's exponents (the lowest on a
+  tie, so zeros and subnormals sit in the window at b = 0); every row of Qwen's table needs at most 3
+  escapes (packing the published BF16 volume, 2026-11-20: 314,900,146 rows none, 5,061,053 one, 40,153
+  two, 184 three; `--verify --rows all` found 0 of 320,001,536 rows differing). `ple_embed_bf16_p12`
+  writes each value's exact BF16 bits, so the embedding equals the BF16 volume's and every route gives
+  the BF16 volume's output (NVIDIA NVFP4 Dense8: the same tokens with either volume on the reproducible,
+  default and lossless routes); it costs one decode launch per PLE call that the BF16 rows, read in
+  place, do not, which an ABBA run did not resolve (Dense8, pp8192 + tg256, INT8 KV, rows cached, 4
+  pairs, 2026-11-21: P12/BF16 median decode 0.999 (worst 0.996), prefill 0.998 (worst 0.994); the
+  BF16-again noise arm 0.999 (worst 0.973) and 1.001). Each W must be even and at most 255 (the escape column is a
+  byte); Flash-Next's 160 gives 256-byte rows. No artifact binds the format (`config.cpp` refuses it,
+  `--ngram-reuse` refuses such a volume), so the volume serves only as a run-time replacement. A missed
+  row is one 4 KiB read in every format (§12.3), so against the BF16 volume it saves disk space and
+  resident RAM, not reads: the same 7,578-token Dense8 request read 73,289 blocks from the BF16 volume
+  and 73,263 from the P12 volume (127,168 rows requested, 1.5 % host-cache hits: since 12 or 16 rows a
+  block read the same count, the reads fall short of the misses because a prompt repeats rows, not
+  because rows share blocks).
 - **NVFP4 (2026-10-19).** `ple_embed_nvfp4` decodes each value as `bf16_rn(e2m1 · e4m3 · m)`, the
   exact product (at most 30 significant bits) rounded once (an FMA residual decides the FP32 product's
   BF16 ties); element 2i is byte i's low nibble, ModelOpt's packing. The multiplier `m` (ModelOpt's
@@ -8342,12 +8366,17 @@ R7 and R8 implemented on `claude/fn-memory-tier` (from the integration branch, 2
   `.cv` loads (their host slots are rewritten; the full-mode bank keeps `.cs`). Waits: the CPU
   wait and the fetch poller end when the host's heartbeat has not changed for 10 s and write
   `kErrorHostSilent` (the CPU service) or `kErrorFetchSilent` (the fetch responder; never a trap,
-  unreported when the source has no error word, since 2026-10-31); host failures write their
+  unreported when the source has no error word, since 2026-10-31), and since 2026-11-20 also once
+  they have lasted `kHostAnswerBoundFactor` (6) heartbeat bounds in all while the host keeps beating
+  (`kErrorHostStalled`, `kErrorFetchStalled`): a host that beat but never answered held a GPU at
+  full use for over ten minutes on 2026-11-20, and ending that process hung the display driver until
+  the PC was restarted; host failures write their
   errno; an SSD-only expert with no path writes `kErrorUnservedRecord`. Tests (layer test): SSD-only
   sets served by CPU jobs (caps 8 and 256, fork, zero staging) and by the fetch channel (serial
   passes of 1 and 3 slots, overlap, fork, landing, with CPU jobs taking the narrow ones), a
-  responder that fails a request or stays silent, an unserved set without a channel, and a silent
-  CPU host, each against the CPU engine's bits or the expected error word. **Not done:** the
+  responder that fails a request, stays silent or keeps beating without landing, an unserved set
+  without a channel, and a silent or still-beating CPU host, each against the CPU engine's bits or
+  the expected error word. **Not done:** the
   tier's agent as responder (R10).
 - **R10.1** (2026-10-05, tier mode end to end without demotions): the ledger's tier placement (or
   `--expert-ram-mib N`, new in `infernix`, `infernix-serve` and `infernix_bench`; a cap above what is free is an
@@ -12701,15 +12730,15 @@ second, 2026-10-31): its narrow jobs ran the one-column kernels (§19.3.21) at e
 per column of half2 products over a staged 46 KB slice, A4(x) re-encoded per column in every CTA between six
 barriers, while the W4A16 banks had the tensor-core narrow kernels of §19.3.40.
 
-**What** (`narrow_a4_mma.cuh`, calls of at most eight columns (of four to eight since 2026-11-09: narrower ones take
-§19.3.53's row pairs), banks whose every expert shares its gate and up input
+**What** (`narrow_a4_mma.cuh`, calls of at most eight columns (of four to eight from 2026-11-09 to 2026-11-20, while
+§19.3.53's row pairs took the narrower ones), banks whose every expert shares its gate and up input
 scales: `MoeExpertSource::a4_shared_input`, set at load; NVIDIA's exports always do, other banks keep the one-column
 kernels). Per 16-element block one `mma.m16n8k16` s8 product of the doubled E2M1 codes (A: the record word's rows g
 and g + 8; B: column g's codes) gives P_b exactly for up to eight columns, folded as (P_b Sw) Sa into the same int64
 sums as `unit_sums`, so every output equals the one-column kernels' and the CPU engine's bit for bit. Gate/up CTAs
 of eight warps, two a row group, each streaming half of K through a three-stage ring (the halves add exactly); each
-CTA quantizes its job's A4(x) into shared memory while its rings fill (from four columns it copies the rows a per-job
-encode kernel wrote, §19.3.47) and its two A4 blocks of h with the down input scale. Down: a warp a row group, its units copied before the PDL wait. Shared memory is sized by the call's columns
+CTA quantizes its job's A4(x) into shared memory while its rings fill (from two columns since 2026-11-20, four before,
+it copies the rows a per-job encode kernel wrote, §19.3.47) and its two A4 blocks of h with the down input scale. Down: a warp a row group, its units copied before the PDL wait. Shared memory is sized by the call's columns
 so three gate/up CTAs fit an SM at one to three columns. Registers 80 (gate/up) and 71 (down), no spills.
 
 **Rejected on the way.** A once-per-call A4(x) encode kernel before the passes with one warp a row group over its
@@ -12921,8 +12950,8 @@ state, three interleaved runs each; outputs equal in every arm: same tokens, rou
   measures, so its one-column work is memory-bound. Op (the GGUF CPU test's `--columns` and `--rates fp8`, extended
   for the run to FP8 records and 4- and 8-column jobs; same-code GGUF rows varied +-4 %): one thread 2-7 % faster at
   2-8 columns, level at one; the 16-worker team 2-6 % faster at four and eight columns.
-- Per-job x encode from four columns: never encoding lost 0.4-0.6 % on every workload, encoding at every width was
-  level (+0.2 / +0.2 / -0.2 %).
+- Per-job x encode from four columns (two since 2026-11-20, §19.3.53): never encoding lost 0.4-0.6 % on every
+  workload, encoding at every width was level (+0.2 / +0.2 / -0.2 %).
 
 **Rejected on the way.**
 - *Per-token A4(x).* FP4-Local's experts share one gate/up input scale in every layer (all 512), so a token's A4(x) is
@@ -13347,9 +13376,32 @@ one binary with the switch, three ABBA blocks of fresh processes):
 - Not timed: long contexts, the reproducible route (it takes the same kernels), Huihui FP4-Local, recipe C and the
   uncensored NVFP4 (same kernels, same bits).
 
-### 19.3.53 NVFP4 W4A4 decode calls on register-resident row pairs (2026-11-09; exact, same bits; default)
+### 19.3.53 NVFP4 W4A4 decode calls on register-resident row pairs (2026-11-09; exact, same bits; removed 2026-11-20)
 
-**What.** §19.3.52's row-pair kernels on 4-bit activations (`ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh`,
+**Removed** (2026-11-20): W4A4 calls of one to three columns take §19.3.44's tensor-core narrow kernels again (with
+the per-job x encode from two columns), and `narrow_rows_a4.cuh` is gone. These kernels fell into a slow state that
+outlasted the process: in the README benchmark of 2026-11-20 (served Dense8, DFlash2 companion auto and n-gram
+drafting, INT8 KV, `--vram-past-budget --vram-headroom-mib 128`, a 6K and two 8K prompts with 1,024 greedy tokens,
+fresh processes from the same saved expert state) every process for an hour at a time decoded at 80-130 tok/s instead
+of ~185, while the tensor-core kernels (a switch in one build) decoded at 181-209 in every process between them. The
+state followed VRAM pressure: another process taking 400 MiB while the engine ran (the engine then gives frames back
+to its 128 MiB headroom) set it off three times, and it stayed for later processes until it cleared on its own or at
+a restart; with 1,024 MiB of headroom the same pressure left the row pairs fast. Under that pressure, mirrored pairs:
+row pairs 35-102 tok/s, row pairs at one column only (the tensor-core kernels from two) 84-156, the tensor-core
+kernels 158-190. Plain decode (one-column calls) was not slowed in the state. In a slow process (nsys, 4 s of
+decode) the row-pair gate/up kernel took a median 238 µs a call against ~31 µs alone and the per-pass x encode
+125-133 µs on the staged passes' streams, the GPU drew ~185 W against ~234 W, and it sent ~6x the GPU-to-host PCIe
+traffic a token (9.8 against 3.3 GB/s); the engine's own VRAM readings matched fast processes', no other process
+used the GPU, and the kernels alone were unchanged (op bench 30.8 / 47.1 / 61.5 µs at T = 1 / 2 / 3). The
+mechanism inside the driver was not found. Neither the down pass's wait (the PDL wait, or stream order, with no
+per-element counts) nor launching the gate/up pass in stream order changed it, and FP4-Local's W4A16 row pairs
+(§19.3.52) were level with its tensor-core kernels in sessions between slow Dense8 ones.
+Cost (op bench, same output hashes): T = 1 30.8 -> 34.8 µs a call, T = 2 47.1 -> 45.1, T = 3 61.5 -> 57.3-59.4.
+End to end (the same probe, fresh processes): plain decode (`--spec off`) A C C A 128.4 / 136.3 / 131.1, 128.4 /
+135.7 / 131.0, 128.5 / 135.9 / 130.9, 128.5 / 136.1 / 131.4 tok/s (level; 5f3a0c2e had measured the row pairs +1.6 %
+there); DFlash2 in a fast state the tensor-core kernels 180-213 against the row pairs' 171-213 at another hour.
+
+**What it was.** §19.3.52's row-pair kernels on 4-bit activations (`ops/offloaded_sparse_moe/cuda/narrow_rows_a4.cuh`,
 candidates TM-02c): the narrow jobs of calls of at most three columns (`moe::wide::kA4RowsMaxColumns`) of W4A4 banks
 whose experts share their gate and up input scales (`a4_shared_input`: Dense8, recipe A, FP4-Local under
 `--expert-a4-activations`), in place of §19.3.44's tensor-core kernels, which keep calls of 4 to 8 columns.

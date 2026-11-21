@@ -666,16 +666,18 @@ about healthy drives. The probe only reports; it never changes where the table l
 
 ## N-gram table formats
 
-The PLE n-gram table has four volume formats: NVIDIA's FP8 rows with one scale for the whole table
-(recipes A-C bind it), the GGUF import's IQ4_NL rows (4.5 bits per value), the BF16 rows of
+The PLE n-gram table has six volume formats. Five can be an artifact's own table: NVIDIA's FP8 rows
+with one scale for the whole table (recipes A-C bind it), the GGUF import's IQ4_NL rows (4.5 bits
+per value), the Q8_0 rows of a Q8_0 GGUF or a .basalt pack (8.5 bits per value), the BF16 rows of
 Qwen's checkpoint (the FP8 checkpoint's exact artifact binds it) and NVIDIA FP4-Local's NVFP4 rows
 (4.5 bits per value: E2M1 codes, an E4M3 scale per 16 values and one FP32 multiplier; the FP4-Local
-artifact binds it). Every artifact binds one of them as its own, and **any Qwen3.8-Flash-Next
-artifact runs with a volume of any of the four formats**: pass it with `--ngram-volume`. The engine
-reads the row format from the volume's header and logs
+artifact binds it). The sixth, [BF16 P12](#bf16-p12-n-gram-table), stores the BF16 rows losslessly in
+less space and serves only at run time. **Any Qwen3.8-Flash-Next artifact runs with a volume of any
+of the six formats**: pass it with `--ngram-volume`. The engine reads the row format from the
+volume's header and logs
 `n-gram table: <format> rows from <volume> in place of the artifact's <format> table`; the PLE
-decodes the FP8, IQ4_NL or NVFP4 rows (or takes the BF16 rows as its embedding) as it does for the
-artifact's own table. The volumes hold the same table row for row: on 3,002 sampled rows,
+decodes the FP8, IQ4_NL, Q8_0, NVFP4 or BF16 P12 rows (or takes the BF16 rows as its embedding) as it
+does for the artifact's own table. The volumes hold the same table row for row: on 3,002 sampled rows,
 the FP8 rows' relative L2 error against the BF16 rows was 2.7 % (median; 3.1 % at the 99th
 percentile) and the IQ4_NL rows' 7.6 % (8.7 %), against 142 % for rows shifted by one; on 65,536
 sampled rows the NVFP4 rows' was 9.5 % (median; 11.3 % at most), an NVFP4 quantization of Qwen's
@@ -694,7 +696,8 @@ record their row format in the header (NVFP4 rows have IQ4_NL's 90 bytes); older
 their row size.
 
 The FP8 checkpoint's artifact, converted with the BF16 table, is bit-exact to Qwen's checkpoint
-only with its own BF16 volume; another table rounds the PLE's values as that table's artifacts do.
+only with its own BF16 volume or a BF16 P12 volume packed from it; another table rounds the PLE's
+values as that table's artifacts do.
 
 ### BF16 n-gram table
 
@@ -717,7 +720,48 @@ The table is ~102 GB in the checkpoint and the volume ~109 GB (rows of 320 bytes
 block, against 52 GB for FP8). A token reads as many 4 KiB blocks as with the FP8 volume, so a drive
 with fast random reads serves it as fast; it does not fit in RAM (`--ngram-residency auto` keeps it
 on the volume). A persistent prefix cache saved with one table is not restored with the other.
-The quality change against the FP8 table has not been measured yet.
+Against the FP8 table the perplexity differs in the fourth decimal (3.5101 against 3.5102, above).
+
+### BF16 P12 n-gram table
+
+A BF16 P12 volume holds the same BF16 values as the BF16 volume, bit for bit, in 256-byte rows instead
+of 320 (16 per 4 KiB block instead of 12). Each value keeps its sign and 7 mantissa bits in a byte
+and its exponent as a 4-bit offset from the row's base; a value whose exponent lies outside the row's
+15-exponent window is stored whole in one of up to four escapes in the row's 16-byte tail. Every row
+of Qwen's table fits: 98.4 % need no escape and the rest at most three. The PLE decodes the rows to
+their exact BF16 values, so an artifact gives the same output with the BF16 P12 volume as with the
+BF16 volume, on every route (NVIDIA NVFP4 Dense8 gave the same tokens with either volume on the
+reproducible, default and lossless routes). The volume packed from Qwen's table is published beside
+the BF16 volume:
+
+```text
+hf download Wallawalla47/Qwen3.8-Flash-Next-FP8-Infernix Qwen3.8-Flash-Next-BF16-P12.ngram --local-dir <fast drive>
+```
+
+Its SHA-256 is `70d19c5666a74f44604143aa947c7ac4b6f6fda7ae275463dea31cbbb9ce5abb`. To make it from a
+BF16 volume instead and check every row:
+
+```text
+python -m tools.flash_next.ngram_p12 --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --census
+python -m tools.flash_next.ngram_p12 --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --out <fast drive>/Qwen3.8-Flash-Next-BF16-P12.ngram
+python -m tools.flash_next.ngram_p12 --source <fast drive>/Qwen3.8-Flash-Next-BF16.ngram --out <fast drive>/Qwen3.8-Flash-Next-BF16-P12.ngram --verify --rows all
+infernix-serve <artifact part 1> --ngram-volume <fast drive>/Qwen3.8-Flash-Next-BF16-P12.ngram ...
+```
+
+`--census` counts the escapes each row needs (the packer refuses a row that needs more than four).
+The packed volume's id follows from its source's, so packing one BF16 volume always gives the same
+file. From and to Samsung 990 PRO drives, with other jobs running, packing took 29 minutes and
+`--verify --rows all` 39. The
+volume is 81.9 GB against the BF16 volume's 109.2 GB (FP8: 52.4 GB). A missed row costs one 4 KiB
+read whatever the format, so a token reads as many blocks as with the BF16 or FP8 volume (a
+7,578-token prompt: 73,289 reads from the BF16 volume, 73,263 from the BF16 P12 one). What changes
+is the space: on disk, and in RAM when the whole table is held there (`--ngram-residency`). Decoding
+the rows costs the PLE one more kernel launch per call, which did not measurably change speed: NVIDIA
+NVFP4 Dense8 with 8,192-token prompts and 256 generated tokens (INT8 KV, rows in the host cache, four
+interleaved runs on an RTX 5090, 2026-11-21) decoded 127.0 tok/s with the BF16 P12 volume and 126.7
+with the BF16 one and read prompts at 4,856 and 4,807 tok/s; the BF16 volume against itself varied
+as much (decode down to 0.973 of itself in one pair). No artifact binds a BF16 P12 table as its own (`--ngram-reuse` refuses one);
+pass it at run time.
 
 ## Chat template
 
@@ -977,7 +1021,11 @@ startup
   - The engine measures this allowance at startup: physical memory less the reserve, less the
     budget, less a 128 MiB margin. It reports it in the ledger (`… in use before loading (640 MiB
     past the OS budget)`).
-  - If Windows lowers the budget later, the cache shrinks by the same amount.
+  - It never takes other programs' memory: free VRAM is at most what NVML finds free over every
+    process, at startup and later (until 2026-11-20 the allowance could count the desktop's and other
+    programs' VRAM as free, about 70-170 MiB on a headless RTX 5090).
+  - If Windows lowers the budget later, or another program takes VRAM, the cache shrinks by the same
+    amount.
   - The cost: memory past the budget may be moved to system memory if another program needs VRAM,
     which slows decode until the cache shrinks. It is off by default.
   - Measured on an RTX 5090 (2026-10-30, greedy 500-token decodes, three runs a side,

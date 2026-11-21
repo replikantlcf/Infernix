@@ -58,9 +58,12 @@ std::string artifact_stem(const std::filesystem::path& path) {
     return stem;
 }
 
+// The formats an artifact binds as its own table (the engine's config.cpp). BF16 P12 is a run-time
+// volume only: it replaces a table through --ngram-volume and is never an artifact's own.
 std::string ngram_format_name(std::string_view artifact_format) {
     if (artifact_format == "fp8_e4m3fn") { return "fp8"; }
-    if (artifact_format == "iq4_nl" || artifact_format == "bf16" || artifact_format == "nvfp4") {
+    if (artifact_format == "iq4_nl" || artifact_format == "bf16" || artifact_format == "nvfp4" ||
+        artifact_format == "q8_0") {
         return std::string(artifact_format);
     }
     return "unknown";
@@ -71,6 +74,7 @@ std::uint32_t head_width(const NgramTableFacts& table) {
     if (table.format == "fp8") { return table.row_bytes; }
     if (table.format == "bf16") { return table.row_bytes / 2; }
     if (table.format == "iq4_nl") { return table.row_bytes / 18 * 32; }
+    if (table.format == "q8_0") { return table.row_bytes / 34 * 32; }
     if (table.format == "nvfp4") { return table.row_bytes * 16 / 9; }
     return 0;
 }
@@ -79,7 +83,9 @@ std::uint32_t row_bytes_for(std::string_view format, std::uint32_t width) {
     if (format == "fp8") { return width; }
     if (format == "bf16") { return 2 * width; }
     if (format == "iq4_nl") { return width % 32 == 0 ? width / 32 * 18 : 0; }
+    if (format == "q8_0") { return width % 32 == 0 ? width / 32 * 34 : 0; }
     if (format == "nvfp4") { return width % 16 == 0 ? width / 2 + width / 16 : 0; }
+    if (format == "bf16_p12") { return width % 2 == 0 && width <= 255 ? width + width / 2 + 16 : 0; }
     return 0;
 }
 
@@ -404,8 +410,8 @@ std::optional<ScannedNgramVolume> parse_ngram_header(const std::filesystem::path
     volume.key       = hex_string(reinterpret_cast<const std::uint8_t*>(p + 44), 16);
     volume.fp8_scale = read_le<std::uint16_t>(p + 60);
     volume.tag       = read_le<std::uint16_t>(p + 62);
-    static constexpr const char* kTagged[] = {"fp8", "iq4_nl", "bf16", "nvfp4"};
-    if (volume.tag >= 1 && volume.tag <= 4) {
+    static constexpr const char* kTagged[] = {"fp8", "iq4_nl", "bf16", "nvfp4", "q8_0", "bf16_p12"};
+    if (volume.tag >= 1 && volume.tag <= 6) {
         volume.format = kTagged[volume.tag - 1];
     } else {
         // Untagged volumes predate NVFP4 tables; Qwen3.8-Flash-Next rows are 160 elements wide.
@@ -445,7 +451,10 @@ std::optional<int> ngram_rank(const ScannedModel& model, const ScannedNgramVolum
     if (format == "fp8") { return 1; }
     if (format == "nvfp4") { return 2; }
     if (format == "iq4_nl") { return 3; }
-    return 4;
+    if (format == "q8_0") { return 4; }
+    if (format == "bf16_p12") { return 5; }
+    if (format == "bf16") { return 6; }
+    return 6;
 }
 
 LibraryScan scan_library(const std::vector<std::filesystem::path>& dirs, int depth) {
