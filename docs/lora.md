@@ -98,9 +98,10 @@ channel before the convolution reads it, and `z` before its gate; decode and ver
 materialized and the convolution over it, where without an adapter some routes fuse the two. The control's term is
 added to `a` and `b` before their gates (`g = -exp(A_log) softplus(a + dt_bias)`, `beta = sigmoid(b)`): an adapted
 control runs the input norm on its own, then the shrink, then one kernel for both controls and their terms (the same
-schedule at every width, so the reproducible route stays request-invariant). Those two are other kernels than the
-unadapted model runs, so a zero adapter on these modules does not give its bits (everywhere else it does). `out_proj`
-takes its term as `o_proj` does. On the lossless route the terms are added to the BF16 `qkv`, `z`, `a` and `b` and
+arithmetic at every width, so the reproducible route stays request-invariant: prompts take a CTA a 64-column tile,
+decode and short verification a cluster of eight CTAs a 16-row tile, one an eighth of the 5,120 inputs). Those two
+are other kernels than the unadapted model runs, so a zero adapter on these modules does not give its bits
+(everywhere else it does). `out_proj` takes its term as `o_proj` does. On the lossless route the terms are added to the BF16 `qkv`, `z`, `a` and `b` and
 to `out_proj`'s output, as PEFT adds them.
 
 ## Speculative decoding and the prefix cache
@@ -123,13 +124,18 @@ Loading reads one adapted site's factors at a time, so it holds a few MB of RAM,
 
 Each adapted input costs one more kernel, the `A x` of its stacked adapters. A prompt's call takes the schedule
 modelled fastest for its shape: for most prompts a tile schedule, a cluster of CTAs over K's groups in rounds whose
-tile and cluster size follow how many clusters the GPU holds at once; for decode, verification and short prompts of
-the narrow stacks, the split and stream schedules. Every schedule gives the same bits. Each projection adds the term
+tile and cluster size follow how many clusters the GPU holds at once, and how many at one CTA an SM (a cluster stays
+within a GPC, so a wave of more doubles CTAs up on some SMs); a stack of at most 64 rows may run 16-column warps where
+each then has an SM sub-partition to itself; for decode, verification and short prompts of the narrow stacks, the
+split and stream schedules. Every schedule gives the same bits. Each projection adds the term
 in its epilogue. The decode kernels copy their rows of `B` and columns of `U` into shared memory beside their main
-loop (their weights stream through L2, so `B` would be gone by the epilogue); the NVFP4 prompt tile copies them once
-for the whole tile, a wide adapter's FP8 tiles copy them too, and so do the groupwise ring tiles (the plain row-split
-ring only for a wide adapter); the other tiles read
-them from L2, one fragment at a time.
+loop (their weights stream through L2, so `B` would be gone by the epilogue); the NVFP4 and FP8 prompt tiles copy
+them once for the whole tile (a wide adapter's NVFP4 tile one adapted module's `U` columns over every token a pass,
+in rows without padding whose 16-byte pieces are swizzled, so all its warps work on every pass; a wide adapter's
+FP8 tile in the same swizzled rows where padded ones do not fit, its row fragments one at a time to spare the
+registers its accumulators leave), and so do the groupwise ring tiles (the plain row-split ring only
+for a wide adapter); the other tiles read them from L2, one fragment at a time. The staged term's MMA loop has one
+instance per count of the rank's 16-value steps, so it runs without a branch a step.
 
 Every adapted kernel has two instances, chosen by the adapter's rank (padded to a multiple of 16): up to 64,
 the narrow one, which holds the term's operands for 64; above, to 128, the wide one, which holds them for 128. They
@@ -191,6 +197,35 @@ under per-stage barriers instead of a barrier for the whole CTA. At rank 128 and
 `down_proj` (222 before), 74 for q/k/v (134) and 55 for gate/up (89), and 80 for a Gated DeltaNet layer's input stack
 (the split schedule, the previous rule's choice for that height, takes 280). One narrow case is slower: o_proj at
 rank 32 and 1,536 tokens, 16.5 us against 14.5.
+
+A second pass the same evening (2026-11-22, against the build above; two pairs of runs each, prefill of 2,048 tokens
+and decode of 128) made prefill 0.7 % faster on QAD at rank 32 (0.7 % at 256 tokens, 2.4 % at 1,024) and 2.7 % at
+rank 128, 0.7 and 1.5 % on the Official NVFP4 27B at ranks 32 and 128, 2.1 and 1.2 % on QAD with the code-tools and
+Atlassian v2 Gated DeltaNet adapters, and left groupwise prefill with code-tools within 0.15 %. Decode with code-tools
+(whose adapter includes the controls) became 1.4 % faster on QAD and 0.8 % on groupwise, and every other decode
+moved by at most 0.15 %. The tables above predate it. At the GPU's base clock, the term's extra cycles on QAD's
+1,792-token tiles fell by a third to two thirds: the NVFP4 gate/up tile from 15 to 10 % at rank 32 and from 40 to
+27 % at rank 128 (the staged MMA loop's fixed step count; at rank 128 also the swizzled copy over every token, where
+half the warps had waited at each of four barriers), down_proj from 2.6 to 0.9 % and from 9.8 to 6.1 %, and the FP8
+attention tiles at rank 32 from 24 to 11 % (q/k/v) and 24 to 8 % (o_proj), which now copy a narrow adapter's
+operands too. The adapted control's kernel takes 5.1 us a call at decode instead of 7.0 (a cluster of eight CTAs a
+16-row tile, the weights copied into shared memory before the kernel waits for its input). A fused projection and
+convolution with the term for the Gated DeltaNet decode was tried and dropped: decode with the Atlassian adapter,
+which it alone would speed up, moved by -0.01 and -0.07 %.
+
+A third pass (2026-11-22, against the second; the same benchmark, two pairs of runs at rank 128, six at rank 32) made
+prefill of 2,048 tokens at rank 128 0.81 % faster on QAD, 0.38 % on the Official NVFP4 27B and 0.54 % on QAD's
+reproducible route (0.24-0.33 % of it the wide adapter's FP8 tiles copying their operands for the whole tile, the rest
+the `A x` plan); decode moved by at most 0.2 %. At rank 32 prefill moved by -0.06 % on QAD and -0.09 % on Official
+(7 of the 12 pairs slower, from -0.26 to +0.16 %), although traces of the QAD prefill show its summed kernel time
+0.3 % lower (`down_proj`'s `A x` at 1,792 tokens 44.2 us a call instead of 49.0); where that gain goes is not
+settled. The plan now counts the clusters
+the GPU holds at one CTA an SM (a rank-128 `down_proj` at 1,792 tokens took clusters of 3, 56 against the 52 the
+GPCs hold that way, so a few SMs ran two CTAs and set the call's 104 us; clusters of 5 take 80), and a stack of at most
+64 rows may take 16-column warps, whose round of a group takes about two thirds of a 32-column warp's where each has
+an SM sub-partition to itself. In the `lora_shrink` bench (the 27B's five sites at ranks 16, 32, 96 and 128,
+256-4,096 columns, two pairs of runs), 54 of 380 calls became 3-34 % faster beyond the runs' spread (rank-32
+`down_proj` at 1,280-1,408 columns by a third) and none slower beyond it (the most, +2.2 %, within the spread).
 
 An adapter of the Gated DeltaNet modules costs more than one of the same rank on the others, mostly in decode: those
 layers then run their projection materialized and the convolution over it, and an adapted control its own kernels.
