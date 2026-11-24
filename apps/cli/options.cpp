@@ -84,6 +84,7 @@ constexpr std::array kCliOptions{
     CliOption{"--messages"},
     CliOption{"--chat-template"},
     CliOption{"--lora"},
+    CliOption{"--ablate"},
     CliOption{"--ngram-volume"},
     CliOption{"--ngram-residency"},
     CliOption{"--expert-state"},
@@ -140,6 +141,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-a4-activations", false},
     CliOption{"--a16-activations", false},
     CliOption{"--a8-activations", false},
+    CliOption{"--q8-weights", false},
     CliOption{"--embedding-host", false},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
@@ -187,7 +189,7 @@ std::string usage_text(const char* argv0) {
            "       [--max-context N] [--kv-capacity N|auto] [--prefill-chunk N] [--max-new N]\n"
            "       [--device N]\n"
            "       [--kv-dtype bf16|bf16p|int8|fp8|nvfp4|k8v4|vq2|k4v2] [--logits-dtype fp32|bf16]\n"
-           "       [--spec auto|off|mtp|dflash|dflash2 --draft-tokens "
+           "       [--spec auto|off|mtp|dflash|dflash2|dspark --draft-tokens "
            "N|auto]\n"
            "       [--draft-model FILE]\n"
            "       [--lm-head-draft] [--spec-min-p P] [--draft-tree-nodes auto|N] [--draft-tree-paths N]\n"
@@ -195,9 +197,10 @@ std::string usage_text(const char* argv0) {
            "       [--temperature F] [--top-p F] [--top-k N] [--min-p F]\n"
            "       [--presence-penalty F] [--frequency-penalty F] [--seed N] [--greedy]\n"
            "       [--stop-token-id N]... [--stop <text>]... [--reasoning-stop <text>]...\n"
-           "       [--chat-template FILE] [--lora PATH] [--ngram-volume FILE] [--ngram-residency auto|ram|volume]\n"
+           "       [--chat-template FILE] [--lora PATH] [--ablate FILE] [--ngram-volume FILE]\n"
+           "       [--ngram-residency auto|ram|volume]\n"
            "       [--expert-state FILE|off] [--expert-stripe FILE] [--expert-a4-activations] [--a16-activations]\n"
-           "       [--a8-activations]\n"
+           "       [--a8-activations] [--q8-weights]\n"
            "       [--embedding-host]\n"
            "       [--ram-free-mib N] [--expert-ram-mib N|auto] [--expert-ram-layout exclusive|full]\n"
            "       [--expert-pin-mib N|auto] [--expert-csf]\n"
@@ -341,21 +344,31 @@ std::string usage_text(const char* argv0) {
            "                           The NVFP4 Qwen3.8-27B artifacts: every NVFP4 and FP8 text\n"
            "                           projection 8-bit at every width (a precision option). A\n"
            "                           GGUF import's BF16 hyper-connection matrices become\n"
-           "                           8-bit at load. Other calls keep their routes.\n"
+           "                           8-bit at load. Inkling 2: every call, as Basalt runs it\n"
+           "                           (the attention projections and head on --q8-weights'\n"
+           "                           matrices, the NVFP4 experts W4A8 instead of W4A4; the\n"
+           "                           MXFP8 experts, gates and router keep theirs). Other\n"
+           "                           calls keep their routes.\n"
            "                           Approximate: changes the output; --reproducible and\n"
            "                           artifacts without such a route refuse it (default: off)\n"
-           "  --embedding-host         Qwen3.5-family artifacts: keep the token embedding in\n"
-           "                           pinned host memory, read zero-copy, so its VRAM\n"
-           "                           (1.18 GiB on the 27B) goes to the KV and prefix\n"
+           "  --q8-weights             8-bit weights where they measured faster: Inkling 2's\n"
+           "                           attention input and output projections and head become\n"
+           "                           int8 with an FP16 scale per 32 values at load\n"
+           "                           (activations stay 16-bit; --a8-activations implies it).\n"
+           "                           Approximate: changes the output; --reproducible\n"
+           "                           and other artifacts refuse it (default: off)\n"
+           "  --embedding-host         Qwen3.5-family and Inkling 2 artifacts: keep the token\n"
+           "                           embedding in pinned host memory, read zero-copy, so\n"
+           "                           its VRAM (1.18 GiB on the 27B) goes to the KV and prefix\n"
            "                           caches. Same output; prompts read their rows over\n"
            "                           PCIe (default: in VRAM; offloaded-expert artifacts\n"
            "                           always keep it in host memory)\n"
            "\n"
            "SPECULATIVE DECODING (auto by default)\n"
-           "  --spec auto|off|mtp|dflash|dflash2\n"
+           "  --spec auto|off|mtp|dflash|dflash2|dspark\n"
            "                           speculative backend. auto (the default, with\n"
            "                           --draft-tokens auto): the drafter measured fastest for\n"
-           "                           the artifact: Qwen3.8-Flash-Next dflash2 with\n"
+           "                           the artifact: Inkling 2 dspark; Qwen3.8-Flash-Next dflash2 with\n"
            "                           --draft-model or its companion artifact alone in the\n"
            "                           model's folder, else mtp; offloaded-expert Qwen3.5\n"
            "                           (122B) mtp; other Qwen3.5/3.6 dflash2, then mtp, then\n"
@@ -377,6 +390,9 @@ std::string usage_text(const char* argv0) {
            "                           adapter directory (or its adapter_model.safetensors,\n"
            "                           adapter_config.json beside it); Qwen3.5 dense models\n"
            "                           (the 27Bs); --lossless computes it as PEFT does (docs/lora.md)\n"
+           "  --ablate FILE            apply an ablation sidecar at runtime: its sidecar.json,\n"
+           "                           the direction file beside it; not on Inkling 2\n"
+           "                           (docs/ablate.md)\n"
            "  --lm-head-draft          use the optimized proposal head\n"
            "  --spec-min-p P           mtp (on Qwen3.8-Flash-Next with a fixed --draft-tokens N\n"
            "                           only), Qwen3.8-Flash-Next dflash2: one-request rounds\n"
@@ -472,6 +488,8 @@ Options parse_options(int argc, char** argv) {
             options.chat_template_path = value(arg);
         } else if (arg == "--lora") {
             options.lora_path = value(arg);
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = value(arg);
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = value(arg);
         } else if (arg == "--ngram-residency") {
@@ -658,6 +676,8 @@ Options parse_options(int argc, char** argv) {
             options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
+        } else if (arg == "--q8-weights") {
+            options.q8_weights = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--stop-token-id") {

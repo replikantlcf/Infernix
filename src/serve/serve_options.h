@@ -1,12 +1,14 @@
 #pragma once
 
 #include "infernix/types.h"
+#include "product/config/config_file.h"
 #include "product/logging/logging.h"
 #include "serve/request.h"
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -52,6 +54,8 @@ struct ServeOptions {
     // --lora PATH: a LoRA adapter applied at runtime (EngineOptions::lora_path).
     std::filesystem::path lora_path;
     std::filesystem::path chat_template_path;
+    // --ablate FILE: the ablation sidecar (docs/ablate.md). Empty: byte-identical standard.
+    std::filesystem::path ablate_sidecar_path;
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
     // --expert-state FILE|off: absent uses the artifact path + .expert-state, "off" disables.
@@ -78,6 +82,7 @@ struct ServeOptions {
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations (--a16-activations)
     bool a8_activations            = false; // EngineOptions::a8_activations
+    bool q8_weights                = false; // EngineOptions::q8_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;
     // At most kMaximumPendingRequests: the HTTP pool starts a worker for each admitted or pending request.
@@ -110,6 +115,9 @@ struct ServeOptions {
     bool original_nvfp4_prefill_kernel = false;
     bool fast_paths                    = true; // off with --reproducible or --lossless (EngineOptions)
     bool lossless                      = false; // --lossless (EngineOptions)
+    // --causal-scoring: start the Engine for teacher-forced scoring (EnginePurpose::CausalScoring):
+    // POST /v1/score answers and nothing generates (no warm-up). Off: /v1/score refuses.
+    bool causal_scoring                = false;
     // --fast-path NAME (repeatable): also run these, qualified or not (qualification and timing
     // runs; EngineOptions::fast_path_candidates).
     std::vector<FastPath> fast_path_candidates;
@@ -224,6 +232,9 @@ const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept;
 std::string resolve_public_model_id(const ServeOptions& options,
                                     std::string_view artifact_model_name);
 std::string serve_usage_text(const char* argv0);
+// Every option the command line and --config accept after the artifact path: its name, whether it takes a value and
+// whether it repeats. serve_usage_text lists each of them (the launcher and tools/ablate read the arity from it).
+std::span<const product::ConfigOption> serve_option_arities() noexcept;
 // Whether a --host value accepts connections from this machine only (127.0.0.0/8, ::1, localhost).
 bool is_loopback_host(std::string_view host) noexcept;
 

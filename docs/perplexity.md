@@ -36,14 +36,17 @@ configuration's declared lossy steps applied exactly (the activation quantizatio
 FP4-Local's 4-bit experts with `--expert-a4-activations`, and the `--kv-dtype` codec: `bf16` stores V as
 FP16, every other format its production codes, read exactly); it implies `--lossless`, and `report.json` records it as
 `execution.reference` ([definition](maintainer/lossless-route.md#3b-the-design-reference---reference)).
-`--lossless` (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next) runs the lossless route, the quality
-reference's: every operation of the model's Hugging Face forward pass correctly rounded, so a score
-depends on the window's tokens alone; one pass per window (give `--prefill-chunk` the context), BF16
-KV, no fast path, FP32 logits ([definition](maintainer/lossless-route.md)). Saved with
+`--lossless` (Qwen3.5/3.6/3.8, Qwen3.8-Flash-Next and Inkling 2) runs the lossless route, the quality
+reference's: every operation of the model's Hugging Face forward pass correctly rounded (Inkling 2's routed experts in
+their declared four-over-six NVFP4 and MXFP8 arithmetic), so a score depends on the window's tokens alone; one pass
+per window (give `--prefill-chunk` the context; Inkling 2 always scores a window in one pass), BF16 KV, no fast path,
+FP32 logits ([definition](maintainer/lossless-route.md)). Inkling 2 takes `--lossless` for text windows, and
+`--reference` with `--kv-dtype bf16` (V stored as FP16; its coded KV formats are not built yet). Saved with
 `--save-top-tokens`, it is the reference that `--kl-reference` measures other runs against, and
 `report.json` records it as `lossless`. [Model-level numerical quality](maintainer/model-quality.md)
 has the method and the recorded results. Qwen3.8-Flash-Next reads its n-gram volume from `<model>.ngram` unless
-`--ngram-volume FILE` names it, as in `infernix` (`--expert-stripe FILE` as there too). Its windows
+`--ngram-volume FILE` names it, as in `infernix` (and with offloaded experts, Flash-Next's or the 122B's,
+`--expert-stripe FILE` as there too). Its windows
 prefill through the generation path, the SSD expert tier included, keeping each position's final
 residual; the LM head then runs over them in tiles of 64 positions with FP32 logits. The available Main
 KV representations are `bf16`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, and `k4v2`; unlike `infernix` and
@@ -124,8 +127,11 @@ same route as generation; `--ngram-volume FILE` names their n-gram volume when i
 (NVFP4, NVFP4 Dense8 and NVFP4-QAD) with 16-bit expert activations and NVIDIA's NVFP4 Qwen3.8-27B artifacts with
 16-bit activations at every text projection, and `--a8-activations` scores infernix-serve's
 8-bit route, which the reproducible and lossless routes refuse; `report.json` records them as
-`expert_a16_activations` and `a8_activations`. `--lora PATH` scores the model with a LoRA adapter applied
-([LoRA adapters](lora.md)); `report.json` names it in `execution.lora_adapter` (`null` without one). The
+`expert_a16_activations` and `a8_activations`. `--q8-weights` scores Inkling 2 with infernix-serve's 8-bit weights
+(the same refusals), recorded as `q8_weights`. `--lora PATH` scores the model with a LoRA adapter applied
+([LoRA adapters](lora.md)); `report.json` names it in `execution.lora_adapter` (`null` without one). `--ablate FILE`
+scores the model with an ablation sidecar applied ([Ablation sidecars](ablate.md)); `report.json` names it in
+`execution.ablate_sidecar` (`null` without one). The
 [numerical acceptance policy](maintainer/model-quality.md#6-numerical-acceptance-policy-and-fast-paths)
 uses its own corpus and tool (`infernix-certify`).
 

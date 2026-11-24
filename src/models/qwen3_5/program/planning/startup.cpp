@@ -513,6 +513,10 @@ PersistentLayout persistent_layout(const SequencePlanImpl& plan) {
             add_tensor(builder, DType::BF16,
                        {dimension(config.hidden_size), static_cast<std::int32_t>(kCausalScoreTile)},
                        "causal score hidden staging");
+        out.score_layer_hidden =
+            add_tensor(builder, DType::BF16,
+                       {dimension(config.hidden_size), dimension(config.num_hidden_layers)},
+                       "causal score layer hidden states");
     }
     qwen3_5::complete_round_state_layout(builder, out.round);
     if (!plan.causal_scoring) {
@@ -609,7 +613,18 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                                    std::int32_t max_width,
                                    ops::CausalAttentionExecutionEnvelope envelope) {
         const bool wide_verification = wide_residual_verification(phase, min_width, max_width);
+        // --ablate: a cut lane copies the residual columns it writes first (TextContext::snapshot_residual), one BF16
+        // [H, T] held through the lane's write; the sidecar's table says which lanes (a plan-only model has it too).
+        // Without a sidecar nothing is reserved.
+        const models::AblateSidecarBinding* ablate = parameters.model.ablate();
+        const auto reserve_cut_output = [&](WorkspaceLayoutBuilder& at, std::size_t layer,
+                                            models::AblateParameters::Lane lane) {
+            if (ablate != nullptr && ablate->sidecar.alpha_for(static_cast<std::uint32_t>(layer), lane) != 0.0F) {
+                (void)at.alloc(DType::BF16, {dimension(config.hidden_size), last});
+            }
+        };
         for (const auto& block : text.layers) {
+            const auto layer = static_cast<std::size_t>(&block - text.layers.data());
             {
                 auto stage = layout.scope();
                 if (const auto* attention =
@@ -628,6 +643,7 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     if (attention->lora_output) {
                         (void)layout.alloc(DType::BF16, {attention->lora_output->a.rows, last});
                     }
+                    reserve_cut_output(layout, layer, models::AblateParameters::Lane::Attn);
                     add_scratch(layout, attention->output, first, last, wide_verification);
                 } else {
                     const auto& gdn = std::get<execution::GdnParameters>(block.mixer);
@@ -664,10 +680,12 @@ WorkspacePlan build_workspace_plan(const SequencePlanImpl& plan) {
                     (void)workspace::gdn_normalized_output(layout, config, last);
                     // --lora: out_proj's U (gdn_output_lora), held under the output projection's scratch.
                     if (gdn.lora_output) { (void)layout.alloc(DType::BF16, {gdn.lora_output->a.rows, last}); }
+                    reserve_cut_output(layout, layer, models::AblateParameters::Lane::Attn);
                     add_scratch(layout, gdn.output, first, last, wide_verification);
                 }
             }
             auto stage = layout.scope();
+            reserve_cut_output(layout, layer, models::AblateParameters::Lane::Mlp);
             (void)workspace::post_mixer_hidden(layout, config, last);
             const ops::LinearRoutes ffn_routes = plan.execution_schedule.linear_routes;
             const ops::offloaded_moe::WideA16 expert_wide = plan.execution_schedule.expert_wide;
@@ -1349,6 +1367,8 @@ void validate_target_options(const execution::Parameters& parameters,
             throw std::invalid_argument("masked draft window must be in [1,15]");
         }
         break;
+    case SpeculativeBackend::DSpark:
+        throw std::invalid_argument("--spec dspark drafts for Inkling 2 artifacts only");
     }
     const bool tree_table = tree_table_enabled(options.speculative.draft_tree_nodes);
     if (tree_table || options.speculative.draft_tree_auto) {

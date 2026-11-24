@@ -6,6 +6,7 @@
 #include "serve/cors_headers.h"
 #include "launcher/load_advice.h"
 #include "launcher/model_defaults.h"
+#include "launcher/option_support.h"
 #include "launcher/process.h"
 #include "launcher/proxy.h"
 #include "launcher/route_support.h"
@@ -238,6 +239,18 @@ Launcher::Launcher(LauncherOptions options)
             .save_state = [this](const Json& jobs) { store_.set_downloads(jobs); },
         });
 
+    ablation_ = std::make_unique<Ablation>(
+        options_.data_dir, options_.ablate_tool,
+        Ablation::Hooks{
+            .version     = options_.version,
+            .take_gpu    = [this](const std::function<bool()>& abort) { return take_gpu_for_ablation(abort); },
+            .release_gpu = [this] { release_gpu_from_ablation(); },
+            .changed     = [this](const Json& state) { publish("ablation", state); },
+            .event       = [this](const std::string& level, const std::string& message) { event(level, "ablation", message); },
+            .toast       = [this](const std::string& level, const std::string& message) { toast(level, message); },
+            .exported    = [this](const std::filesystem::path& folder) { download_finished(ablation_->sidecars_dir(), folder); },
+        });
+
     model_updates_ = std::make_unique<ModelUpdates>(ModelUpdates::Hooks{
         .jobs    = [this] { return downloads_->list(); },
         .token   = [this] { return store_.hf_token(); },
@@ -323,6 +336,8 @@ void Launcher::stop() {
     events_.close_all();
     model_events_.close_all();
     server_.stop();
+    // An ablation run first: the tool stops its engines (and keeps its finished work) before the GPU is let go.
+    if (ablation_) { ablation_->shutdown(); }
     // A model still loading is abandoned (and stopped by the router's thread) instead of awaited.
     if (supervisor_) { supervisor_->shutdown(); }
     if (router_) { router_->shutdown(); }
@@ -506,7 +521,12 @@ void Launcher::scan_loop() {
 
 Args Launcher::effective_args(const std::string& config_id, const ScannedModel& model, const LibraryScan& scan) const {
     const std::optional<StoredModelConfig> stored = store_.model_config(config_id);
-    if (stored && stored->args) { return *stored->args; }
+    if (stored && stored->args) {
+        // A saved value for an option this model no longer takes never reaches the command line.
+        Args args = *stored->args;
+        strip_unsupported_options(args, model);
+        return args;
+    }
     return model_default_args(model, scan);
 }
 
@@ -573,7 +593,7 @@ Json Launcher::model_config_json(const std::string& config_id, const ScannedMode
     const std::optional<StoredModelConfig> stored = store_.model_config(config_id);
     const bool named            = is_named_config(config_id);
     const Args defaults         = model_default_args(model, scan);
-    const Args args             = stored && stored->args ? *stored->args : defaults;
+    const Args args             = effective_args(config_id, model, scan); // without options this model does not take
     const std::string def_alias = config_default_alias(config_id, model, scan);
     const std::string alias     = stored && stored->alias && !stored->alias->empty() ? *stored->alias : def_alias;
     Json env                    = Json::array();
@@ -627,6 +647,9 @@ Json Launcher::library_json() const {
         }
         for (const ScannedAdapter& adapter : library_.adapters) {
             if (same_or_inside(adapter.path, path, 64)) { bytes += adapter.bytes; }
+        }
+        for (const ScannedSidecar& sidecar : library_.sidecars) {
+            if (inside(sidecar.path)) { bytes += sidecar.bytes; }
         }
         dir["library_bytes"] = bytes;
     }
@@ -708,8 +731,83 @@ std::optional<std::filesystem::path> Launcher::prefix_cache_file(const std::stri
     return options_.data_dir / "launcher-prefix-cache" / (name + ".cache");
 }
 
+namespace {
+constexpr const char* kAblationHoldsGpu =
+    "an ablation run has the GPU (the Ablation page): a model loads once it ends or is stopped";
+}
+
+bool Launcher::ablation_holds_gpu() const { return gpu_gate_.load(); }
+
+bool Launcher::take_gpu_for_ablation(const std::function<bool()>& abort) {
+    {
+        std::lock_guard gate(gpu_gate_mutex_); // after a server start in progress
+        gpu_gate_ = true;
+    }
+    event("info", "ablation", "the ablation run takes the GPU: the model is unloaded, and none loads until the run ends");
+    router_->request_unload();
+    // A load the unload cancelled ends in load_model, whose start it passed (or not) under the gate's lock.
+    while (!stopping_ && !abort()) {
+        const InstanceSnapshot instance = supervisor_->snapshot();
+        if (!router_->loading_model() && (instance.state == InstanceState::Idle || instance.state == InstanceState::Failed)) {
+            publish_instance();
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    release_gpu_from_ablation();
+    return false;
+}
+
+void Launcher::release_gpu_from_ablation() {
+    gpu_gate_ = false;
+    if (router_) { router_->clear_holds(); }
+    publish_instance();
+}
+
+AblationRun Launcher::ablation_run_for(const std::string& config_id) {
+    LibraryScan scan;
+    std::string id;
+    {
+        std::lock_guard lock(library_mutex_);
+        const std::optional<ConfigRef> ref = find_config_locked(config_id);
+        if (!ref) { throw std::invalid_argument("no configuration " + config_id); }
+        id   = ref->id;
+        scan = library_;
+    }
+    const ScannedModel* model = scan.model(artifact_key_of(id));
+    if (model == nullptr) { throw std::invalid_argument("the model is not in the library"); }
+    if (!model->missing_files.empty()) { throw std::invalid_argument(model->file_name + " has missing or incomplete parts"); }
+    if (model->family == "unknown") {
+        throw std::invalid_argument(model->file_name + " is a " + model->model_type + " model, which Infernix does not run");
+    }
+    const std::filesystem::path executable = serve_executable();
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(executable, error)) {
+        throw std::invalid_argument("infernix-serve was not found at " + path_utf8(executable) + " (Settings, Server)");
+    }
+    const ServeOptions serve = serve_options();
+    const TakesValue takes   = [&serve](std::string_view flag) { return serve.takes_value(flag); };
+    Args args                = effective_args(id, *model, scan);
+    strip_managed_flags(args, takes);
+    remove_flag(args, "--ablate", takes); // a fit measures the plain model
+    AblationRun run;
+    run.config_id  = id;
+    run.model_name = effective_alias(id, *model, scan);
+    // Absolute, as the tool starts its engines elsewhere; the other relative paths are the data folder's (--launch-dir).
+    run.argv = {path_utf8(executable), path_utf8(std::filesystem::absolute(model->path, error))};
+    run.argv.insert(run.argv.end(), args.begin(), args.end());
+    for (const auto& [name, value] : effective_env(id)) { run.env.emplace_back(name, value); }
+    return run;
+}
+
 Router::Loaded Launcher::load_model(const std::string& key) {
     Router::Loaded result;
+    if (ablation_holds_gpu()) {
+        // Not a failure of the model: it is not held off once the run ends.
+        result.error     = kAblationHoldsGpu;
+        result.cancelled = true;
+        return result;
+    }
     LibraryScan scan;
     {
         std::lock_guard lock(library_mutex_);
@@ -792,6 +890,13 @@ Router::Loaded Launcher::load_model(const std::string& key) {
             return result;
         }
         try {
+            // Under the gate's lock: an ablation run that takes the GPU waits for this start, and its unload ends it.
+            std::lock_guard gate(gpu_gate_mutex_);
+            if (gpu_gate_) {
+                result.error     = kAblationHoldsGpu;
+                result.cancelled = true;
+                return result;
+            }
             supervisor_->start(spec);
         } catch (const std::exception& failure) {
             result.error = failure.what();
@@ -881,7 +986,8 @@ Json Launcher::instance_json() const {
             {"idle_unload_at", idle_unload_at},
             {"pinned", s.state == InstanceState::Ready && settings.pin_loaded},
             {"memory", memory},
-            {"incident", incident}};
+            {"incident", incident},
+            {"ablation_holds_gpu", ablation_holds_gpu()}};
 }
 
 void Launcher::publish_instance() {

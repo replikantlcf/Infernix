@@ -112,6 +112,7 @@ const char* endpoint_name(std::string_view request_path) noexcept {
     if (path == "/v1/messages") { return "anthropic_messages"; }
     if (path == "/v1/messages/count_tokens") { return "anthropic_count_tokens"; }
     if (path == "/v1/decide" || path == "/v1/systemone") { return "decide"; }
+    if (path == "/v1/score") { return "score"; }
     return "http_route";
 }
 
@@ -684,6 +685,18 @@ void HttpServer::register_routes() {
                      [this](const httplib::Request& req, httplib::Response& res) {
                          handle_decide(req, res);
                      });
+    }
+    server_.Post(api_route_pattern("/score"),
+                 [this](const httplib::Request& req, httplib::Response& res) { handle_score(req, res); });
+}
+
+void HttpServer::require_generation() const {
+    if (service_->engine_options().purpose == infernix::EnginePurpose::CausalScoring) {
+        throw ApiException(ApiError{.status  = 501,
+                                    .type    = "not_supported",
+                                    .message = "this server only scores (--causal-scoring) and generates nothing: "
+                                               "use POST /v1/score",
+                                    .code    = "generation_not_enabled"});
     }
 }
 

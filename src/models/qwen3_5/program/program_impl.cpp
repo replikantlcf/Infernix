@@ -324,6 +324,9 @@ ProgramImpl::ProgramImpl(const execution::Parameters& parameters_in, const Seque
     if (plan.persistent.score_hidden) {
         score_hidden = plan.persistent.score_hidden->bind(backing);
     }
+    if (plan.persistent.score_layer_hidden) {
+        score_layer_hidden = plan.persistent.score_layer_hidden->bind(backing);
+    }
     if (plan.persistent.token_counts) {
         token_counts = plan.persistent.token_counts->bind(backing);
     }
@@ -507,7 +510,7 @@ ProgramImpl::~ProgramImpl() noexcept {
 
 ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t first_target,
                                       const ScoreOptions& options) {
-    if (!causal_scoring || !score_hidden || !score_logprobs_host ||
+    if (!causal_scoring || !score_hidden || !score_layer_hidden || !score_logprobs_host ||
         workspace_plan.causal_score == 0) {
         throw std::logic_error("Program was not constructed for causal scoring");
     }
@@ -569,6 +572,16 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
     std::vector<TokenId> staged_targets;
     staged_targets.reserve(kCausalScoreTile);
     std::uint32_t staged_columns = 0;
+    // ScoreOptions::prompt_hidden_states: every layer's output at the last prompt position, recorded by the text pass
+    // that holds it.
+    std::vector<std::uint8_t> hidden_rows;
+    std::optional<execution::HiddenStateSink> hidden_sink;
+    if (options.prompt_hidden_states) {
+        hidden_rows.assign(parameters.model.config().text.num_hidden_layers, 0);
+        hidden_sink.emplace(execution::HiddenStateSink{.out      = *score_layer_hidden,
+                                                       .position = static_cast<std::int64_t>(first_target) - 1,
+                                                       .rows     = &hidden_rows});
+    }
 
     try {
         state = state_store->reserve_reset(device.stream);
@@ -705,6 +718,7 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
                 0,
                 0,
                 nullptr};
+            schedule_state.hidden_states = hidden_sink ? &*hidden_sink : nullptr;
             mark_workspace_usage(workspace_plan.text_prefill);
             // Offloaded experts: each scored pass is a prompt pass of lane 0.
             execution::OffloadedCall offload_call;
@@ -759,6 +773,22 @@ ScoreResult ProgramImpl::causal_score(PreparedPromptData&& prompt, std::uint32_t
         if (output.logprobs.size() != scored_positions) {
             throw std::logic_error("causal score produced the wrong number of logprobs");
         }
+        if (hidden_sink) {
+            if (std::any_of(hidden_rows.begin(), hidden_rows.end(), [](std::uint8_t n) { return n != 1; })) {
+                throw std::logic_error("the scored prompt's hidden states were not captured once per layer");
+            }
+            const auto values = static_cast<std::size_t>(score_layer_hidden->numel());
+            std::vector<std::uint16_t> raw(values);
+            CUDA_CHECK(cudaMemcpyAsync(raw.data(), score_layer_hidden->data, 2 * values, cudaMemcpyDeviceToHost,
+                                       device.stream));
+            device.synchronize();
+            output.hidden_states.resize(values);
+            output.hidden_state_layers = parameters.model.config().text.num_hidden_layers;
+            for (std::size_t i = 0; i < values; ++i) {
+                const std::uint32_t bits = std::uint32_t{raw[i]} << 16U;
+                std::memcpy(&output.hidden_states[i], &bits, sizeof(bits));
+            }
+        }
         // flush() synchronized: the appends' flag is final.
         if (unpackable != nullptr && std::exchange(*unpackable, 0) != 0) {
             throw std::runtime_error("a K or V row of the scored text has more values outside its exponent window "
@@ -788,7 +818,7 @@ MemorySummary ProgramImpl::memory_summary() const noexcept {
     out.weights = ArenaMemorySummary{weights.device_capacity_bytes, weights.device_capacity_bytes,
                                      weights.device_capacity_bytes};
     out.draft_screen_bytes = parameters.draft_screen.bytes;
-    out.adapter_bytes      = parameters.lora_factors.bytes;
+    out.adapter_bytes      = parameters.allocated_adapter_bytes();
     out.sequence =
         ArenaMemorySummary{persistent.capacity(), persistent.used(), persistent.peak_used()};
     std::size_t active_handoff_bytes = 0;
@@ -845,8 +875,9 @@ MemoryUsage ProgramImpl::memory_usage() const noexcept {
     out.device.weights  = storage.device_capacity_bytes - std::min<std::uint64_t>(storage.device_capacity_bytes, drafter_weight_bytes);
     // With the drafter's proposal-head screen (DFlash2, Parameters::draft_screen: 357.6 MB at 248,320 rows).
     out.device.drafter  = drafter_weight_bytes + persistent_drafter_bytes + parameters.draft_screen.bytes;
-    // --lora: the adapter's factors (Parameters::lora_factors; its per-call U is in the workspace).
-    out.device.adapter  = parameters.lora_factors.bytes;
+    // --lora: the adapter's factors (Parameters::lora_factors; its per-call U is in the workspace); --ablate: the
+    // sidecar's direction (Parameters::ablate).
+    out.device.adapter  = parameters.allocated_adapter_bytes();
     // The KV: the decoder's pages and tables (and an elastic pool's mapped pages), less the pages only the prefix
     // cache holds (each page's share of the KV), which are its part.
     out.device.kv = persistent_kv_bytes + (kv_vmm ? kv_vmm->mapped_bytes() : 0);

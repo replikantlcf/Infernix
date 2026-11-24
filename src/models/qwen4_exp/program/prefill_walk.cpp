@@ -91,6 +91,14 @@ std::size_t ProgramImpl::walk_span_end(const Lane& lane, std::uint32_t index) {
     if (total < static_cast<std::uint32_t>(stream_min_columns())) { return first; }
     const bool one_then_last = end - first == 1U && end + 1 == lane.calls.size() && lane.calls[end] - from >= kWalkJoinMinTokens;
     if (end - first < 2U && !one_then_last) { return first; }
+    // Within the CPU split's width that one call stays chunk-major: its gated stream copies only what it routes and the
+    // CPU serves the rest, where a walk streams every expert a layer lacks, from the SSD too. An agent turn that does
+    // not echo its reply has this shape (a few thousand tokens and the generation opener's last call): prefill of 600-
+    // 3,000 new tokens took 0.40-0.93x the walk's time on Dense8 and FP4-Local (issue #77, design §19.3.42).
+    if (one_then_last && split_policy_ && options_.prefill_cpu_split &&
+        total <= static_cast<std::uint32_t>(split_columns())) {
+        return first;
+    }
     // The prompt's last call, too narrow to stream, joins a
     // span of streamed calls (as its own MoE group, walk_begin), so its experts are read from the span's ring
     // instead of being staged again right after it. It also puts a divergence inside that last call (a /v1/decide
@@ -354,7 +362,10 @@ execution::ForwardBatch ProgramImpl::walk_batch(std::size_t c) {
     fb.stream         = true;
     fb.release_stream = c + 1 == walk_.widths.size();
     fb.stream_whole   = tier_losses() == tier_losses_at_span_;
-    if (scoring_) { fb.residual_out = score_residuals(walk_.begins[c], w); } // a scored prompt's (causal_score)
+    if (scoring_) { // a scored prompt's (causal_score)
+        fb.residual_out = score_residuals(walk_.begins[c], w);
+        set_hidden_capture(fb, walk_.begins[c], w);
+    }
     return fb;
 }
 
@@ -525,7 +536,16 @@ void ProgramImpl::walk_plan_taps(Lane& lane) {
             continue;
         }
         const bool tail   = B % kBlock != 0;
-        const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail));
+        // A tap is a deeper state of the path: on a shortage of Host room its lineage's source gives way.
+        std::optional<pc::SnapshotRef> source;
+        std::span<const TokenId> continuation;
+        if (lane.prefix.resume && prefix_->index().valid(*lane.prefix.resume)) {
+            source                   = *lane.prefix.resume;
+            const std::uint32_t from = prefix_->index().snapshot(*source).frontier;
+            if (from < B) { continuation = std::span<const TokenId>(lane.history.data() + from, B - from); }
+        }
+        const auto staged = prefix_->open_staged_capture(tail, prefix_->index().estimate_priority(deepest, B, tail),
+                                                         source, continuation);
         if (!staged) {
             prefix_retry_tap(lane, B, forward); // no Host room now: due again at the next chunk's end
             continue;

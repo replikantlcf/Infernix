@@ -53,8 +53,9 @@ struct Options {
     std::optional<std::filesystem::path> save_top_tokens;
     std::optional<std::filesystem::path> save_tokens;
     std::optional<std::filesystem::path> kl_reference;
-    std::filesystem::path expert_stripe; // Qwen3.8-Flash-Next's record tails on a second drive
+    std::filesystem::path expert_stripe; // offloaded experts' record tails on a second drive
     std::filesystem::path lora;          // --lora: EngineOptions::lora_path
+    std::filesystem::path ablate;        // --ablate: EngineOptions::ablate_sidecar_path
     float rope_yarn_factor              = 1.0F;
     std::uint32_t context               = 4096;
     std::uint32_t stride                = 2048;
@@ -70,6 +71,7 @@ struct Options {
     bool expert_a4_activations          = false;
     bool expert_a16_activations         = false;
     bool a8_activations                 = false; // EngineOptions::a8_activations
+    bool q8_weights                     = false; // EngineOptions::q8_weights
     bool fast_paths                     = true;
     std::vector<infernix::FastPath> fast_path_candidates;
     std::vector<infernix::FastPath> fast_path_exclusions;
@@ -91,9 +93,12 @@ std::string usage_text() {
            "       [--use-original-nvfp4-prefill-kernel (nvfp4 only; default fast kernel)]\n"
            "       [--lora PATH] (Qwen3.5 dense: a LoRA adapter applied at runtime, a Hugging Face PEFT\n"
            "        adapter directory or its adapter_model.safetensors with adapter_config.json beside it)\n"
-           "       [--lossless] (Qwen3.5/3.6/3.8 and Qwen3.8-Flash-Next: the quality reference's\n"
-           "        route, every operation of the model correctly rounded; no fast path, one\n"
-           "        pass per window: give --prefill-chunk the context; logits as --logits-dtype)\n"
+           "       [--ablate FILE] (an ablation sidecar applied at runtime, every model: its\n"
+           "        sidecar.json with the direction file beside it)\n"
+           "       [--lossless] (Qwen3.5/3.6/3.8, Qwen3.8-Flash-Next and Inkling 2: the quality\n"
+           "        reference's route, every operation of the model correctly rounded; no fast path,\n"
+           "        one pass per window: give --prefill-chunk the context (Inkling 2 always scores a\n"
+           "        window in one pass); logits as --logits-dtype)\n"
            "       [--reference] (the design reference: --lossless with the configuration's declared\n"
            "        steps applied exactly, the activation quantization its artifact permits and\n"
            "        the --kv-dtype's codec; implies --lossless)\n"
@@ -103,6 +108,8 @@ std::string usage_text() {
            "       [--a16-activations] (16-bit activations where the checkpoint specifies fewer\n"
            "        bits: Flash-Next's W4A4 NVFP4 experts, NVIDIA's NVFP4 27B's NVFP4 and FP8 layers)\n"
            "       [--a8-activations] (8-bit activations where infernix-serve's option takes them;\n"
+           "        not on the reproducible or lossless route)\n"
+           "       [--q8-weights] (8-bit weights where infernix-serve's option takes them: Inkling 2;\n"
            "        not on the reproducible or lossless route)\n"
            "       [--reproducible] (score the reproducible route; by default the qualified fast\n"
            "        paths run, as in infernix-serve)\n"
@@ -118,8 +125,9 @@ std::string usage_text() {
            "        evaluator that writes a --kl-reference of the same windows)\n"
            "       [--kl-reference <file>] (KL divergence from a --save-top-tokens run of the\n"
            "        same corpus, context and stride, by context length)\n"
-           "       [--expert-stripe <file>] (Qwen3.8-Flash-Next's expert record tails on a second\n"
-           "        drive, read beside the artifact by the SSD expert tier)\n"
+           "       [--expert-stripe <file>] (offloaded experts, Qwen3.8-Flash-Next and Qwen3.5-122B:\n"
+           "        the expert record tails on a second drive, read beside the artifact by the SSD\n"
+           "        expert tier)\n"
            "       [--log-level trace|debug|info|warning|error|critical|off]\n";
 }
 
@@ -183,10 +191,14 @@ Options parse_options(int argc, char** argv) {
             out.expert_a16_activations = true;
         } else if (option == "--a8-activations") {
             out.a8_activations = true;
+        } else if (option == "--q8-weights") {
+            out.q8_weights = true;
         } else if (option == "--ngram-volume") {
             out.ngram_volume = std::filesystem::path(value("--ngram-volume"));
         } else if (option == "--lora") {
             out.lora = std::filesystem::path(value("--lora"));
+        } else if (option == "--ablate") {
+            out.ablate = std::filesystem::path(value("--ablate"));
         } else if (option == "--reproducible") {
             out.fast_paths = false;
         } else if (option == "--fast-path") {
@@ -338,6 +350,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     infernix::EngineOptions engine_options;
     engine_options.artifact_path    = options.artifact;
     engine_options.lora_path        = options.lora;
+    engine_options.ablate_sidecar_path = options.ablate;
     engine_options.purpose          = infernix::EnginePurpose::CausalScoring;
     engine_options.device           = options.device;
     engine_options.max_context      = options.context;
@@ -352,6 +365,7 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
     engine_options.expert_a4_activations         = options.expert_a4_activations;
     engine_options.expert_a16_activations        = options.expert_a16_activations;
     engine_options.a8_activations                = options.a8_activations;
+    engine_options.q8_weights                    = options.q8_weights;
     // The lossless route runs no fast path.
     engine_options.fast_paths           = options.fast_paths && !options.lossless;
     engine_options.fast_path_candidates = options.fast_path_candidates;
@@ -645,6 +659,9 @@ int run(const Options& options, const std::shared_ptr<spdlog::logger>& logger,
           {"expert_a16_activations", options.expert_a16_activations},
           {"a8_activations", options.a8_activations},
           {"lora_adapter", load.lora_adapter.empty() ? nlohmann::json(nullptr) : nlohmann::json(load.lora_adapter)},
+          {"ablate_sidecar",
+           load.ablate_sidecar.empty() ? nlohmann::json(nullptr) : nlohmann::json(load.ablate_sidecar)},
+          {"q8_weights", options.q8_weights},
           {"fast_paths", load.fast_paths},
           {"fast_path_configuration", load.fast_path_configuration},
           {"stride_tokens", options.stride},

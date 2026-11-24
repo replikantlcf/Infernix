@@ -58,7 +58,15 @@ import { Switch } from "@/components/ui/switch";
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Textarea } from "@/components/ui/textarea";
 import { api } from "@/lib/api";
-import type { EnvVar, Library, LoraAdapter, ModelArtifact, ModelConfig, ServeOption } from "@/lib/api-types";
+import type {
+  AblationSidecar,
+  EnvVar,
+  Library,
+  LoraAdapter,
+  ModelArtifact,
+  ModelConfig,
+  ServeOption,
+} from "@/lib/api-types";
 import { argsToCommandLine, argsToText, getFlagString, hasFlag, sameArgs, setFlag, tokenize } from "@/lib/args";
 import {
   cleanEnv,
@@ -253,11 +261,11 @@ function ContextField({ model, form }: { model: ModelArtifact; form: FormContext
       label="Context length"
       flag="--max-context"
       help={`Tokens per request (prompt and output). Native ${formatInt(model.native_context)}; without the flag the server uses 8,192.${
-        model.offloaded_experts ? "" : " Auto sizes it at startup to the largest the KV cache holds beside the weights."
+        model.option_support.context_auto ? " Auto sizes it at startup to the largest the KV cache holds beside the weights." : ""
       }`}
     >
       <div className="flex flex-wrap items-center gap-1.5">
-        {model.offloaded_experts ? null : (
+        {!model.option_support.context_auto ? null : (
           <button
             type="button"
             onClick={() => set("auto")}
@@ -343,10 +351,17 @@ function ConcurrencyField({ form }: { form: FormContext }) {
 function SpecField({ model, form, specArg }: { model: ModelArtifact; form: FormContext; specArg: string | null | undefined }) {
   const current = getFlagString(form.args, "--spec", form.takesValue);
   const offIsExplicit = (specArg ?? "").split("|").includes("off");
-  const options: { value: string; label: string }[] = [{ value: "auto", label: "Auto (fastest measured drafter)" }];
-  if (model.has_mtp) options.push({ value: "mtp", label: "MTP" });
-  if (model.has_dflash) options.push({ value: "dflash", label: "DFlash" });
-  if (model.has_dflash2 || model.accepts_draft_model) options.push({ value: "dflash2", label: "DFlash2" });
+  const labels: Record<string, string> = {
+    auto: "Auto (fastest measured drafter)",
+    mtp: "MTP",
+    dflash: "DFlash",
+    dflash2: "DFlash2",
+    dspark: "DSpark",
+  };
+  // The drafters this model takes (option_support); `off` is the Off item below.
+  const options = model.option_support.spec_values
+    .filter((value) => value !== "off")
+    .map((value) => ({ value, label: labels[value] ?? value }));
   // UNSET is the Off item; without the flag the server's own default applies.
   const value = current === "off" ? UNSET : current.length > 0 ? current : offIsExplicit ? "auto" : UNSET;
   const choose = (next: string) =>
@@ -548,6 +563,83 @@ function AdapterField({ model, form, library }: { model: ModelArtifact; form: Fo
             Find one on Hugging Face
           </Link>{" "}
           (Harness Hub's for Pi, OpenCode and Hermes, and its super-adapter for all three, among them).
+        </div>
+      ) : null}
+    </FieldShell>
+  );
+}
+
+/** The Select item that shows the path box for a sidecar outside the library. */
+const OTHER_SIDECAR = "__other_sidecar__";
+
+function SidecarField({ model, form, library }: { model: ModelArtifact; form: FormContext; library: Library }) {
+  const current = getFlagString(form.args, "--ablate", form.takesValue);
+  // Fitted on this artifact first, then those that fit its geometry; the others cannot load on it.
+  const fits = library.sidecars
+    .filter((sidecar) => sidecar.compatible_models.includes(model.key))
+    .sort((a, b) => Number(b.fitted_models.includes(model.key)) - Number(a.fitted_models.includes(model.key)));
+  const listed = fits.find((sidecar) => samePath(sidecar.path, current));
+  const [typing, setTyping] = useState(false);
+  const other = typing || (current.length > 0 && !listed);
+  const value = other ? OTHER_SIDECAR : listed ? listed.path : UNSET;
+  const set = (next: string | null) => form.setArgs(setFlag(form.args, "--ablate", next, form.takesValue));
+  const label = (sidecar: AblationSidecar) =>
+    [
+      sidecar.name,
+      sidecar.fitted_models.includes(model.key) ? "fitted on this artifact" : `fitted on ${sidecar.fitted_artifact ?? "another artifact"}`,
+      `cuts ${sidecar.attn_layers} attention + ${sidecar.mlp_layers} MLP layers`,
+    ].join(" · ");
+  return (
+    <FieldShell
+      label="Ablation sidecar"
+      flag="--ablate"
+      help="An ablation sidecar's sidecar.json, with the direction file it names beside it: a direction removed from the attention and MLP outputs of the layers it lists, at the strength it gives each. A sidecar is fitted to one artifact's activations; one fitted on another conversion of the same model may load (the geometry matches) but was not measured there. The start refuses a malformed sidecar, and --lossless. docs/ablate.md"
+    >
+      <Select
+        value={value}
+        onValueChange={(next) => {
+          setTyping(next === OTHER_SIDECAR);
+          if (next !== OTHER_SIDECAR) set(next === UNSET ? null : next);
+        }}
+      >
+        <SelectTrigger aria-label="Ablation sidecar">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={UNSET}>None</SelectItem>
+          {fits.map((sidecar) => (
+            <SelectItem key={sidecar.key} value={sidecar.path}>
+              {label(sidecar)}
+            </SelectItem>
+          ))}
+          <SelectItem value={OTHER_SIDECAR}>A sidecar.json elsewhere…</SelectItem>
+        </SelectContent>
+      </Select>
+      {other ? (
+        <CommitInput
+          value={listed ? "" : current}
+          onCommit={(text) => set(text.trim().length > 0 ? text.trim() : null)}
+          placeholder="The sidecar's sidecar.json"
+          mono
+          ariaLabel="Ablation sidecar path"
+        />
+      ) : null}
+      {listed && !listed.fitted_models.includes(model.key) ? (
+        <div className="flex items-center gap-1.5 text-xs text-warning">
+          <TriangleAlert className="size-3.5 shrink-0" />
+          <span>
+            This sidecar was fitted on {listed.fitted_artifact ?? "another artifact"}: it fits this model's geometry, but its cut
+            was not measured on this artifact.
+          </span>
+        </div>
+      ) : null}
+      {fits.length === 0 ? (
+        <div className="text-xs text-muted-foreground">
+          No sidecar for this model in your folders.{" "}
+          <Link to={`/ablation?model=${encodeURIComponent(model.key)}`} className="font-medium text-foreground underline-offset-4 hover:underline">
+            Make one
+          </Link>{" "}
+          on the Ablation page.
         </div>
       ) : null}
     </FieldShell>
@@ -810,10 +902,11 @@ export function ModelConfigurePage() {
   const commandLine = preview.data?.command_line ?? argsToCommandLine(args);
 
   // The sections this model and this infernix-serve have options for, with how many each sets.
-  const formSections = FORM_SECTIONS.filter((section) => (section.when ? section.when(model) : true))
-    .map((section) => {
-      const controls = section.controls.filter((control) => (control.when ? control.when(model) : true) && available(control.flag));
-      const fields = (section.fields ?? []).filter(available);
+  // What this model takes is the launcher's table (option_support), the same one its launches apply.
+  const shown = (flag: string) => available(flag) && !model.option_support.unsupported.includes(flag);
+  const formSections = FORM_SECTIONS.map((section) => {
+      const controls = section.controls.filter((control) => shown(control.flag));
+      const fields = (section.fields ?? []).filter(shown);
       const flags = [...fields, ...controls.map((control) => control.flag)];
       return { section, controls, fields, setCount: flags.filter((flag) => hasFlag(args, flag, takesValue)).length };
     })
@@ -1061,6 +1154,7 @@ export function ModelConfigurePage() {
                 ) : null}
                 {fields.includes("--ngram-volume") && library ? <NgramVolumeField model={model} form={form} library={library} /> : null}
                 {fields.includes("--lora") && library ? <AdapterField model={model} form={form} library={library} /> : null}
+                {fields.includes("--ablate") && library ? <SidecarField model={model} form={form} library={library} /> : null}
                 <Controls controls={controls} form={form} />
               </Section>
             ))}

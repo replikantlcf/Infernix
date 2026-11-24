@@ -3,10 +3,12 @@
 #include "artifact/framing.h"
 #include "artifact/materializer.h"
 #include "core/host_memory.h"
+#include "models/bf16_packing.h"
 #include "models/qwen3_5/frontend/resources.h"
 #include "models/qwen3_5/load/vision_overlay.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/expert_offload.h"
+#include "models/ablate/binding.h"
 #include "models/qwen4_exp/weights.h"
 #include "ops/offloaded_sparse_moe/cpu/ggml_expert.h"
 #include "ops/offloaded_sparse_moe/cpu/w4a4_expert.h"
@@ -34,22 +36,6 @@ struct InstanceInfo {
 
 class LoadPlan;
 
-// The BF16 projections packed losslessly at load (LoadOptions::pack_bf16; core/weight.h bf16_p12): one device
-// block of their planes and a parent per artifact object, which the bound views address in place of the
-// artifact's BF16 parents (freed after packing).
-struct PackedWeights {
-    DeviceBuffer storage;
-    // Objects packed into pinned host memory (the token embedding, gathered zero-copy), and their bytes.
-    std::unique_ptr<RegisteredHostBuffer> host_storage;
-    std::uint64_t host_bytes = 0;
-    std::vector<std::unique_ptr<WeightParent>> parents;
-    std::uint64_t source_bytes = 0; // the BF16 bytes they replace
-    std::uint64_t escapes      = 0;
-    double seconds             = 0; // packing's wall time
-    // Of which: counts, the block's allocation, packing, freeing the BF16 copies. (The CUDA module load of the
-    // process's first kernel launch, ~2.4 s, is a start's CUDA initialization: load_kernel_images.)
-    double phase_seconds[4] = {};
-};
 
 class Model {
 public:
@@ -116,6 +102,8 @@ public:
     [[nodiscard]] const std::optional<qwen3_5::VisionOverlayAssets>& overlay_vision() const noexcept {
         return overlay_vision_;
     }
+    // LoadOptions::ablate (--ablate, docs/ablate.md): the sidecar read at load; null without one.
+    [[nodiscard]] const AblateSidecarBinding* ablate() const noexcept { return ablate_ ? &*ablate_ : nullptr; }
 
 private:
     friend std::unique_ptr<Model> materialize_model(LoadPlan&&, DeviceContext&,
@@ -143,6 +131,7 @@ private:
     FrontendResources resources_;
     InstanceInfo info_;
     std::optional<qwen3_5::VisionOverlayAssets> overlay_vision_;
+    std::optional<AblateSidecarBinding> ablate_;
 };
 
 } // namespace infernix::models::qwen4_exp

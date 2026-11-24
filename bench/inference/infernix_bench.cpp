@@ -245,6 +245,7 @@ int main(int argc, char** argv) {
         infernix::EngineOptions engine_options;
         engine_options.artifact_path   = options.artifact_path;
         engine_options.lora_path       = options.lora_path;
+        engine_options.ablate_sidecar_path = options.ablate_sidecar_path;
         engine_options.device          = options.device;
         engine_options.max_context     = max_context;
         engine_options.max_concurrency = options.concurrency;
@@ -281,6 +282,7 @@ int main(int argc, char** argv) {
         engine_options.expert_a4_activations = options.expert_a4_activations;
         engine_options.expert_a16_activations = options.expert_a16_activations;
         engine_options.a8_activations        = options.a8_activations;
+        engine_options.q8_weights            = options.q8_weights;
         engine_options.embedding_host        = options.embedding_host;
         engine_options.context_cache.enabled            = false;
         engine_options.context_cache.host_capacity_bytes = 0;
@@ -307,10 +309,12 @@ int main(int argc, char** argv) {
         env.expert_a4_activations        = options.expert_a4_activations;
         env.expert_a16_activations       = options.expert_a16_activations;
         env.a8_activations               = options.a8_activations;
+        env.q8_weights                   = options.q8_weights;
         env.ngram_volume_path            = options.ngram_volume_path;
         env.ngram_residency              = options.ngram_residency;
         env.expert_stripe_path           = options.expert_stripe_path;
         env.lora_path                    = options.lora_path;
+        env.ablate_sidecar_path          = options.ablate_sidecar_path;
         env.expert_state                 = options.expert_state_off           ? std::string("off")
                                            : options.expert_state_path.empty() ? std::string("calibrated")
                                                                                : options.expert_state_path;

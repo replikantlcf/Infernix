@@ -11,6 +11,7 @@
 #include "models/load_options.h"
 #include "models/qwen4_exp/config.h"
 #include "models/qwen4_exp/load.h"
+#include "models/ablate/binding.h"
 #include "runtime/expert_offload/expert_residency.h"
 #include "runtime/expert_offload/host_slot_pool.h"
 #include "runtime/expert_offload/memory_plan.h"
@@ -62,6 +63,17 @@ void report(const EngineOptions& options, DiagnosticLevel level, const std::stri
     report_engine(options, level, text);
 }
 
+// --ablate (docs/ablate.md): the startup log names the cut applied, and warns when the sidecar names another artifact
+// as the one its direction was fitted on (the geometry matches, so it loads, but it was not measured here).
+void report_ablate(const EngineOptions& options, const models::qwen4_exp::Model& model) {
+    const models::AblateSidecarBinding* ablate = model.ablate();
+    if (ablate == nullptr) { return; }
+    report(options, DiagnosticLevel::Info, "ablation sidecar " + ablate->path.string() + ": " + ablate->describe());
+    if (const std::string warning = ablate->artifact_mismatch(model.info().artifact_id); !warning.empty()) {
+        report(options, DiagnosticLevel::Warning, warning);
+    }
+}
+
 // The fast paths and --a8-activations' routes are chosen from the stored formats the load plan records
 // (TextConfig::dense_format, expert_format, ggml_projections) before any weight is read; the bound
 // Parameters must agree, or a route chosen for one format would run on another.
@@ -107,14 +119,16 @@ models::qwen3_5::FrontendOptions frontend_options(const EngineOptions& options) 
 // (check_expert_vram), into plan.vram, with the frames the Program sizes from that check less its
 // pools' chunk slack, and the largest --max-context whose device plan still leaves the expert cache
 // room (the check passes) with the other options as given. An explicit KV capacity equal to
-// --max-context (infernix-serve's default without the prefix cache) follows the context.
+// --max-context (infernix-serve's default without the prefix cache) follows the context. `adapter` is the device
+// memory beside the dense weights (an --ablate sidecar's direction), counted as a start counts it.
 void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
                         const models::qwen4_exp::ProgramOptions& program_options, const models::qwen4_exp::Config& config,
-                        std::uint32_t public_tokens, std::uint64_t dense, const VramSnapshot& before) {
+                        std::uint32_t public_tokens, std::uint64_t dense, std::uint64_t adapter, const VramSnapshot& before) {
     const auto device_plan = models::qwen4_exp::Program::plan_device(program_options, config, public_tokens);
     const ExpertVramCheck check =
-        size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(), device_plan.graph_bound,
-                         device_plan.expert_frame_bytes, device_plan.max_frames, device_contributors(dense, device_plan));
+        size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + adapter + device_plan.fixed_bytes(),
+                         device_plan.graph_bound, device_plan.expert_frame_bytes, device_plan.max_frames,
+                         device_contributors(dense, device_plan));
     const std::uint32_t slack = expert_offload::pool_slack_frames(
         config.text.expert_frame_pools, expert_offload::ExpertResidency::kChunkBytes, device_plan.expert_frame_bytes);
     EnginePlanVram& vram           = plan.vram;
@@ -129,7 +143,8 @@ void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
     vram.headroom_bytes            = check.sizing.headroom;
     vram.expert_frames             = check.sizing.frames > slack ? check.sizing.frames - slack : 0U;
     vram.expert_cache_bytes        = static_cast<std::uint64_t>(*vram.expert_frames) * device_plan.expert_frame_bytes;
-    vram.planned_bytes             = dense + device_plan.fixed_bytes() + *vram.expert_cache_bytes;
+    if (adapter != 0) { vram.adapter_bytes = adapter; }
+    vram.planned_bytes             = dense + adapter + device_plan.fixed_bytes() + *vram.expert_cache_bytes;
     const std::uint64_t used       = vram.planned_bytes + check.sizing.headroom + check.sizing.reserve;
     vram.left_bytes                = before.device_free > used ? before.device_free - used : 0;
     if (!check.refusal.empty()) { plan_refuse(plan, check.refusal); }
@@ -141,7 +156,7 @@ void plan_device_memory(EnginePlan& plan, const EngineOptions& options,
         trial.max_context                       = context;
         if (kv_follows) { trial.kv_capacity_tokens = context; }
         const auto trial_plan = models::qwen4_exp::Program::plan_device(trial, config, public_tokens);
-        return size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + trial_plan.fixed_bytes(),
+        return size_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + adapter + trial_plan.fixed_bytes(),
                                 trial_plan.graph_bound, trial_plan.expert_frame_bytes, trial_plan.max_frames, {})
             .refusal.empty();
     });
@@ -662,6 +677,8 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     const auto device_plan =
         models::qwen4_exp::Program::plan_device(program_options, plan.config(), plan.public_token_count());
     const std::uint64_t dense = plan.device_bytes();
+    // --ablate: the sidecar's direction, beside the dense weights (the Parameters allocate it before the frames).
+    const std::uint64_t adapter = plan.ablate() != nullptr ? plan.ablate()->device_bytes() : 0;
     const VramSnapshot before = vram->query();
     if (plan_only) {
         EnginePlanRam& planned_ram = planned->ram;
@@ -678,7 +695,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
                                                    : models::qwen4_exp::NgramVolume::cache_bytes(table);
         planned_ram.ngram_residency = ngram_in_ram ? NgramResidency::Ram : NgramResidency::Volume;
         plan_ram_totals(*planned, ram.ledger.planned + ram.ledger.expert_ram);
-        plan_device_memory(*planned, options, program_options, plan.config(), plan.public_token_count(), dense,
+        plan_device_memory(*planned, options, program_options, plan.config(), plan.public_token_count(), dense, adapter,
                            before);
         // A start meets the pinned block's check in the load, after the VRAM check.
         if (std::string shortfall = artifact::pinned_shortfall(plan.materialization(), available_host_memory_bytes());
@@ -689,7 +706,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         (void)models::qwen3_5::make_frontend(plan.resources(), frontend_options(options));
         return {};
     }
-    (void)check_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + device_plan.fixed_bytes(),
+    (void)check_expert_vram(options, "Qwen3.8-Flash-Next", before, dense + adapter + device_plan.fixed_bytes(),
                             device_plan.graph_bound, device_plan.expert_frame_bytes, device_plan.max_frames,
                             device_contributors(dense, device_plan));
 
@@ -727,6 +744,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     auto instance = std::make_unique<Qwen4ExpInstance>(std::move(model), options);
     frontend.complete();
     check_selection_formats(instance->parameters, instance->model->config());
+    report_ablate(options, *instance->model);
 
     // The fast paths selected before the load.
     program_options.fast_paths        = fast.forward();
@@ -919,6 +937,9 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     LoadSummary summary;
     summary.architecture         = std::string(models::architecture_name(models::Architecture::Qwen4Exp));
     summary.model_name           = instance->model->info().name;
+    if (const auto* ablate = instance->model->ablate()) {
+        summary.ablate_sidecar = ablate->path.string() + ": " + ablate->describe();
+    }
     summary.load_seconds         = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
     summary.upload_seconds       = stats.upload_seconds;
     summary.artifact_bytes_read  = stats.read_bytes;

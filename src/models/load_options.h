@@ -48,6 +48,8 @@ struct LoadOptions {
     std::filesystem::path draft_model;
     // Qwen3.5: the LoRA adapter applied at runtime (EngineOptions::lora_path), empty for none.
     std::filesystem::path lora;
+    // Every model: the ablation sidecar applied at runtime (EngineOptions::ablate_sidecar_path), empty for none.
+    std::filesystem::path ablate;
     // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
     // artifact without them loads as before): the MTP drafter's proposal head (Generation with --spec mtp
     // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected; the Qwen4Exp
@@ -57,20 +59,24 @@ struct LoadOptions {
     bool proposal_head_screen = false;
     bool lm_head_screen       = false;
     bool screened_lm_head     = false;
-    // Qwen3.5 (EngineOptions::embedding_host): the token embedding stays in pinned host memory, gathered
-    // zero-copy, as an artifact with offloaded experts already keeps it.
+    // Qwen3.5 and Inkling 2 (EngineOptions::embedding_host): the token embedding stays in pinned host memory,
+    // gathered zero-copy, as an artifact with offloaded experts already keeps it.
     bool embedding_host = false;
     // --spec mtp generation off the lossless route (candidates §22 VM-01 variant B): the MTP drafter's routed experts
     // stay in pinned host memory and its draft steps route among the experts a pool of device slots holds
     // (runtime/expert_offload/drafter_pool.h), where the model can pool them: Qwen4Exp, and Qwen3.5 with offloaded
     // experts, each with its measured slot count (Config::mtp_expert_slots). False: the bank is device-resident.
     bool mtp_expert_pool = false;
-    // Qwen4Exp off the lossless route: the BF16 weights whose every reader takes bf16_p12 are packed losslessly at
-    // load (core/weight.h), and their BF16 copies freed.
+    // Qwen4Exp and Inkling 2 off the lossless route: BF16 weights whose every reader takes bf16_p12 are packed
+    // losslessly at load (core/weight.h), and their BF16 copies freed (Inkling 2: the head only, the set measured
+    // faster; nothing under q8_weights).
     bool pack_bf16 = false;
     // Qwen4Exp --a8-activations with fast paths: a GGUF import's hyper-connection matrices are repacked to Q8 at load
     // (execution::Parameters' hc_q8), so its mixers stay BF16 for that repack; every other artifact's mixers pack.
     bool hc_q8_repack = false;
+    // Inkling 2 --q8-weights (EngineOptions::q8_weights): the fused attention input projections and the head become
+    // Q8 at load (models/q8_weights.h), and the head is not packed.
+    bool q8_weights = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -107,6 +113,8 @@ struct LoadOptions {
             return "dflash";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
+        case SpeculativeBackend::DSpark:
+            return "dspark";
         }
         return {};
     }
@@ -140,6 +148,7 @@ struct LoadOptions {
             .expert_csf               = options.expert_csf,
             .draft_model              = options.speculative.draft_model,
             .lora                     = options.lora_path,
+            .ablate                   = options.ablate_sidecar_path,
             // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).
             .proposal_head_screen     = architecture == Architecture::Qwen4Exp &&
                                     options.purpose == EnginePurpose::Generation &&
@@ -156,9 +165,12 @@ struct LoadOptions {
             // width-invariant and sampling Gumbel-max). No speculation is lossless.
             .mtp_expert_pool = !options.lossless && options.purpose == EnginePurpose::Generation &&
                                options.speculative.backend == SpeculativeBackend::Mtp,
-            .pack_bf16       = architecture == Architecture::Qwen4Exp && !options.lossless,
+            .pack_bf16 = (architecture == Architecture::Qwen4Exp || architecture == Architecture::Inkling2Loop) &&
+                         !options.lossless,
             .hc_q8_repack    = architecture == Architecture::Qwen4Exp && options.a8_activations && !options.lossless &&
-                            options.fast_paths};
+                            options.fast_paths,
+            .q8_weights = architecture == Architecture::Inkling2Loop && options.q8_weights && !options.lossless &&
+                          options.fast_paths};
 }
 
 } // namespace infernix::models

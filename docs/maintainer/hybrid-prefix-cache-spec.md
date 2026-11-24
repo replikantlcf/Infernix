@@ -56,7 +56,7 @@ be positive, §17); every other value is derived from the rest of the configurat
 | §7.9 next-turn prefill | implemented 2026-10-27 (`--cache-next-turn-ms`; default on for Qwen3.5, off for Qwen3.8-Flash-Next and refused on its reproducible route): host tests pass; real scenarios `next-turn` / `next-turn-reproducible` (27B) pass; Flash-Next's reproducible resume from the pass was not exact, and its reproducible route keeps no tap where a lane ends (§7.9); the agentic replay A/B is outstanding |
 | §6.2 cost model | implemented: the Engine's context-cost coefficients (prefill and Host-to-Device transfer) rank sources and value snapshots |
 | §5.5 persistence across restarts | implemented (opt-in `--prefix-cache-file`) |
-| §5.7 SSD tier | implemented 2026-11-06 (opt-in `--ssd-context-gib` with `--ssd-context-dir`), both bindings; the write policy 2026-11-07 (fate counters, Qwen4Exp's ring left out, the image codec, `--ssd-context-gib-per-hour`): host-only unit tests (index write-back, demotion, promotion, SSD eviction order, partial and packed copies, a randomized stress with invariant checks), `infernix_ssd_tier_test` (bytes through a real scratch file, the codec's exactness, packed and partial copies, the write budget), `infernix_direct_scratch_file_test`, real scenarios `ssd-restore`/`ssd-restore-mtp` (27B) and `--ssd` (Flash-Next, also with DFlash2), timing `--ssd-scale` (§16.9) |
+| §5.7 SSD tier | implemented 2026-11-06 (opt-in `--ssd-context-gib` with `--ssd-context-dir`), both bindings; the write policy 2026-11-07 (fate counters, Qwen4Exp's ring left out, the image codec, `--ssd-context-gib-per-hour`): host-only unit tests (index write-back, demotion, promotion, SSD eviction order, partial and packed copies, a randomized stress with invariant checks), `infernix_ssd_tier_test` (bytes through a real scratch file, the codec's exactness, packed and partial copies, the write budget), `infernix_direct_scratch_file_test`, real scenarios `ssd-restore`/`ssd-restore-mtp` (27B) and `--ssd` (Flash-Next, also with DFlash2), timing `--ssd-scale` (§16.9); Inkling 2's binding 2026-11-23 (`infernix_inkling2_prefix_cache_real_test`'s SSD case; not timed) |
 | §12.2 in-flight prefix coalescing | implemented: requests sharing a new prefix with a lane still prefilling wait for its snapshot at the divergence instead of prefilling the prefix again |
 | §7.2–§7.3 zero-split GDN state tap and phase alignment | not implemented as specified: an exact tap costs one prefill split (about 15 ms per turn on 27B); flexible taps avoid it, and requests resuming from an endpoint skip the opener tap (§7.1). The generation opener's tap, in a prompt's last pass, is taken without the split: the Qwen3.5 binding's pair window (§7.10, 2026-11-17) and the Qwen4Exp binding's pair call (Flash-Next design §19.3.56) |
 | §11.2 KV transfer Op | copy-engine path only: a restore enqueues one copy per block and plane as one `cudaMemcpyBatchAsync` per model layer; write-through moves runs of consecutive pages and slabs as one `cudaMemcpy2DAsync` per plane |
@@ -1583,7 +1583,43 @@ Allocation of `k` slabs:
 
 A snapshot image write stops at step 3 when the victim is worth more than the new snapshot
 (`H(victim) > H(new)`): GDSF never inserts what it would evict next, and the new snapshot stays
-Device-only (§9.2). KV block writes (write-through) are not bounded this way.
+Device-only (§9.2).
+
+A KV block write (write-through) takes a slab only from what no resume needs: free slabs, dead blocks,
+copies the SSD tier also holds and superseded snapshots. It never evicts a retained snapshot. Without an
+SSD tier it also leaves one image and its tail free for the lineage's next capture (with one, a capture
+makes its room losslessly, §5.7). A block it cannot place stays Device-only and is written by a later
+release if room appears. The block's Device copy serves until it
+is evicted, while a retained snapshot's Host image may be its only copy (always on Qwen3.8-Flash-Next).
+Before 2026-11-23 these writes had an infinite claim: on a tier smaller than one conversation's blocks
+plus an image (1 GiB holds 1,149 Flash-Next INT8 slabs, so about 65.5K tokens), a turn's own write-through
+evicted the snapshot its next turn needed, and that turn re-prefilled from the root (issue #77).
+
+On Qwen3.8-Flash-Next a capture reserves its image before it lands, so when the tier has no room its own
+lineage gives way first. A tap, or an endpoint after the turn's tap, supersedes the snapshot the lane
+resumed from. An endpoint that is the turn's first capture does so unless the conversation is known not
+to resume at endpoints (it continued only a generation opener) or the request was cancelled, because the
+client usually drops a cancelled reply and its next turn reads that source. In a lineage that resumes at
+endpoints the endpoint also supersedes the
+turn's generation-opener tap once it publishes. A supersession made for room is undone when the capture
+is refused or abandoned, and when a turn's first capture publishes nothing. One made by a later capture
+stays if that capture's publication is refused: the turn's earlier capture is the deeper state.
+
+Measured on the RTX 5090 (2026-11-23, INT8 KV, the old and new rules in one build; share of the prompt
+tokens recomputed after each run's first turn):
+
+| Workload | Host tier | Before | After |
+|---|---|---|---|
+| Flash-Next Dense8, one conversation 45K to 86K, client strips thinking | 1 GiB | 49.5 % | 3.5 % |
+| Same, client echoes its replies | 1 GiB | 49.0 % | 3.4 % |
+| Qwen3.8-27B, one conversation, client strips thinking | 2 GiB | 8.6 % | 3.5 % |
+| Same, client echoes its replies (never lost its endpoint) | 2 GiB | 3.5 % | 3.5 % |
+| `bench/agentic_ab` (131 requests, greedy), Flash-Next Dense8 | 7.5 GiB | 12.4 % | 11.1 % |
+| `bench/agentic_ab` (131 requests, greedy), Qwen3.8-27B | 4 GiB | 61.1 % | 20.6 % |
+
+The Flash-Next conversations went from seven full re-prefills to none (worst time to first token 10.3 s to
+3.5 s with a client stripping thinking, 2.6 s with one echoing). The agentic replay's conversations drift
+apart between runs, so its rows compare shares of slightly different prompt totals.
 
 **Jointly feasible eviction (2026-11-14, after NInfer).** Evicting one victim at a time lost victims
 even when the rest could not free enough: a pause's resume point against a Host tier of held

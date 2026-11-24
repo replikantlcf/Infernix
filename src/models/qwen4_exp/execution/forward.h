@@ -224,6 +224,12 @@ struct ForwardBatch {
     // columns): the head's logits come from ops::screened_head_logits.
     bool screened_head = false;
     Tensor residual_out;                   // when set: BF16 [S*H, T] copy of the final residual
+    // A scored prompt's hidden states (ScoreOptions::prompt_hidden_states): when hidden_column >= 0, that column of the
+    // call writes layer L + 1's mixer input into hidden_out's column L and the last layer's MoE input into its last
+    // column (BF16 [H, layers]), counting each row it writes in (*hidden_rows)[L].
+    Tensor hidden_out;
+    std::int32_t hidden_column                = -1;
+    std::vector<std::uint8_t>* hidden_rows    = nullptr;
     // DFlash2 target features (docs/maintainer/dflash.md): when set, BF16 [taps * H, n] receives,
     // for the call's last n columns, the stream mean of each tapped layer's completed residual
     // (tap i at rows [i * H, (i + 1) * H)). n <= T.
@@ -397,6 +403,8 @@ public:
     // residual columns (BF16 [S*H, n]) into that tap's rows of `features` (BF16 [taps * H, n], any
     // column pitch); layer() applies it to ForwardBatch::draft_features, a layer walk to its spans.
     void capture_draft_features(std::uint32_t layer, const Tensor& residual, const Tensor& features);
+    // ForwardBatch::hidden_out: column batch.hidden_column of `x` (BF16 [H, T]) into hidden_out's column `row`.
+    void capture_hidden(const ForwardBatch& batch, std::uint32_t row, const Tensor& x);
 
     // Runs the MTP drafter (requires MTP parameters and state).
     void run_mtp(const MtpCall& call);
@@ -495,6 +503,10 @@ private:
                                            const Tensor& xm, const Tensor& inject, Tensor& residual,
                                            std::int32_t route_columns, std::int32_t route_skipped, std::int32_t chunk_columns,
                                            TrimmedCall trimmed = {});
+    // A lane's output injected into the residual streams: hyper_connection_inject, or with an --ablate cut on this
+    // layer's lane (Parameters::ablate_cut) its cut inject. Without --ablate it is the plain inject, unchanged.
+    void inject_lane(const Tensor& y, std::uint32_t layer, AblateParameters::Lane lane, const Tensor& inject,
+                     Tensor& residual, cudaStream_t stream) const;
     template <class A> void finish_impl(A& a, const ForwardBatch* batch, const FinishShape& shape, Tensor& residual,
                                         Tensor* logits);
     template <class A> void ple_impl(A& a, const PleParameters& p, Tensor& residual, const ForwardBatch* batch,

@@ -42,6 +42,27 @@ struct NullTap {
     [[nodiscard]] static constexpr bool reads_layer(int) noexcept { return false; }
 };
 
+// Causal scoring's hidden-state capture (ScoreOptions::prompt_hidden_states): every layer's output residual (the
+// residual after layer L) at one absolute prompt position, into column L of `out` (BF16 [H, layers]); rows[L] counts
+// the writes. The prefill tells it each window's first position and width (begin_window).
+struct HiddenStateSink {
+    static constexpr bool enabled = true;
+    Tensor out;
+    std::int64_t position           = -1;
+    std::vector<std::uint8_t>* rows = nullptr;
+    std::int64_t window_first       = 0;
+    std::int32_t window_columns     = 0;
+
+    // Every layer is read, so the last layer's tail runs over every column (YC-01 trims none).
+    [[nodiscard]] static constexpr bool reads_layer(int) noexcept { return true; }
+    void begin(const Tensor&) noexcept {}
+    void begin_window(std::int64_t first, std::int32_t columns) noexcept {
+        window_first   = first;
+        window_columns = columns;
+    }
+    void capture_layer(int layer, const Tensor& value, cudaStream_t stream);
+};
+
 struct PrefillChunkResult {
     std::uint32_t processed_tokens = 0;
     bool finalized                 = false;
@@ -208,6 +229,10 @@ public:
                                                    std::uint32_t begin,
                                                    std::uint32_t nominal_length,
                                                    bool finalize_at_end, DFlashFeatureSink& sink);
+    [[nodiscard]] PrefillChunkResult prefill_chunk(std::span<const int> full_ids,
+                                                   std::uint32_t begin,
+                                                   std::uint32_t nominal_length,
+                                                   bool finalize_at_end, HiddenStateSink& sink);
     [[nodiscard]] PrefillChunkResult
     prefill_chunk(const qwen3_5::PreparedPromptData& input, std::uint32_t begin,
                   std::uint32_t nominal_length, VisionPrefillSession& vision, bool finalize_at_end);
@@ -269,10 +294,20 @@ private:
     [[nodiscard]] PagedKVBatchLayerView mtp_kv_batch_layer() const;
     [[nodiscard]] PagedKVLayerView mtp_kv_layer() const;
 
-    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
-    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase);
+    void attn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase, std::size_t layer);
+    void gdn_mix(const BlockParameters& weights, Tensor& x, int index, Phase phase, std::size_t layer);
+    // The mixer's output projection added to the residual (ops::linear_add). On a layer whose attention lane an
+    // --ablate sidecar cuts (docs/ablate.md), the same call between a copy of the residual columns it writes and
+    // ops::residual_delta_cut; without a cut, the plain call alone.
+    void add_output_projection(const Tensor& input, const Weight& weight, Tensor& residual, ops::LinearPolicy policy,
+                               ops::LinearRoutes routes, const ops::LoraAddend* lora, std::size_t layer);
+    // The post-mixer norm and MLP added to x (mlp_write); a cut MLP lane wraps it as add_output_projection does.
     void mlp_tail(const BlockParameters& weights, Tensor& x, Phase phase,
                   const ops::SparseMoeHints& hints, std::size_t layer);
+    void mlp_write(const BlockParameters& weights, Tensor& x, Phase phase, const ops::SparseMoeHints& hints,
+                   std::size_t layer);
+    // --ablate: a workspace copy of the residual columns a cut lane is about to write (the planner reserves it).
+    [[nodiscard]] Tensor snapshot_residual(const Tensor& residual);
     [[nodiscard]] ops::SparseMoeHints next_projection_hints(int layer) const;
     // Per-request width of a bound sequence batch; an unbatched call is one row of all columns.
     [[nodiscard]] std::int32_t row_width(std::int32_t columns) const noexcept {

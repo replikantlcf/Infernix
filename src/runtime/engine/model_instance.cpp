@@ -1,4 +1,5 @@
 #include "runtime/engine/model_instance.h"
+#include "artifact/ablate_sidecar.h"
 #include "artifact/reader.h"
 #include "artifact/formats.h"
 #include "artifact/materializer.h"
@@ -72,6 +73,11 @@ void validate_engine_options(const EngineOptions& options, models::Architecture 
                                         "offloaded), and Infernix applies LoRA adapters to the dense Qwen3.5-family "
                                         "models (the 27B) only");
         }
+    }
+    // The lossless route computes the model's own forward correctly rounded; a cut is not part of it. Refused here,
+    // before anything loads.
+    if (!options.ablate_sidecar_path.empty() && options.lossless) {
+        throw std::invalid_argument("--ablate does not combine with --lossless (docs/ablate.md)");
     }
     // An automatic context takes all the VRAM the KV pool may have: offloaded experts size their cache from what
     // the fixed allocations leave, so it would starve the expert cache.
@@ -253,6 +259,13 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     out += ";lossless=" + std::to_string(options.lossless ? 1 : 0);
     // The 8-bit activation routes change the KV and state their calls write (decode, short and prefill calls).
     if (options.a8_activations) { out += ";a8"; }
+    const auto stamp = [](const std::filesystem::path& file) {
+        std::error_code e;
+        const auto bytes = std::filesystem::file_size(file, e);
+        const auto when  = std::filesystem::last_write_time(file, e);
+        return std::filesystem::absolute(file).string() + ":" + std::to_string(e ? 0U : bytes) + ":" +
+               std::to_string(e ? 0 : when.time_since_epoch().count());
+    };
     // A LoRA adapter changes every adapted projection: its weights file and configuration name it as the artifact's
     // path, size and time do.
     if (!options.lora_path.empty()) {
@@ -260,14 +273,13 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
                                                   ? options.lora_path / "adapter_model.safetensors"
                                                   : options.lora_path;
         const std::filesystem::path config = weights.parent_path() / "adapter_config.json";
-        const auto stamp = [&](const std::filesystem::path& file) {
-            std::error_code e;
-            const auto bytes = std::filesystem::file_size(file, e);
-            const auto when  = std::filesystem::last_write_time(file, e);
-            return std::filesystem::absolute(file).string() + ":" + std::to_string(e ? 0U : bytes) + ":" +
-                   std::to_string(e ? 0 : when.time_since_epoch().count());
-        };
         out += ";lora=" + stamp(weights) + "|" + stamp(config);
+    }
+    // An ablation sidecar changes the residual writes of every layer it cuts: the sidecar and its direction file name
+    // it the same way.
+    if (!options.ablate_sidecar_path.empty()) {
+        out += ";ablate=" + stamp(options.ablate_sidecar_path) + "|" +
+               stamp(artifact::AblateSidecar::direction_path(options.ablate_sidecar_path));
     }
     // Tail skip leaves experts out of decode and verification rounds, so the KV and state those rounds wrote
     // (endpoints, continued turns) differ from what a run without it computes, and the reverse.
@@ -282,16 +294,6 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
 }
 
 namespace {
-
-// The free device memory a start sizes its KV against: cudaMemGetInfo's, bounded under WDDM by the OS
-// budget less this process's usage, as the expert frames are (size_expert_frames). The two differ (an RTX
-// 5090: 24.10 GiB free against 21.88 the budget left, Basalt #28), and a KV sized past the budget is
-// demoted to system memory, which the Program's spill guard refuses at startup (candidates VR-04).
-std::size_t free_device_bytes(const VramSnapshot& s) {
-    if (!s.has_budget) { return s.device_free; }
-    const std::uint64_t left = s.local_budget > s.local_usage ? s.local_budget - s.local_usage : 0U;
-    return static_cast<std::size_t>(std::min<std::uint64_t>(s.device_free, left));
-}
 
 // What a start resolves its KV capacity in (kv_available_bytes): an automatic capacity leaves `headroom` of
 // free device memory and, of the OS budget, the expert frames' margin (size_expert_frames) with the retry's
@@ -429,8 +431,12 @@ void plan_qwen3_5_program(EnginePlan& plan, const EngineOptions& options, const 
         }
     }
     if (offload != nullptr) {
+        // Not yet on the device: the weights and what a start allocates beside them before its frames. On the 122B
+        // that is an --ablate sidecar's direction (12 KiB shared, 576 KiB per layer: under one frame); it takes no
+        // --lora, and its DFlash2 head (hidden size 3072) has no draft screen.
         const OffloadedFrames estimate =
-            estimate_offloaded_frames(*instance.model, sequence, reservation, vram.weights_bytes,
+            estimate_offloaded_frames(*instance.model, sequence, reservation,
+                                      vram.weights_bytes + planned_beside_weights_bytes(vram),
                                       open_vram_budget_source(device.device, options.vram_past_budget)->query(),
                                       *offload, device);
         vram.expert_frames      = estimate.frames;
@@ -570,6 +576,7 @@ void resolve_auto_speculative_backend(EngineOptions& options, models::Architectu
     case SpeculativeBackend::Mtp: break;
     case SpeculativeBackend::DFlash: chosen = "dflash"; break;
     case SpeculativeBackend::DFlash2: chosen = "dflash2"; break;
+    case SpeculativeBackend::DSpark: chosen = "dspark"; break;
     case SpeculativeBackend::None:
         // Nothing to draft with: plain decode, and every drafter setting goes with the drafter (copy
         // proposals stay where the model verifies them alone).
@@ -597,7 +604,26 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     switch (options.purpose) {
     case EnginePurpose::Generation:
         break;
-    case EnginePurpose::CausalScoring:
+    case EnginePurpose::CausalScoring: {
+        // Scoring runs one teacher-forced call at a time, without speculation, vision, CUDA Graphs or the prefix
+        // cache. A server started for scoring with a generation configuration (the launcher's defaults name lanes
+        // and a drafter) says which of its settings that leaves unused rather than refusing them.
+        std::string ignored;
+        const auto ignore = [&ignored](const std::string& what) { ignored += (ignored.empty() ? "" : ", ") + what; };
+        if (options.max_concurrency > 1) { ignore("--max-concurrency " + std::to_string(options.max_concurrency)); }
+        const SpeculativeOptions& spec = options.speculative;
+        if (spec.backend != SpeculativeBackend::None || spec.backend_auto || !spec.draft_model.empty() ||
+            spec.ngram_draft_tokens != 0 || spec.ngram_draft_tokens_auto) {
+            ignore("speculative decoding (--spec, --draft-model, --ngram-draft-tokens)");
+        }
+        if (options.enable_vision) { ignore("vision"); }
+        if (!options.context_cache.hybrid.persistent_file.empty()) { ignore("--prefix-cache-file"); }
+        if (!ignored.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "causal scoring runs one request at a time without speculation, vision or the prefix "
+                               "cache: %s unused",
+                               ignored.c_str());
+        }
         options.max_concurrency      = 1;
         options.max_pending_requests = 1;
         options.kv_capacity         = KvCapacityPolicy::explicit_capacity(options.max_context);
@@ -606,6 +632,7 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
         options.use_cuda_graph       = false;
         options.context_cache        = ContextCacheOptions{.enabled = false};
         break;
+    }
     default:
         throw std::invalid_argument("Engine purpose is invalid");
     }
@@ -701,6 +728,8 @@ EngineOptions normalize_engine_options(EngineOptions options, models::Architectu
     if (options.a8_activations && !options.fast_paths) {
         throw std::invalid_argument("--a8-activations is approximate; the reproducible route (--reproducible) refuses it");
     }
+    // Inkling 2's options are normalized apart (inkling2_instance.cpp): every artifact reaching here refuses it.
+    if (options.q8_weights) { throw std::invalid_argument("--q8-weights applies to Inkling 2 artifacts only"); }
     // An automatic draft length chooses up to the model's most drafts unless given a ceiling: MTP on
     // Qwen3.8-Flash-Next verifies 8 columns column-invariantly, the Qwen3.5 planner captures 5. The
     // block drafters propose their whole block: Qwen3.8-Flash-Next's DFlash2 7; the Qwen3.5 planner
@@ -1232,14 +1261,26 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
                            lora->adapter->weights_path().parent_path().string().c_str(), lora->describe().c_str(),
                            static_cast<unsigned long long>((instance->parameters.lora_bytes() + (1U << 20) - 1) >> 20));
     }
+    // --ablate: the cut applied, and a warning when the sidecar was fitted on another artifact.
+    if (const auto* ablate = instance->model->ablate()) {
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "ablation sidecar %s: %s",
+                           ablate->path.string().c_str(), ablate->describe().c_str());
+        if (const std::string warning = ablate->artifact_mismatch(instance->model->info().artifact_id); !warning.empty()) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning, "%s", warning.c_str());
+        }
+    }
     if (spill) {
         const std::uint64_t screen = instance->parameters.draft_screen.bytes;
-        const std::uint64_t lora   = instance->parameters.lora_factors.bytes;
+        const std::uint64_t lora   = instance->parameters.allocated_adapter_bytes();
         const std::uint64_t beside = screen + lora;
         if (const std::uint64_t spilled = beside != 0 ? spill->end(beside, 0) : 0; spilled != 0) {
-            const char* what = screen != 0 && lora != 0 ? "the DFlash2 draft screen and the LoRA adapter's factors"
-                               : screen != 0           ? "the DFlash2 draft screen"
-                                                       : "the LoRA adapter's factors";
+            // --ablate's direction counts beside a LoRA adapter's factors (Parameters::allocated_adapter_bytes).
+            const char* adapter = instance->parameters.lora_factors.bytes != 0 ? "the LoRA adapter's factors"
+                                                                               : "the ablation sidecar's direction";
+            const std::string named = screen != 0 && lora != 0 ? std::string("the DFlash2 draft screen and ") + adapter
+                                      : screen != 0            ? std::string("the DFlash2 draft screen")
+                                                               : std::string(adapter);
+            const char* what = named.c_str();
             throw std::runtime_error(std::to_string(spilled >> 20) + " MiB of " + what + " (" +
                                      std::to_string(beside >> 20) +
                                      " MiB) were placed in shared system memory by the driver's sysmem fallback: free "
@@ -1251,7 +1292,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         if (const std::uint64_t screen = instance->parameters.draft_screen_bytes(); screen != 0) {
             planned->vram.draft_screen_bytes = screen;
         }
-        if (const std::uint64_t adapter = instance->parameters.lora_bytes(); adapter != 0) {
+        if (const std::uint64_t adapter = instance->parameters.adapter_bytes(); adapter != 0) {
             planned->vram.adapter_bytes = adapter;
         }
     }
@@ -1335,7 +1376,7 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
         std::size_t free_bytes =
             plan_only ? planned_free_after_weights(sizing_now, planned_weights,
                                                    planned_beside_weights + instance->parameters.draft_screen_bytes() +
-                                                       instance->parameters.lora_bytes())
+                                                       instance->parameters.adapter_bytes())
                       : sizing_now;
         // Other processes' VRAM by NVML, which counts every process (the OS budget does not): its device-wide use
         // less this process's; 0 without NVML. On the RTX 5090 it read ~200 MiB on a quiet card (the desktop
@@ -1635,6 +1676,9 @@ ConstructedModel construct_model(EngineOptions& options, DeviceContext& device, 
     summary.model_name   = instance->model->info().name;
     if (const auto* lora = instance->model->lora()) {
         summary.lora_adapter = lora->adapter->weights_path().parent_path().string() + ": " + lora->describe();
+    }
+    if (const auto* ablate = instance->model->ablate()) {
+        summary.ablate_sidecar = ablate->path.string() + ": " + ablate->describe();
     }
     summary.prefill_signature = signature;
     std::set<std::string> formats;

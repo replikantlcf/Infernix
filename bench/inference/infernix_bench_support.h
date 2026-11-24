@@ -15,7 +15,7 @@
 
 namespace infernix::bench {
 
-inline constexpr int kSchemaVersion                   = 27;
+inline constexpr int kSchemaVersion                   = 28;
 inline constexpr std::string_view kArtifactType       = "infernix_bench_report";
 inline constexpr std::string_view kDefaultCorpusPath  = "bench/fixtures/bench_corpus.ids";
 inline constexpr int kDecodeSeedTokens                = 1;
@@ -54,6 +54,7 @@ enum class OutputFormat { Table, Json, Csv };
 struct BenchOptions {
     std::string artifact_path;
     std::string lora_path; // --lora: EngineOptions::lora_path
+    std::string ablate_sidecar_path; // --ablate: EngineOptions::ablate_sidecar_path
     std::string ngram_volume_path;
     infernix::NgramResidency ngram_residency = infernix::NgramResidency::Auto;
     std::string expert_stripe_path;
@@ -72,6 +73,7 @@ struct BenchOptions {
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
     bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations
     bool a8_activations            = false; // EngineOptions::a8_activations
+    bool q8_weights                = false; // EngineOptions::q8_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::string corpus_path{kDefaultCorpusPath};
     // Prompts start this many tokens into the corpus (wrapping), so A/B blocks can vary them.
@@ -199,6 +201,7 @@ struct BenchEnvironment {
     bool expert_a4_activations         = false; // FP4-Local W4A4 experts (changes the output)
     bool expert_a16_activations        = false; // W4A4 banks with 16-bit activations (changes the output)
     bool a8_activations                = false; // --a8-activations (changes the output)
+    bool q8_weights                    = false; // --q8-weights (changes the output)
     // Qwen3.8-Flash-Next placement (they move its throughput): empty paths and budgets are the defaults.
     std::string ngram_volume_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
@@ -206,6 +209,7 @@ struct BenchEnvironment {
     // How the expert cache started: "calibrated" (the default seed), "off" (empty) or the state file.
     std::string expert_state = "calibrated";
     std::string lora_path; // --lora, empty without an adapter
+    std::string ablate_sidecar_path; // --ablate, empty without a sidecar
     std::uint64_t ram_free_bytes = infernix::kDefaultRamFreeBytes;
     std::optional<std::uint64_t> expert_ram_bytes;
     std::optional<ExpertRamLayout> expert_ram_layout;

@@ -3,11 +3,14 @@
 
 #include "product/media_acquire/acquire.h"
 #include "serve/documents.h"
+#include "serve/request_validation.h"
 #include "serve/translate.h"
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstddef>
+#include <deque>
 #include <exception>
 #include <iterator>
 #include <mutex>
@@ -42,6 +45,16 @@ struct RequestLifetime {
     std::shared_ptr<RequestCapacity> capacity;
     std::chrono::steady_clock::time_point started;
     std::chrono::steady_clock::time_point deadline;
+};
+
+// POST /v1/score's turn (GenerationService::score): the scoring Engine runs one call at a time, so requests wait here
+// in arrival order, where one whose client disconnects or that outlives --pending-timeout-ms still gives up. A score
+// that has started runs to its end.
+struct ScoreQueue {
+    std::mutex mutex;
+    std::condition_variable turn;
+    std::deque<std::uint64_t> waiting; // tickets in arrival order; the front one scores
+    std::uint64_t next = 0;
 };
 
 std::string vision_overflow_note(const infernix::ContextLengthDetails& details) {
@@ -384,6 +397,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     infernix::EngineOptions engine_options;
     engine_options.artifact_path            = options.artifact_path;
     engine_options.lora_path                = options.lora_path;
+    engine_options.ablate_sidecar_path      = options.ablate_sidecar_path;
     engine_options.chat_template_path       = options.chat_template_path;
     engine_options.ngram_volume_path        = options.ngram_volume_path;
     engine_options.ngram_residency          = options.ngram_residency;
@@ -405,6 +419,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     engine_options.expert_a4_activations    = options.expert_a4_activations;
     engine_options.expert_a16_activations   = options.expert_a16_activations;
     engine_options.a8_activations           = options.a8_activations;
+    engine_options.q8_weights               = options.q8_weights;
     engine_options.embedding_host           = options.embedding_host;
     engine_options.max_concurrency          = options.max_concurrency;
     engine_options.max_pending_requests     = options.max_pending_requests;
@@ -416,6 +431,7 @@ infernix::EngineOptions make_engine_options(const ServeOptions& options, Startup
     // The lossless route runs no fast path.
     engine_options.fast_paths                    = options.fast_paths && !options.lossless;
     engine_options.lossless                      = options.lossless;
+    if (options.causal_scoring) { engine_options.purpose = infernix::EnginePurpose::CausalScoring; }
     engine_options.fast_path_candidates          = options.fast_path_candidates;
     engine_options.fast_path_exclusions          = options.fast_path_exclusions;
     engine_options.kv_cache                  = options.kv_cache;
@@ -455,7 +471,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
     count_capacity_ = std::make_shared<RequestCapacity>(
         static_cast<std::size_t>(options_.max_concurrency) + options_.max_pending_requests);
-    pdf_cache_ = std::make_shared<PdfCache>(kPdfCacheBytes);
+    score_queue_ = std::make_shared<ScoreQueue>();
+    pdf_cache_   = std::make_shared<PdfCache>(kPdfCacheBytes);
 }
 
 std::shared_ptr<RequestLifetime>
@@ -807,7 +824,125 @@ void GenerationService::schedule_next_turn(PreparedRequest& prepared,
     engine_->prefill_next_turn(std::move(conversation));
 }
 
+ScoreOutcome GenerationBackend::score(const ScoreRequest&, std::function<bool()>) {
+    throw ApiException(ApiError{.status  = 501,
+                                .type    = "not_supported",
+                                .message = "this server does not score: start infernix-serve with --causal-scoring",
+                                .code    = "scoring_not_enabled"});
+}
+
+ScoreOutcome GenerationService::score(const ScoreRequest& request, std::function<bool()> is_cancelled) {
+    if (engine_->options().purpose != infernix::EnginePurpose::CausalScoring) {
+        return GenerationBackend::score(request, std::move(is_cancelled));
+    }
+    // Admission as a generation's: at most --max-pending-requests wait beside the one scoring, each until
+    // --pending-timeout-ms.
+    const std::shared_ptr<RequestLifetime> lifetime =
+        acquire_request_lifetime(DeadlinePolicy::ClientPendingTimeout, false);
+    ScoreOutcome outcome;
+    outcome.chat_template_applied = request.apply_chat_template;
+    outcome.top_k                 = request.top_k;
+    std::vector<infernix::TokenId> tokens;
+    try {
+        if (request.apply_chat_template) {
+            // The prompt /v1/chat/completions would prefill for the same turns, generation prompt
+            // included: the same semantics, translation and Engine::prepare.
+            const ResolvedPromptSemantics semantics = resolve_prompt_semantics(request.chat, options_);
+            outcome.enable_thinking                 = semantics.enable_thinking;
+            infernix::PromptInput input = to_prompt_input(request.chat, semantics, [](const ContentPart&) -> infernix::OwnedMedia {
+                throw std::invalid_argument("scoring takes text only");
+            });
+            const infernix::PreparedPrompt prepared = engine_->prepare(std::move(input));
+            tokens.assign(prepared.token_ids().begin(), prepared.token_ids().end());
+        } else {
+            tokens = engine_->tokenize_text(request.prompt);
+        }
+    } catch (const ApiException&) { throw; } catch (const infernix::RequestError& exception) {
+        throw_request_error(exception, "structured_outputs.grammar", {}, queue_retry_after_seconds());
+    } catch (const std::invalid_argument& exception) {
+        throw_invalid_input(exception, "invalid_prompt");
+    }
+    if (tokens.empty()) { bad_request("the prompt encodes to no tokens", "prompt", "empty_prompt"); }
+    outcome.prompt_tokens                       = static_cast<std::uint32_t>(tokens.size());
+    const std::vector<infernix::TokenId> scored = engine_->tokenize_text(request.continuation);
+    if (scored.empty()) {
+        bad_request("the continuation encodes to no tokens", "continuation", "continuation_required");
+    }
+    tokens.insert(tokens.end(), scored.begin(), scored.end());
+    if (tokens.size() > engine_->options().max_context) {
+        bad_request("prompt and continuation are " + std::to_string(tokens.size()) +
+                        " tokens, past the scoring window of " +
+                        std::to_string(engine_->options().max_context),
+                    "continuation", "context_length_exceeded");
+    }
+    infernix::ScoreOptions score_options;
+    score_options.top_k                = request.top_k;
+    score_options.prompt_hidden_states = request.hidden_states;
+    infernix::ScoreResult result;
+    {
+        // The scoring Engine's turn, in arrival order (ScoreQueue): a request whose client disconnects, or that is
+        // still waiting at its deadline, leaves the queue; one that has started scoring runs to its end.
+        ScoreQueue& queue = *score_queue_;
+        std::unique_lock lock(queue.mutex);
+        const std::uint64_t ticket = queue.next++;
+        queue.waiting.push_back(ticket);
+        while (queue.waiting.front() != ticket) {
+            queue.turn.wait_for(lock, std::chrono::milliseconds(10));
+            if (queue.waiting.front() == ticket) { break; }
+            lock.unlock();
+            const bool cancelled = is_cancelled && is_cancelled();
+            const bool expired   = Clock::now() >= lifetime->deadline;
+            lock.lock();
+            if ((cancelled || expired) && queue.waiting.front() != ticket) {
+                queue.waiting.erase(std::find(queue.waiting.begin(), queue.waiting.end(), ticket));
+                lock.unlock();
+                if (cancelled) {
+                    throw ApiException(ApiError{.status  = 499,
+                                                .type    = "request_cancelled",
+                                                .message = "client disconnected while the score waited for its turn",
+                                                .code    = "client_disconnected"});
+                }
+                throw_request_error(infernix::RequestError(RequestErrorKind::QueueTimeout,
+                                                           "the score waited past --pending-timeout-ms for its turn"),
+                                    "structured_outputs.grammar", {}, queue_retry_after_seconds());
+            }
+        }
+        lock.unlock();
+        struct Turn {
+            ScoreQueue& queue;
+            ~Turn() {
+                std::lock_guard done(queue.mutex);
+                queue.waiting.pop_front();
+                queue.turn.notify_all();
+            }
+        } turn{queue};
+        try {
+            result = engine_->score_tokens(std::move(tokens), outcome.prompt_tokens, score_options);
+        } catch (const std::invalid_argument& exception) {
+            bad_request(exception.what(), {}, "invalid_score_request");
+        }
+    }
+    const auto text = [this](infernix::TokenId id) {
+        return engine_->detokenize_bytes(std::span<const infernix::TokenId>(&id, 1));
+    };
+    outcome.positions.reserve(scored.size());
+    for (std::size_t i = 0; i < scored.size(); ++i) {
+        ScoredPosition position{.id = scored[i], .text = text(scored[i]), .logprob = result.logprobs[i], .top = {}};
+        position.top.reserve(request.top_k);
+        for (std::size_t k = 0; k < request.top_k; ++k) {
+            const std::size_t at = i * request.top_k + k;
+            position.top.push_back(ScoredAlternative{
+                .id = result.top_ids[at], .text = text(result.top_ids[at]), .logprob = result.top_logprobs[at]});
+        }
+        outcome.positions.push_back(std::move(position));
+    }
+    outcome.hidden_states       = std::move(result.hidden_states);
+    outcome.hidden_state_layers = result.hidden_state_layers;
+    return outcome;
+}
+
 void GenerationService::warmup() {
+    if (engine_->options().purpose == infernix::EnginePurpose::CausalScoring) { return; }
     const auto generate = [this](int max_tokens, bool ignore_eos) {
         GenerationRequest request;
         ChatTurn turn;

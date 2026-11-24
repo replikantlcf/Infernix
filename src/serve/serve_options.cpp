@@ -55,13 +55,16 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--use-original-nvfp4-prefill-kernel", false},
     ServeOptionArity{"--reproducible", false},
     ServeOptionArity{"--lossless", false},
+    ServeOptionArity{"--causal-scoring", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--no-fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
     ServeOptionArity{"--a16-activations", false},
     ServeOptionArity{"--a8-activations", false},
+    ServeOptionArity{"--q8-weights", false},
     ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
+    ServeOptionArity{"--ablate"},
     ServeOptionArity{"--log-stats-interval-ms"},
     ServeOptionArity{"--log-colours"},
     ServeOptionArity{"--log-stats-panel"},
@@ -143,6 +146,12 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--log-level"},
     ServeOptionArity{"--plan"},
 };
+
+} // namespace
+
+std::span<const product::ConfigOption> serve_option_arities() noexcept { return kServeOptionArities; }
+
+namespace {
 
 const ServeOptionArity* find_option(std::string_view name) noexcept {
     const auto found =
@@ -331,6 +340,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             request and the artifact alone; text with\n"
            "                             --kv-dtype bf16, no speculation; slower\n"
            "                             (docs/maintainer/lossless-route.md)\n"
+           "  --causal-scoring           start for teacher-forced scoring: POST /v1/score\n"
+           "                             returns per-token log-probabilities and top_k;\n"
+           "                             nothing generates (docs/serving.md)\n"
            "  --fast-path NAME           also run this fast path, qualified or not\n"
            "                             (qualification and timing runs; repeatable)\n"
            "  --no-fast-path NAME        leave this selected fast path out of the default\n"
@@ -361,9 +373,19 @@ std::string serve_usage_text(const char* argv0) {
            "                             routed and shared) take the 8-bit\n"
            "                             route in place of their 4-bit one. A GGUF import's BF16\n"
            "                             hyper-connection matrices become 8-bit at load.\n"
+           "                             Inkling 2: every call, as Basalt runs it (the attention\n"
+           "                             projections and head on --q8-weights' matrices, the\n"
+           "                             NVFP4 experts W4A8 instead of W4A4; the MXFP8 experts,\n"
+           "                             gates and router keep theirs).\n"
            "                             Other calls keep their routes. Approximate: changes\n"
            "                             the output; --reproducible and artifacts without such\n"
            "                             a route refuse it (default: off)\n"
+           "  --q8-weights               8-bit weights where they measured faster: Inkling 2's\n"
+           "                             attention input and output projections and head become\n"
+           "                             int8 with an FP16 scale per 32 values at load\n"
+           "                             (activations stay 16-bit; --a8-activations implies it).\n"
+           "                             Approximate: changes the output; --reproducible\n"
+           "                             and other artifacts refuse it (default: off)\n"
            "  --embedding-host           Qwen3.5-family artifacts: keep the token embedding in\n"
            "                             pinned host memory, read zero-copy, so its VRAM\n"
            "                             (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
@@ -428,15 +450,25 @@ std::string serve_usage_text(const char* argv0) {
            "                             on demand;\n"
            "                             auto (default) takes RAM while every expert still\n"
            "                             fits in RAM beside it\n"
-           "  --expert-state FILE|off    Qwen3.8-Flash-Next expert-cache state: read at\n"
+           "  --expert-state FILE|off    expert cache state (offloaded experts,\n"
+           "                             Qwen3.8-Flash-Next and Qwen3.5-122B): read at\n"
            "                             startup to fill the VRAM expert cache, written at\n"
            "                             stop and every 10 minutes between requests\n"
-           "                             (default: the artifact path + .expert-state)\n"
-           "  --expert-stripe FILE       Qwen3.8-Flash-Next expert stripe on a second drive:\n"
-           "                             the SSD expert tier reads each record's tail from it\n"
-           "                             beside its head in the artifact\n"
+           "                             (default: the artifact path + .expert-state; off:\n"
+           "                             an empty cache, nothing saved)\n"
+           "  --expert-stripe FILE       expert stripe on a second drive (offloaded experts,\n"
+           "                             Qwen3.8-Flash-Next and Qwen3.5-122B): the SSD\n"
+           "                             expert tier reads each record's tail from it beside\n"
+           "                             its head in the artifact\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
+           "  --ablate FILE              runtime ablation sidecar (not Inkling 2)\n"
+           "                             (docs/ablate.md): a sidecar.json\n"
+           "                             naming a direction file and per-layer alpha tables;\n"
+           "                             each cut layer removes the direction's component from\n"
+           "                             its attention and/or MLP residual writes. Absent:\n"
+           "                             byte-identical to the standard engine. Not combinable\n"
+           "                             with --lossless; startup-fixed (graphs bake the hooks)\n"
            "  --rope-yarn-factor F       runtime YaRN context extension factor, finite [1,4]\n"
            "                             (default 1); startup-fixed, extends the allowed\n"
            "                             ceiling only, not --max-context\n"
@@ -584,10 +616,11 @@ std::string serve_usage_text(const char* argv0) {
            "                             state (default fp32: exact)\n"
            "\n"
            "SPECULATIVE DECODING (auto by default)\n"
-           "  --spec auto|off|mtp|dflash|dflash2\n"
+           "  --spec auto|off|mtp|dflash|dflash2|dspark\n"
            "                             speculative decoding backend. auto (the default,\n"
            "                             with --draft-tokens auto): the drafter measured\n"
-           "                             fastest for the artifact: Qwen3.8-Flash-Next dflash2\n"
+           "                             fastest for the artifact: Inkling 2 dspark;\n"
+           "                             Qwen3.8-Flash-Next dflash2\n"
            "                             with --draft-model or its companion artifact alone\n"
            "                             in the model's folder, else mtp; offloaded-expert\n"
            "                             Qwen3.5 (122B) mtp; other Qwen3.5/3.6 dflash2, then\n"
@@ -913,6 +946,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.fast_paths = false;
         } else if (arg == "--lossless") {
             options.lossless = true;
+        } else if (arg == "--causal-scoring") {
+            options.causal_scoring = true;
         } else if (arg == "--fast-path") {
             const std::string name(require_value("--fast-path"));
             const std::optional<FastPath> path = parse_fast_path(name);
@@ -929,6 +964,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
+        } else if (arg == "--q8-weights") {
+            options.q8_weights = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--context-cost-presets") {
@@ -936,6 +973,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.context_cost_presets.empty()) {
                 throw std::invalid_argument("--context-cost-presets must not be empty");
             }
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = require_value("--ablate");
+            if (options.ablate_sidecar_path.empty()) { throw std::invalid_argument("--ablate must not be empty"); }
         } else if (arg == "--log-stats-interval-ms") {
             options.log_stats_interval_ms = static_cast<std::uint32_t>(parse_nonnegative_int(
                 require_value("--log-stats-interval-ms"), "log-stats-interval-ms"));

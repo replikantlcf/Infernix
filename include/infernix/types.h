@@ -392,6 +392,7 @@ enum class SpeculativeBackend : std::uint8_t {
     Mtp,
     DFlash,
     DFlash2,
+    DSpark, // Inkling 2's DFlash-style block drafter with its Markov head (the artifact's dspark component)
 };
 
 // Automatic tree verification considers, besides the chain, trees of these many columns
@@ -717,15 +718,20 @@ struct EngineOptions {
     std::filesystem::path chat_template_path;
     // Qwen3.8-Flash-Next's per-layer n-gram embedding volume. Empty uses `<artifact>.ngram`.
     std::filesystem::path ngram_volume_path;
+    // Ablation sidecar, every model (docs/ablate.md): a sidecar.json naming a direction file and
+    // per-layer alpha tables. Empty (no --ablate): nothing loads, nothing hooks, behavior
+    // byte-identical to the standard engine.
+    std::filesystem::path ablate_sidecar_path;
     NgramResidency ngram_residency = NgramResidency::Auto;
-    // Qwen3.8-Flash-Next's saved expert-cache state: read at startup to fill the VRAM expert cache
-    // before the first request (warm start), written at stop and every 10 minutes between requests.
-    // Without a usable file (none given, a first start, another artifact's) the cache is seeded from the
-    // built-in calibrated expert order instead, and only a given file is saved.
+    // Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the saved expert-cache state, read at
+    // startup to fill the VRAM expert cache before the first request (warm start), written at stop and
+    // every 10 minutes between requests. Without a usable file (none given, a first start, another
+    // artifact's) the cache is seeded from the model's built-in calibrated expert order instead (half the
+    // frames on the 122B), and only a given file is saved.
     std::filesystem::path expert_state_path;
     // --expert-state off: no file and no seed, so the expert cache starts empty (cold benchmarks).
     bool expert_state_off = false;
-    // Qwen3.8-Flash-Next's expert stripe (tools/flash_next/expert_stripe.py): the tail of every routed
+    // Offloaded experts' stripe (tools/flash_next/expert_stripe.py): the tail of every routed
     // expert record on a second drive, read beside each record's head in the artifact when the SSD
     // expert tier serves the experts. Empty: whole records from the artifact.
     std::filesystem::path expert_stripe_path;
@@ -825,8 +831,10 @@ struct EngineOptions {
     // 16-bit activations where the checkpoint specifies fewer bits (--a16-activations): Qwen3.8-Flash-Next routed
     // experts that are W4A4 by their checkpoint (NVIDIA's NVFP4 recipes A and B, Dense8, NVFP4-QAD) run the
     // arithmetic of the weight-only banks (design §16.2.1); on a Qwen3.5-family artifact every text projection
-    // binds A16Only (NVIDIA's NVFP4 27B layers instead of 4-bit, its FP8 layers instead of 8-bit activations).
-    // Changes the output; the engine warns at launch that the default follows NVIDIA's specification and is
+    // binds A16Only (NVIDIA's NVFP4 27B layers instead of 4-bit, its FP8 layers instead of 8-bit activations); on an
+    // Inkling 2 artifact the routed experts' NVFP4 and MXFP8 layers take 16-bit activations (w4a4_sparse_moe.h's
+    // ExpertActivation::A16), deterministic and request-invariant, which the reproducible route accepts.
+    // Changes the output; the engine warns at launch that the default follows the checkpoint's specification and is
     // recommended. Artifacts that already run 16-bit activations accept it unchanged; --expert-a4-activations,
     // --a8-activations and the lossless route refuse it.
     bool expert_a16_activations        = false;
@@ -845,6 +853,13 @@ struct EngineOptions {
     // projections already take the activations their artifact permits, the 35B-A3B and the official FP8 import),
     // the reproducible route and the lossless route refuse it.
     bool a8_activations                = false;
+    // 8-bit weights (--q8-weights; approximate, opt-in, never a default): BF16 projections converted at load to Q8
+    // (int8 codes, an FP16 scale per 32 values; include/infernix/ops/q8_g32.h) where that measured faster, and their
+    // BF16 copies freed. Inkling 2: each attention's fused input projections (query, relative, gate, key, value, sink
+    // and the dynamic-conv taps) and the head (in place of its lossless bf16_p12 packing); the activations stay 16-bit.
+    // Every route stays column- and request-invariant. Other artifacts, the reproducible route and the lossless route
+    // refuse it.
+    bool q8_weights                    = false;
     // Qwen3.5-family artifacts (--embedding-host): keep the token embedding in pinned host memory and
     // gather its rows zero-copy, as artifacts with offloaded experts already do, so its VRAM (1.18 GiB on
     // the 27B) goes to the KV and prefix caches. Same bits; a prefill chunk reads its rows over the link.
@@ -2051,6 +2066,14 @@ struct ScoreOptions {
     // kMaximumScoreLogitPositions) whose whole logits vector ScoreResult::logits returns, for exact
     // comparisons (IQS-2 reference conformance).
     std::vector<std::uint32_t> logits_positions;
+    // Every layer's hidden state at the last prompt token (the position before first_target, whose next-token
+    // distribution is scored position 0): ScoreResult::hidden_states (tools/ablate's capture). Not on the lossless
+    // route.
+    bool prompt_hidden_states = false;
+    // Only the most probable token of every scored position (equal logits: the lowest id), found on the device, in
+    // ScoreResult::top_ids (one a position, logprobs and top_logprobs empty): a token-frequency measurement over
+    // millions of positions (tools/freq_corpus). Excludes top_k, candidates and logits_positions.
+    bool argmax_only = false;
 };
 
 inline constexpr std::uint32_t kMaximumScoreLogitPositions = 256;
@@ -2067,6 +2090,12 @@ struct ScoreResult {
     // One vocabulary-sized row per ScoreOptions::logits_positions entry, in that order: the FP32 logits
     // as scoring computed them.
     std::vector<float> logits;
+    // ScoreOptions::prompt_hidden_states: [layers][hidden_size], layer-major, the BF16 values widened exactly. Row L
+    // is the hidden state layer L hands on at the last prompt token: on Qwen3.5 the residual after layer L; on
+    // Qwen3.8-Flash-Next (four hyper-connection streams) layer L + 1's mixer input, and for the last layer its MoE
+    // input. Empty otherwise.
+    std::vector<float> hidden_states;
+    std::uint32_t hidden_state_layers = 0; // hidden_states' rows (0 when empty)
 };
 
 // Offloaded routed experts (Qwen3.5-122B-A10B): the VRAM expert cache's frames now and at startup,
@@ -2095,7 +2124,8 @@ struct MemoryUsage {
     struct Device {
         std::uint64_t weights       = 0; // the model's device weights, the drafter's excepted
         std::uint64_t drafter       = 0; // a separate drafter's weights, and the drafters' columns, rings and pools
-        std::uint64_t adapter       = 0; // a LoRA adapter's factors (--lora; its per-call U is in `workspace`)
+        std::uint64_t adapter       = 0; // a LoRA adapter's factors (--lora; its per-call U is in `workspace`) and an
+                                         // ablation sidecar's direction (--ablate)
         std::uint64_t experts       = 0; // the VRAM expert cache's frames that hold experts
         std::uint32_t expert_frames = 0;
         std::uint64_t kv            = 0; // the KV cache's backed pages and tables, less `prefix`'s pages
@@ -2205,8 +2235,9 @@ struct EnginePlanVram {
     // Offloaded experts: the VRAM expert cache's frames and bytes.
     std::optional<std::uint64_t> expert_cache_bytes;
     std::optional<std::uint32_t> expert_frames;
-    // Qwen3.5 family, beside the weights' arena: the DFlash2 drafter's proposal-head screen, and a LoRA adapter's
-    // factors (--lora; the adapter's per-call workspace is in workspace_bytes). Empty when the start has none.
+    // Beside the weights' arena: the DFlash2 drafter's proposal-head screen (Qwen3.5 family), and the adapters, a
+    // LoRA adapter's factors (--lora, Qwen3.5 dense) and an ablation sidecar's direction (--ablate, every model); their
+    // per-call workspace is in workspace_bytes. Empty when the start has none.
     std::optional<std::uint64_t> draft_screen_bytes;
     std::optional<std::uint64_t> adapter_bytes;
     // Left free for the display and other programs (--vram-headroom-mib or the automatic headroom).
@@ -2597,6 +2628,9 @@ struct LoadSummary {
     // EngineOptions::lora_path: the adapter applied, as "<directory>: <modules, rank, scale, factor type, base>";
     // empty without one.
     std::string lora_adapter;
+    // EngineOptions::ablate_sidecar_path: the sidecar applied, as "<sidecar.json>: <format, direction, lanes cut,
+    // provenance>" (the startup log's line); empty without one.
+    std::string ablate_sidecar;
     std::string cuda_sync_mode;
     std::vector<std::string> weight_formats;
     std::string prefill_signature;

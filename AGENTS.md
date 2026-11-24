@@ -42,8 +42,9 @@ Infernix is a from-scratch C++/CUDA inference engine for maximum single-GPU perf
 `Qwen3_5ForCausalLM` and `Qwen3_5MoeForCausalLM`; official Qwen3.6/3.8 artifacts and user recipes
 use the same architecture, binding and execution path. It also implements `Qwen4ExpForCausalLM`
 (Qwen3.8-Flash-Next, model family `qwen4_exp`), whose routed experts are offloaded to host memory or
-the SSD behind a VRAM expert cache. The implementation targets `sm_120a` and is tuned on NVIDIA
-GeForce RTX 5090.
+the SSD behind a VRAM expert cache, and `Inkling2LoopForCausalLM` (Inkling 2 Mini, model family
+`inkling2_loop`), which stays resident in VRAM. The implementation targets `sm_120a` and is tuned on
+NVIDIA GeForce RTX 5090.
 
 Generation uses one GPU, one resident model, one to eight resident execution lanes fixed at startup,
 bounded FIFO ingress with finite bypass, resource-pressure preemption with Replay recovery,
@@ -68,7 +69,8 @@ Keep these ownership boundaries visible when selecting a design:
   inference: it supervises one `infernix-serve` process per loaded model, proxies its HTTP
   endpoints, switches models on request, downloads artifacts and keeps per-model launch parameters.
   It links neither the Engine nor CUDA; what it shows of a server comes from the server's own HTTP
-  endpoints and log.
+  endpoints and log. Its Ablation page runs `tools/ablate` (Python) as a child that starts its own
+  `infernix-serve` engines; the launcher holds model loads off while that run has the GPU.
 - Core owns physical primitives and raw transfers; artifact owns generic framing and
   materialization; Ops own closed mathematical and state-transition implementations.
 - Models own fixed mathematics, config interpretation, logical parameter binding, frontend
