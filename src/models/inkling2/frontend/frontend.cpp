@@ -107,6 +107,18 @@ std::string tool_name(const Json& tool) {
     return fn.at("name").get<std::string>();
 }
 
+// A strict tool asks that every call's arguments satisfy its schema. Inkling 2 parses calls unconstrained (the
+// constrained tool route is a later slice), so a strict tool is refused rather than accepted unchecked
+// (docs/inkling2-mini.md: an unsupported feature fails with a clear error). strict false or absent is the default.
+void refuse_strict(const Json& tool) {
+    const Json& fn = tool.contains("function") ? tool.at("function") : tool;
+    if (fn.is_object() && fn.contains("strict") && fn.at("strict").is_boolean() && fn.at("strict").get<bool>()) {
+        throw RequestError(RequestErrorKind::InvalidToolConstraint,
+                           "strict tool schemas are not available for Inkling 2 yet (send strict false or leave it out)",
+                           {}, RequestErrorSource::Tools);
+    }
+}
+
 constexpr std::uint64_t mix64(std::uint64_t state, std::uint64_t value) noexcept {
     state ^= value + 0x9e3779b97f4a7c15ULL + (state << 6U) + (state >> 2U);
     state *= 0xbf58476d1ce4e5b9ULL;
@@ -310,7 +322,11 @@ struct Frontend::Impl {
         auto names  = std::make_shared<ToolNames>();
         names->open = options.open_tool_names;
         for (const auto* list : {&options.tool_jsons, &options.deferred_tool_jsons}) {
-            for (const std::string& tool : *list) { names->declared.insert(tool_name(parse_object(tool, "a tool declaration"))); }
+            for (const std::string& tool : *list) {
+                const Json declaration = parse_object(tool, "a tool declaration");
+                refuse_strict(declaration);
+                names->declared.insert(tool_name(declaration));
+            }
         }
         for (const std::string& withdrawn : options.withdrawn_tool_names) { names->declared.erase(withdrawn); }
         if (names->declared.empty() && !names->open) { return nullptr; }
@@ -346,7 +362,10 @@ struct Frontend::Impl {
 
 PromptSummary PreparedPrompt::summary() const {
     if (!data_) { throw std::logic_error("prepared prompt is empty"); }
-    PromptSummary out{.starts_in_reasoning = false, .prompt_tokens = static_cast<std::uint32_t>(data_->token_ids.size())};
+    // The model opens its thinking blocks in its output, at every effort (none included).
+    PromptSummary out{.starts_in_reasoning = false,
+                      .opens_reasoning     = true,
+                      .prompt_tokens       = static_cast<std::uint32_t>(data_->token_ids.size())};
     out.has_media = !data_->images.empty();
     for (const PromptImage& image : data_->images) { out.media.push_back(image.image.source); }
     return out;

@@ -386,9 +386,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             (activations stay 16-bit; --a8-activations implies it).\n"
            "                             Approximate: changes the output; --reproducible\n"
            "                             and other artifacts refuse it (default: off)\n"
-           "  --embedding-host           Qwen3.5-family artifacts: keep the token embedding in\n"
-           "                             pinned host memory, read zero-copy, so its VRAM\n"
-           "                             (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
+           "  --embedding-host           Qwen3.5-family and Inkling 2 artifacts: keep the token\n"
+           "                             embedding in pinned host memory, read zero-copy, so its\n"
+           "                             VRAM (1.18 GiB on the 27B) goes to the KV and prefix caches.\n"
            "                             Same output; prompts read their rows over PCIe\n"
            "  --no-cuda-graph            disable CUDA-graph decode rounds (on by default)\n"
            "  --default-max-tokens N     default max_tokens when a request omits it\n"
@@ -408,7 +408,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             whichever is less)\n"
            "  --thinking-budget-message S  message fed to the model when it hits its thinking\n"
            "                             budget, replacing the built-in end-of-thinking notice\n"
-           "                             (wrap the message in double quotes, e.g.\n"
+           "                             (Inkling 2: the message, then the <|end_message|>\n"
+           "                             that alone closes the block without it; wrap the\n"
+           "                             message in double quotes, e.g.\n"
            "                             --thinking-budget-message \"Time to stop thinking. I must "
            "act\n"
            "                             now:\")\n"
@@ -435,7 +437,8 @@ std::string serve_usage_text(const char* argv0) {
            "                             adapter_config.json beside it). Every attention and\n"
            "                             dense MLP projection it targets computes W x + s B(A x)\n"
            "                             exactly; the artifact is unchanged. Qwen3.5 dense models\n"
-           "                             (the 27Bs); --lossless computes it as PEFT does (docs/lora.md)\n"
+           "                             (the 27Bs) and Inkling 2 (attention and message gates);\n"
+           "                             --lossless computes it as PEFT does (docs/lora.md)\n"
            "  --claude-code-prompt as-sent|local\n"
            "                             Anthropic Messages from Claude Code: keep its system\n"
            "                             prompt (as-sent, default) or replace its Claude-\n"
@@ -462,7 +465,7 @@ std::string serve_usage_text(const char* argv0) {
            "                             its head in the artifact\n"
            "  --context-cost-presets F   runtime context-cost preset file (overrides\n"
            "                             matching compiled-in values)\n"
-           "  --ablate FILE              runtime ablation sidecar (not Inkling 2)\n"
+           "  --ablate FILE              runtime ablation sidecar\n"
            "                             (docs/ablate.md): a sidecar.json\n"
            "                             naming a direction file and per-layer alpha tables;\n"
            "                             each cut layer removes the direction's component from\n"
@@ -772,6 +775,11 @@ std::string serve_usage_text(const char* argv0) {
            "NOTES\n"
            "  Qwen3.5 applies --vram-headroom-mib only with --kv-capacity auto (the\n"
            "  default with the new prefix caching system).\n"
+           "  Inkling 2 refuses each option it has nothing to apply to, the other models'\n"
+           "  expert, kernel and drafting options among them (docs/inkling2-mini.md,\n"
+           "  \"Not supported yet\"). Its thinking budgets, the answer room and the\n"
+           "  end-in-thinking mode apply to every request, also with --no-thinking: its\n"
+           "  lowest effort still thinks.\n"
            "  Options of the two prefix caching systems cannot be mixed.\n"
            "  --vision-offload on requires --vision.\n"
            "  --ngram-native-sessions requires --ngram-archive-mib.\n"
@@ -782,6 +790,30 @@ std::string serve_usage_text(const char* argv0) {
            "  sampler defaults come from the loaded model and resolved thinking mode;\n"
            "  server flags and request fields override individual values.\n"
            "  --greedy forces temperature 0 (exact argmax).\n";
+}
+
+void refuse_unsupported_options(const ServeOptions& options, std::string_view architecture) {
+    if (architecture != "Inkling2LoopForCausalLM") { return; }
+    // The Engine refuses the options it can tell (normalize_inkling2_options); these are the server's own, or have
+    // a default the Engine's options cannot tell from a given value.
+    const auto refuse = [](bool given, const char* flag, const char* why) {
+        if (given) { throw std::invalid_argument(std::string("Inkling 2: ") + flag + " " + why); }
+    };
+    refuse(options.expert_state.has_value(), "--expert-state",
+           "applies to models with offloaded experts; Inkling 2 keeps its experts in VRAM");
+    refuse(options.ram_resize_explicit, "--ram-resize",
+           "resizes the RAM tiers of the models that have them; Inkling 2's Host tier keeps its startup size");
+    refuse(options.kv_capacity_explicit && !options.causal_scoring && !options.allow_prefix_reuse, "--kv-capacity",
+           "sizes the prefix cache's KV pool: with --no-prefix-reuse each lane reserves its whole context "
+           "(--max-context) and nothing else");
+    refuse(options.reasoning_loop != infernix::ReasoningLoopAction::Off, "--reasoning-loop",
+           "stop and conclude: Inkling 2 has no reasoning-loop guard (use off)");
+    refuse(options.preserve_thinking.has_value(), "--preserve-thinking",
+           "is a Qwen chat template option; Inkling 2's template renders the history's reasoning as given");
+    refuse(options.tolerant_tool_calls, "--tolerant-tool-calls",
+           "recovers malformed Qwen tool calls; Inkling 2's tool-call parser has no tolerant mode");
+    refuse(options.tool_parameter_names == ToolParameterNames::Declared, "--tool-parameter-names declared",
+           "limits the constrained tool route; Inkling 2 parses tool calls unconstrained");
 }
 
 const char* reasoning_loop_name(infernix::ReasoningLoopAction action) noexcept {
@@ -828,7 +860,6 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         redact_next = options.startup_argv.back() == "--api-key";
     }
     bool default_max_tokens_explicit = false;
-    bool kv_capacity_explicit        = false;
     bool request_log_keep_explicit = false;
     bool host_context_explicit     = false;
     bool spec_explicit             = false; // without --spec: product::apply_default_speculation
@@ -905,7 +936,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-capacity") {
             options.kv_capacity  = parse_kv_capacity(require_value("--kv-capacity"));
-            kv_capacity_explicit = true;
+            options.kv_capacity_explicit = true;
         } else if (arg == "--vram-headroom-mib") {
             options.vram_headroom_bytes =
                 parse_vram_headroom(require_value("--vram-headroom-mib"));
@@ -1176,7 +1207,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
         } else if (arg == "--ram-resize") {
             const std::string mode = require_value("--ram-resize");
             if (mode != "auto" && mode != "off") { throw std::invalid_argument("--ram-resize must be auto or off"); }
-            options.ram_resize = mode == "auto";
+            options.ram_resize          = mode == "auto";
+            options.ram_resize_explicit = true;
         } else if (arg == "--expert-ram-mib") {
             const std::string text = require_value("--expert-ram-mib");
             if (text == "auto") {
@@ -1361,7 +1393,7 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             throw std::logic_error("serve option " + arg + " has no parser");
         }
     }
-    if (!kv_capacity_explicit) {
+    if (!options.kv_capacity_explicit) {
         // The prefix cache turns every Device page no active request holds into block cache,
         // so it sizes the KV pool to free VRAM unless a capacity is given. Without a prefix cache
         // pages beyond the active requests would sit unused, unless the context itself takes them

@@ -27,8 +27,7 @@ struct Rule {
 // The options that do not apply to every model. Why, for the model types left out:
 constexpr std::array kRules = {
     // Adapters and weights.
-    Rule{"--lora", kDense},                 // the Qwen MoE models and Inkling refuse it (validate_engine_options, ...)
-    Rule{"--ablate", kQwen},                // Inkling refuses it (normalize_inkling2_options)
+    Rule{"--lora", kDense | kInkling},      // the Qwen MoE models refuse it (validate_engine_options, bind_lora)
     Rule{"--q8-weights", kInkling},         // normalize_engine_options refuses it elsewhere
     // Routed experts held off the GPU.
     Rule{"--expert-ram-mib", kOffload},
@@ -57,6 +56,7 @@ constexpr std::array kRules = {
     Rule{"--cache-tool-hold-secs", kQwen35},  // refused by Flash-Next and Inkling
     Rule{"--cache-next-turn-ms", kQwen},    // refused by Inkling
     Rule{"--no-queue-holds", kQwen},        // Inkling's Program builds no queue holds
+    Rule{"--context-cost-presets", kQwen},  // Inkling's prefix cache has no cost model
     // Speculative decoding.
     Rule{"--draft-model", kFlash},
     Rule{"--draft-tree-nodes", kQwen35},    // Flash-Next verifies neural drafts as chains and refuses it
@@ -70,14 +70,13 @@ constexpr std::array kRules = {
     Rule{"--ngram-native-sessions", kQwen35},
     Rule{"--ngram-volume", kFlash},
     Rule{"--ngram-residency", kFlash},
-    // Thinking: Inkling's template has an effort instead, a prompt never starts in reasoning (so no thinking budget),
-    // and its output session has no loop guard or tolerant tool-call parsing.
+    // Thinking and tools: Inkling's template has an effort instead of preserve_thinking, its output session has no loop
+    // guard or tolerant tool-call parsing, and it has no constrained tool route (infernix-serve refuses each:
+    // serve::refuse_unsupported_options). Its thinking budgets work as every model's.
     Rule{"--preserve-thinking", kQwen},
     Rule{"--tolerant-tool-calls", kQwen},
+    Rule{"--tool-parameter-names", kQwen},
     Rule{"--reasoning-loop", kQwen},
-    Rule{"--default-thinking-budget", kQwen},
-    Rule{"--no-thinking-answer-room", kQwen},
-    Rule{"--thinking-budget-message", kQwen},
     // Vision's media pipeline (the Qwen frontends'; with `needs_vision` below).
     Rule{"--media-cache-mib", kQwen},
     Rule{"--media-live-mib", kQwen},

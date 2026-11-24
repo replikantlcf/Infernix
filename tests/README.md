@@ -117,7 +117,14 @@ no-term call plus the FP64 term at every route and policy, a zero `B`'s bits, `A
 the snapshot and record forms bit for bit against the projection with the term and the convolution over it. On the
 host, `infernix_artifact_peft_lora_test` covers the safetensors reader and PEFT configuration handling (patterns,
 rsLoRA, every refusal) and `infernix_qwen3_5_lora_binding_test` the module binding (the Gated DeltaNet modules
-included), ranks to 128 and its refusals (a rank above 128 by its wording).
+included), ranks to 128 and its refusals (a rank above 128 by its wording). On Inkling 2,
+`infernix_inkling2_lora_test` checks the term Op (`lora_term_add`) against an FP64 oracle at the model's output shapes
+(K2's, W_o, the gates' down and their FP32 forget and message rows, a partial 16-row group for the sink) at ranks 16, 64
+and 128: a zero `B` keeps `y`'s bits, rows outside a target stay, and a column equals the column computed alone;
+`infernix_inkling2_lora_binding_test` the PEFT module binding and its refusals (host only);
+`infernix_lossless_lora_test` also the FP32 output form against its exact oracle; and
+`infernix_inkling2_adapters_real_test` (a real artifact, generated adapter and sidecar) that a zero adapter keeps the
+logits' bits on the default, reproducible and lossless routes.
 
 `--ablate` ([Ablation sidecars](../docs/ablate.md)): `infernix_direction_cut_test` checks the cut injects (the plain
 lane form and the fused MoE combine) at Flash-Next's shapes and the single-stream cut after a lane's write
@@ -125,6 +132,10 @@ lane form and the fused MoE combine) at Flash-Next's shapes and the single-strea
 mathematics, with residual elements in the thousands), a column's bits whatever the call's width or the column's
 position, graph replay, that an inactive cut is the plain kernel bit for bit (a negligible one too, for the cut after
 the write) and that the fused combine equals `moe_combine` followed by the cut inject. On the host, `infernix_artifact_ablate_sidecar_test` covers the sidecar reader and every refusal.
+`infernix_inkling2_visit_cut_test` checks Inkling 2's cut instances (the attn lane in `mlp_entry`, the mlp lane in the
+tail of `visit_entry` / `final_mix`) against an FP64 oracle over the plain instance's conv output: a negligible alpha keeps
+the plain bits, the rings hold the uncut input; `infernix_inkling2_adapters_real_test` the same through the Engine, the
+24 hidden-state rows at any prefill chunk and the refusal with `--lossless`.
 `infernix_qwen4_exp_ablate_real_test` (Flash-Next, the reproducible route) checks that a negligible cut keeps the
 plain run's bits on every cut path, that cuts of the last layer's lanes and of layer 0's move the first-token
 readouts, that a strong cut's decode agrees with its own prefill, and that a cut prompt reads the same bits at two
@@ -542,6 +553,13 @@ reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it rep
 turn and how far `--q8-weights`' tokens agree with the BF16 weights' without judging them. Each `--kv-dtype` format of
 the full pools runs as such a variant too (accepted with `--reproducible`), with DSpark equal to its plain tokens and a
 10,000-token prompt's continuation the same in chunks of 4,096 and 1,000; bf16p must give bf16's tokens throughout.
+A forced MoE stall (the down pass's error word, through a test seam) must fail its request with the stall's error, and
+the next request must equal an undisturbed run (`INFERNIX_INKLING2_STALL_ONLY=1` runs that case alone).
+`infernix_inkling2_options_test` (CPU only) passes every launch option Inkling 2 refuses through infernix-serve's parser,
+`normalize_inkling2_options` and `serve::refuse_unsupported_options` (each must be refused by its flag), and the
+configurations its callers start with (the server's and the launcher's defaults, tools/ablate's engines,
+infernix_bench's, the real tests' and infernix-perplexity's options), which must start; a scoring start must report
+the generation options it leaves unused.
 `infernix_inkling2_lossless_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) checks the `--lossless` route's cache form
 (generation) against its window form (scoring), the exact oracle: a 1,226-token sequence's logits byte for byte over
 calls of mixed widths (one wider than a sliding visit's ring, single-column decode calls, calls across the ring's wrap
