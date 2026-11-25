@@ -567,6 +567,10 @@ reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it rep
 turn and how far `--q8-weights`' tokens agree with the BF16 weights' without judging them. Each `--kv-dtype` format of
 the full pools runs as such a variant too (accepted with `--reproducible`), with DSpark equal to its plain tokens and a
 10,000-token prompt's continuation the same in chunks of 4,096 and 1,000; bf16p must give bf16's tokens throughout.
+`--kv-window-dtype` apart from the pools' format: bf16p windows over bf16 pools and bf16 windows over bf16p pools must
+give bf16's tokens, and bf16p and bf16 windows over int8 and vq2 pools each other's (the golden continuation, the four
+sampled requests at C = 4, a 160-token reply plain and under DSpark, the 10,000-token prompt in chunks of 4,096 and
+1,000); int8 windows over bf16 pools run as a variant.
 A forced MoE stall (the down pass's error word, through a test seam) must fail its request with the stall's error, and
 the next request must equal an undisturbed run (`INFERNIX_INKLING2_STALL_ONLY=1` runs that case alone).
 `infernix_inkling2_constrained_engine_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) runs constrained requests (JSON
@@ -584,6 +588,15 @@ under Basic protection as free.
 configurations its callers start with (the server's and the launcher's defaults, tools/ablate's engines,
 infernix_bench's, the real tests' and infernix-perplexity's options), which must start; a scoring start must report
 the generation options it leaves unused.
+`infernix_inkling2_preemption_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) runs requests that together outgrow a KV
+pool of one 4,096-token context (two 1,500-token prompts with 900-token greedy replies, plain, under DSpark and with
+INT8 KV; three sampled requests under DSpark; two with a presence penalty; the cache off, where a resume replays its
+ledger, plain, under DSpark with INT8 KV and under `--a8-activations`; a 2,600-token prompt prefilled in 512-token chunks
+beside a reply; two 12,000-token prompts with 6,000-token replies in a 32,768-token pool, DSpark and INT8 KV): there must
+be preemptions, and each request's tokens must equal its tokens alone in an Engine whose pool holds every lane. It
+reports the snapshot restores, replays, replayed tokens and time paused, and checks that the owner's launcher configuration of
+2026-11-25 (240,000 tokens, four lanes, INT8 KV, vision offloaded, the embedding on the host, DSpark with
+`--lm-head-draft`) plans, starts and serves a request (`INFERNIX_INKLING2_NO_OWNER_CONFIG` skips that).
 `infernix_inkling2_withdraw_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) reports a row as non-finite through
 `runtime::testing::set_nonfinite_fault`, as the other families' withdrawal tests do: a failed prompt's entries leave the
 prefix cache (its retry resumes from nothing and equals a cache-off run, which also reports its

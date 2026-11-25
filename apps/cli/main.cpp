@@ -418,6 +418,7 @@ int main(int argc, char** argv) {
         engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.kv_window_cache          = cli.kv_window_cache;
         engine_options.logits_dtype             = cli.logits_dtype;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
         engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;
@@ -451,8 +452,8 @@ int main(int argc, char** argv) {
                                             "Inkling 2 keeps its experts in VRAM");
             }
             if (cli.kv_capacity_explicit) {
-                throw std::invalid_argument("Inkling 2: --kv-capacity sizes the prefix cache's KV pool, which the CLI "
-                                            "runs without: the lane reserves its whole context (--max-context)");
+                throw std::invalid_argument("Inkling 2: --kv-capacity sizes the KV pool infernix-serve's lanes share; "
+                                            "the CLI serves one request, whose pool is its context (--max-context)");
             }
         }
         startup_log.engine_ready(engine.load_summary());

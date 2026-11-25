@@ -584,8 +584,8 @@ A window ring is whole pages, so a 64-key unit of attention is one contiguous pa
 at row p mod 64); 1088 = 1024 + 64 lets a call append up to 65 positions a lane before a write reaches a key the call's
 first query reads. A conv ring of 32 slots (p at slot p mod 32) holds 3 taps of history plus the call's columns, up to
 29 a lane. Each lane's image is contiguous (the kernels take a lane stride), so a snapshot is one copy. The window
-rings take the KV profile's window codec ([§7.6](#76-kv-profiles)): BF16 K and FP16 V under `bf16`, the packed form
-under `bf16p`, INT8-G64 under every other profile (the column above); a quantized ring's codes and side records sit
+rings take the window codec ([§7.6](#76-kv-profiles)), `--kv-window-dtype`'s or by default the KV profile's: BF16 K and
+FP16 V under `bf16`, the packed form under `bf16p`, INT8-G64 under every other profile (the column above); a quantized ring's codes and side records sit
 beside the image in their own per-lane planes, copied with it. The BF16 size is close to the 27B's StateImage
 (186.8 MiB), so the prefix cache's slot and Host-tier policies apply as they are.
 
@@ -605,21 +605,23 @@ form Qwen3.8-Flash-Next's binding takes:
 - **Pages.** The full visits' pools are one core `DeviceKVPagePool` of page-major planes (`[pages][8][64][row]`: a
   page is one contiguous run in each plane, so Host records copy whole pages), the lanes' block-table rows a
   `KVExecutionTablePool`. With DSpark the pool has two more planes, the drafter's full layer's K and V (BF16), read
-  and written through the same rows, so a cached page carries the drafter's context with the model's. A lane
-  reserves its whole context at its binding and maps a page when a call (or a draft's block rows) first writes into
-  it; an unmapped row names a scratch page. Every lane's context fits the pool, so a binding always gets its pages
-  (evicting cached blocks, or waiting for a Host write to land): no request is paused.
+  and written through the same rows, so a cached page carries the drafter's context with the model's. The lanes share
+  the pool (`--kv-capacity`, at least one `--max-context`): a binding reserves its first unit (a resume: through its
+  paused frontier and one round), `reserve_units` each later one (a prompt chunk, a decode round with a DSpark round's
+  block rows, forced tokens), and a lane maps a page from its reservation when a call (or a draft's block rows) first
+  writes into it; an unmapped row names a scratch page, and a write past the reservation is a logic error. A shortage
+  the cache cannot cover (cached blocks evicted, Host writes landed) goes to the Engine, which pauses a resident (§7.5).
 - **Snapshots are Host-born.** A tap copies the lane's StateImage (window rings, conv rings) and the drafter's sliding
   rings straight to reserved Host slabs, and its partial page as the tail record; the lane's next call waits for the
   copy. No Device snapshot slots. An image copied after a call ending at `end` serves every frontier in
   `[end - 29, end]` (the conv rings' 32 slots hold the 3 taps before it; 15 with DSpark, whose Markov ring keeps 16
   rows), so a tap splits a prompt call only when it lies further back; the prompt-end tap is the image after the
   prompt's last call, labelled `n - 1`.
-- **Only prompt-computed state is published**: blocks whose 64 positions were prefilled, and taps. No endpoint and no
-  decode-computed block (they would make a resumed request's output depend on what the cache held), so a resumed
-  request's output equals a cold run's, bit for bit, on every route: the prompt route is chunk-invariant. The
-  drafter's context depends on its call widths (projections_dmma at 16 columns or fewer, projections_mma above),
-  which changes drafts only.
+- **Only prompt-computed state is shared**: blocks whose 64 positions were prefilled, and taps. A decode-computed block
+  or endpoint under the shared keys would make a resumed request's output depend on what the cache held, so a resumed
+  request's output equals a cold run's, bit for bit, on every route: the prompt route is chunk-invariant. A pause's
+  decode-route blocks and endpoint take keys of their own (§7.5). The drafter's context depends on its call widths
+  (projections_dmma at 16 columns or fewer, projections_mma above), which changes drafts only.
 - **Persistence** (`--prefix-cache-file`): the common file format, Inkling's magic and geometry (slab, page record,
   the image's parts); the fingerprint adds the KV format, drafter, `--q8-weights`, `--a16-activations`, `--lossless`
   and vision.
@@ -632,10 +634,11 @@ form Qwen3.8-Flash-Next's binding takes:
   model's 2 GB/s (a modelled break-even, not timed) a default-route prompt under about 2,800 tokens is re-prefilled
   instead; the lossless route's model (about 0.27 s a call, 3.1 ms a token and 0.89 us a query-key pair) prefers the
   read at any length.
-- **Not built yet**: next-turn prefill, tool-call holds, queue holds and prefetching for waiting requests.
+- **Queue holds** (spec §9.6): the snapshot each queued request would resume from, a paused one's over its ledger.
+- **Not built yet**: next-turn prefill, tool-call holds and prefetching for waiting requests.
 
-Sizes: an image is 190 MiB with BF16 windows, 107 MiB with INT8 windows (every profile but `bf16` and `bf16p`) and
-158 MiB with `bf16p` windows, plus 9 MiB of drafter rings; restoring a BF16 one takes ~8 ms over the PCIe link,
+Sizes: an image is 190 MiB with BF16 windows, 107 MiB with INT8 windows (by default every profile but `bf16` and
+`bf16p`) and 158 MiB with `bf16p` windows, plus 9 MiB of drafter rings; restoring a BF16 one takes ~8 ms over the PCIe link,
 against ~0.25 s to recompute 4K tokens.
 
 The alternative (TokenSpeed's): window K/V in a paged pool whose pages behind the window are freed unless a cached
@@ -645,16 +648,44 @@ and is adopted only if M4's agentic replay shows Host-tier bytes, not hits, limi
 
 ### 7.5 Preemption and Replay
 
-As Qwen3.5: on the reproducible route a request reserves its whole extent and is never paused
-([engine architecture §3.1](engine-architecture.md#31-pause-and-resume)); otherwise Replay rebuilds from the deepest
-snapshot.
+Built 2026-11-25 (the owner's "the KV cache system should work similar to the system for Qwen 27B"; before it every
+lane reserved its whole context, and four 240,000-token INT8 lanes beside the vision tower did not fit the card). The
+Engine's pressure turns pause a resident as for the Qwen families ([engine architecture
+§3.1](engine-architecture.md#31-pause-and-resume)), on every route: Inkling's replay is exact, so no route holds a
+request's whole extent.
+
+- **What a position's bits are.** The prompt route (`CallPlan::prompt`) is chunk-invariant but not the decode route's
+  arithmetic (the forward test reports their difference); decode-route calls of up to 16 columns give single-column
+  decode's bits (decode = verify, any lanes beside). A prompt's positions were computed on the prompt route and its
+  reply's on the decode route, from the prompt's end on.
+- **Pause** (`start_pause`, at a committed boundary): the lane's full blocks through its frontier F are published, its
+  prompt's full blocks under the frontend's keys and every later block under `pause_keys`'s: the chained lookup hash
+  with an extra key of the prompt's length alone (high bit set, never an image key), which no fresh prompt carries.
+  Their bits are those of any request with the same ledger and prompt length, so the key need not name the request.
+  The endpoint at F is captured with the resume-point claim when its key is the prompt's (F within the prompt) or
+  private (a private block on its path); a frontier past the prompt inside the prompt's last block would sit on the
+  shared anchor with decode-computed rows, so it takes no endpoint and the resume replays from the deepest snapshot.
+  The lane is released (its captures stay known for a later withdrawal) and the ResumeState keeps the lane's request
+  (ledger, forced positions, sampling, constraint, counters, timings, keys).
+- **Resume** (`hybrid_sources` with the ResumeState, `start_binding`): the deepest snapshot of the ledger at or below
+  F (the queue holds keep the pause's endpoint cached last); the binding reserves through F and one round, so the
+  replay never needs pages. A resume below F replays (`advance_replay`): prompt-route calls of the prefill chunk below
+  the prompt's end, decode-route calls of up to 16 columns past it, each publishing its blocks under the same keys.
+  The penalty counts are rebuilt from the sampled output (the sampler counts every draw; forced tokens are not
+  counted). A request paused inside its prompt resumes as a prefill and reports only the prompt positions past those
+  it had reported. Without the prefix cache a resume replays the whole ledger.
+- **Sampling** is keyed by (seed, position) and verification samples every column as decoding would, so the drafter's
+  state after a resume changes the drafts only.
 
 ### 7.6 KV profiles
 
-`--kv-dtype` selects the full visits' paged pools and, with them, the window codec of the 40 sliding visits' rings
-(`window_codec()`, owner's mapping 2026-11-24): `bf16` keeps BF16 K / FP16 V windows, `bf16p` packs its windows as its
-pools, and every other profile stores its windows as `int8` (the coarser formats' own codecs would quantize the recent
-keys every query reads; `nvfp4` windows measured 3.5 times `int8`'s KL). The windows are a fixed share a lane,
+`--kv-dtype` selects the full visits' paged pools and, with them, the default window codec of the 40 sliding visits'
+rings (`window_codec()`, owner's mapping 2026-11-24): `bf16` keeps BF16 K / FP16 V windows, `bf16p` packs its windows
+as its pools, and every other profile stores its windows as `int8` (the coarser formats' own codecs would quantize the
+recent keys every query reads; `nvfp4` windows measured 3.5 times `int8`'s KL). `--kv-window-dtype bf16|bf16p|int8`
+(owner 2026-11-25) names the window codec apart from the pools': the window rings and the pools are separate views
+with their own attention instances, so every pool takes every window codec, and a bf16p pool or ring flags a lane's
+unpackable rows alike. The windows are a fixed share a lane,
 independent of context: 170 MiB as BF16, 88 MiB as INT8-G64, 138 MiB as `bf16p`. The lossless route takes `bf16`
 only, so its windows stay BF16. Every profile decodes into the attention kernels' existing tiles (K as BF16 words, V as FP16), so the decode route's
 pinned score chain and the prompt route's MMAs are unchanged; the append (the prologue, or the fused prologue inside
@@ -726,6 +757,23 @@ windows' rounding leads to (−4.1 to +12 % over 3 prompts × 3 pools, acceptanc
 time, fitted post hoc against the tokens a round over those 9 cells, is about +0.2 % at an equal count. Against `bf16`
 KV, `int8` (windows included) decodes +0.4 % after 2,048 prompt tokens and −0.2 % after 10,000 and prefills 0.6 % and
 1.5 % slower.
+
+`bf16p` windows (2026-11-25, RTX 5090, `--kv-dtype bf16p`, 2 runs an arm, against `bf16` windows over the same pools in
+one binary). As first built (c0e69d556: the generic quantized instance, whose 16-value decoder walks the exponent
+nibbles a value at a time, and an encoder that searched every base for a wide row) they decoded 3.5 / 3.7 % slower
+after 2,048 / 10,000 prompt tokens, 5.8 % at 4 lanes and about 4 % under DSpark, and prefilled 0.7-0.9 % slower. A lean
+bf16p instance, as `int8`'s (a thread decodes an 8-value piece, `kv_bf16p_piece.cuh`), made decode 1.7-2.0 % faster.
+An attribution run then put most of the rest in the encoder (a second encode of each new row cost 0.17 ms a token, a
+second decode 0.05 ms, against a 0.14 ms gap): it now counts only the bases that can win, 1 and e − 13 for each
+exponent e of a wide row, writing the same bytes (120,000 test rows against the old encoder and a host oracle that
+counts every base), +2.2 to +2.9 % decode against the lean instance alone. What remains against `bf16` windows: decode
+−0.64 / −0.58 %, 4 lanes −1.80 %, prefill −0.34 / −0.25 %, DSpark −0.6 to −1.8 % over 3 prompts; the windows save 32 MiB
+a lane (170 → 138 MiB). Compiling the bf16p encoder out of the generic and rotated instances changed their code:
+`fp8`, `nvfp4` and `k8v4` decode 0.11-0.20 % slower and `vq2` and `k4v2` 0.05-0.15 % faster (4 runs an arm), prefill
+within 0.08 %. The escape census over the quick set (291,842 tokens) found at most 10 escapes in a sliding row and 11
+in a full row (the record holds 14), escapes in 4.8 % of the sliding K rows and 7.7 % of the V rows, and no row
+without a packed form. The other window codecs under a pool not their default (`--kv-window-dtype`) are checked
+(Engine real test 8b), not timed.
 
 ---
 
@@ -1465,7 +1513,7 @@ Transformers' dequantized path; open points are D4.
 
 Request invariance from the start: decode projections under `A16ColumnInvariant`; attention splits from fixed key chunks
 and the row's own length; experts narrow at every decode width (kMaxColumns ≥ 128); per-token quantizers; graphs per
-exact B; chunk-width-invariant prefill; no pausing.
+exact B; chunk-width-invariant prefill; pauses whose replay keeps each position's route (§7.5).
 
 ### 16.3 Op oracles
 
@@ -1568,6 +1616,7 @@ component, kept byte for byte after the converter checks it names the processor 
 | `--spec` | `off`, `dspark`, `auto` (= `dspark` when the artifact carries the drafter) |
 | `--draft-tokens` | `auto` (calibrated), 1-7 |
 | `--kv-dtype` | the full visits' pools ([§7.6](#76-kv-profiles)): `bf16` (default), `bf16p`, `int8` (recommended), `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`; the sliding windows `bf16` under `bf16`, `bf16p` under `bf16p`, `int8` under every other |
+| `--kv-window-dtype` | the sliding windows ([§7.6](#76-kv-profiles)): `auto` (default: `--kv-dtype`'s mapping above), `bf16`, `bf16p`, `int8`; every pool takes every window codec; the lossless route `bf16` only |
 | `--vision` | images (no video) from an artifact with the vision component; `--vision-max-merged` image tokens an image (default 32,768); `--vision-offload on` streams the tower from pinned host memory |
 | `--prefill-chunk` | default 4,096; a multiple of 128 up to 8,064 ([§14.1](#141-chunk-width-invariance)) |
 | `--reproducible`, `--lossless` | as for every family |

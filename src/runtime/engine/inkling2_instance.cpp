@@ -12,6 +12,8 @@
 #include "runtime/expert_offload/memory_plan.h"
 #include "runtime/prefix_cache/persist_file.h"
 
+#include <cuda_runtime_api.h>
+
 #include <algorithm>
 #include <chrono>
 #include <fstream>
@@ -57,6 +59,23 @@ models::inkling2::FrontendOptions frontend_options(const models::inkling2::Model
             .grammar_cache_bytes     = options.grammar_cache_bytes};
 }
 
+// The sliding windows' storage: --kv-window-dtype's, or --kv-dtype's default (normalize_inkling2_options refuses a
+// format the windows do not take).
+ops::inkling2::KvCodec window_codec(const EngineOptions& options) {
+    return models::inkling2::window_codec(
+               models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
+               options.kv_window_cache)
+        .value_or(ops::inkling2::KvCodec::Bf16);
+}
+
+const char* window_name(ops::inkling2::KvCodec codec) {
+    switch (codec) {
+    case ops::inkling2::KvCodec::Bf16Packed: return "bf16p (packed losslessly to 12 bits)";
+    case ops::inkling2::KvCodec::Int8G64: return "int8";
+    default: return "bf16 (BF16 keys, FP16 values)";
+    }
+}
+
 models::inkling2::ProgramOptions program_options(const EngineOptions& options, std::uint32_t lora_rank) {
     return {.max_context     = options.max_context,
             .max_concurrency = options.max_concurrency,
@@ -75,8 +94,7 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options, s
             .vision            = options.enable_vision,
             .vision_max_cells  = options.enable_vision ? vision_max_cells(options) : 0U,
             .kv_codec          = models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16),
-            .window_codec      = models::inkling2::window_codec(
-                models::inkling2::kv_codec(options.kv_cache).value_or(ops::inkling2::KvCodec::Bf16)),
+            .window_codec      = window_codec(options),
             .prefix_cache      = options.context_cache.enabled && options.purpose == EnginePurpose::Generation,
             .prefix_host_bytes = options.context_cache.host_capacity_bytes.value_or(0U),
             .prefix_max_new_taps   = options.context_cache.hybrid.max_new_taps.value_or(8U),
@@ -99,23 +117,28 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options, s
             .diagnostics       = options.diagnostic_observer};
 }
 
-// The prefix cache's Device pool: with --kv-capacity auto every page the free VRAM holds beside the Program's other
-// buffers and the display headroom (the lanes' contexts first, the rest cache-only), else the explicit capacity; never
-// less than every lane's context.
-std::uint32_t cache_pool_pages(const EngineOptions& options, models::inkling2::ProgramOptions program,
-                               const models::inkling2::Config& config, std::uint64_t free_bytes, std::uint64_t headroom) {
-    const std::uint64_t lanes = static_cast<std::uint64_t>(models::inkling2::pages_per_lane(options.max_context)) *
-                                options.max_concurrency;
+// The KV pool the lanes share (--kv-capacity): with auto every page `sizing_bytes` (kv_sizing_bytes, the Qwen3.5
+// family's reading: the display headroom off free device memory, the budget margin off the OS budget, not stacked)
+// holds beside the Program's other buffers and the headroom (pages no lane holds are the prefix cache's blocks), else
+// the explicit capacity; never less than one lane's whole context, so a request alone always completes.
+std::uint32_t pool_pages(const EngineOptions& options, models::inkling2::ProgramOptions program,
+                         const models::inkling2::Config& config, std::uint64_t sizing_bytes, std::uint64_t headroom) {
+    const std::uint64_t lane = models::inkling2::pages_per_lane(options.max_context);
     if (options.kv_capacity.mode != KvCapacityMode::Automatic) {
         const std::uint64_t asked =
             (std::uint64_t{options.kv_capacity.explicit_tokens} + ops::inkling2::kKeyUnit - 1) / ops::inkling2::kKeyUnit;
-        return static_cast<std::uint32_t>(std::min<std::uint64_t>(std::max(asked, lanes), 0x7FFFFFF0U));
+        return static_cast<std::uint32_t>(std::min<std::uint64_t>(std::max(asked, lane), 0x7FFFFFF0U));
     }
     program.kv_pages                                = 0;
     const models::inkling2::ProgramDevicePlan plan = models::inkling2::Program::plan_device(program, config);
-    const std::uint64_t used                       = plan.fixed_bytes() + headroom;
-    const std::uint64_t extra = free_bytes > used && plan.page_bytes != 0 ? (free_bytes - used) / plan.page_bytes : 0U;
-    return static_cast<std::uint32_t>(std::min<std::uint64_t>(lanes + extra, 0x7FFFFFF0U));
+    const std::uint64_t used  = plan.fixed_bytes() + headroom;
+    const std::uint64_t extra = sizing_bytes > used && plan.page_bytes != 0 ? (sizing_bytes - used) / plan.page_bytes : 0U;
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(lane + extra, 0x7FFFFFF0U));
+}
+
+// The tokens a pool of `pages` (its scratch page included) holds.
+std::uint64_t pool_tokens(std::uint32_t pages) {
+    return std::uint64_t{pages > 0 ? pages - 1U : 0U} * static_cast<std::uint64_t>(ops::inkling2::kKeyUnit);
 }
 
 // --host-context-mib auto: the Host tier takes the RAM the plan (its pinned weights) leaves beyond --ram-free-mib, as
@@ -155,6 +178,8 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
         refuse(options.q8_weights, "--lossless takes the artifact's exact weights (no --q8-weights)");
         refuse(options.kv_cache != KvCacheStorage::BFloat16,
                "--lossless keeps K and V exactly (--kv-dtype bf16; V stored as BF16 on this route)");
+        refuse(options.kv_window_cache.has_value() && *options.kv_window_cache != KvCacheStorage::BFloat16,
+               "--lossless keeps the sliding windows' K and V exactly (--kv-window-dtype bf16 or auto)");
         refuse(options.fast_paths, "--lossless has no fast paths");
     }
     refuse(options.expert_a4_activations, "--expert-a4-activations belongs to Qwen3.8-Flash-Next's FP4-Local artifact");
@@ -197,8 +222,6 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     refuse_option(!options.route_trace_path.empty(), "--route-trace", kResidentExperts);
     refuse_option(!options.context_cost.preset_path.empty(), "--context-cost-presets",
                   "calibrates the Qwen prefix caches' cost model; Inkling 2's prefix cache has none");
-    refuse_option(!options.context_cache.hybrid.queue_holds, "--no-queue-holds",
-                  "turns off the queue holds of the Qwen prefix caches; Inkling 2's prefix cache builds none");
     refuse_option(options.media_cache_bytes != kDefaultMediaCacheBytes, "--media-cache-mib", kQwenMedia);
     refuse_option(options.media_live_bytes != kDefaultMediaLiveBytes, "--media-live-mib", kQwenMedia);
     refuse_option(options.media_preprocess_threads != 0, "--media-preprocess-threads", kQwenMedia);
@@ -232,19 +255,27 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     }
     refuse(!models::inkling2::kv_codec(options.kv_cache).has_value(),
            "--kv-dtype: bf16 (BF16 keys, FP16 values), bf16p, int8, fp8, nvfp4, k8v4, vq2 or k4v2");
-    if (options.kv_cache == KvCacheStorage::Vq2 || options.kv_cache == KvCacheStorage::Q4KeyVq2Value) {
-        report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
-                            " stores the full visits' keys and values as Hadamard-rotated vector codes (2-4 bits a "
-                            "value, no exact recent window) and the sliding windows' as int8 (the output differs from "
-                            "bf16's)");
-    } else if (options.kv_cache == KvCacheStorage::Bf16Packed) {
-        report(options, "Inkling 2: --kv-dtype bf16p packs the BF16 keys and values (full visits and sliding windows) "
-                        "losslessly to 12 bits "
-                        "(the output is bf16's; a request with a row that has no packed form fails)");
-    } else if (options.kv_cache != KvCacheStorage::BFloat16) {
-        report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
-                            " stores the full visits' keys and values quantized and the sliding windows' as int8 (the "
-                            "output differs from bf16's)");
+    refuse(!models::inkling2::window_codec(ops::inkling2::KvCodec::Bf16, options.kv_window_cache).has_value(),
+           "--kv-window-dtype: auto (the --kv-dtype's default), bf16 (BF16 keys, FP16 values), bf16p or int8");
+    {
+        using ops::inkling2::KvCodec;
+        const KvCodec pool   = models::inkling2::kv_codec(options.kv_cache).value_or(KvCodec::Bf16);
+        const KvCodec window = window_codec(options);
+        if (pool != KvCodec::Bf16 || window != KvCodec::Bf16) {
+            // Both lossless forms give bf16's output; int8 windows or a quantized pool change it.
+            const bool exact  = (pool == KvCodec::Bf16 || pool == KvCodec::Bf16Packed) && window != KvCodec::Int8G64;
+            const bool packed = pool == KvCodec::Bf16Packed || window == KvCodec::Bf16Packed;
+            const char* full  = pool == KvCodec::Bf16         ? "as BF16 keys and FP16 values"
+                                : pool == KvCodec::Bf16Packed ? "packed losslessly to 12 bits"
+                                : pool == KvCodec::Vq2 || pool == KvCodec::Q4KeyVq2V
+                                    ? "as Hadamard-rotated vector codes (2-4 bits a value, no exact recent window)"
+                                    : "quantized";
+            report(options, std::string("Inkling 2: --kv-dtype ") + kv_cache_cli_name(options.kv_cache) +
+                                " stores the full visits' keys and values " + full + ", and the sliding windows' as " +
+                                window_name(window) + (options.kv_window_cache ? " (--kv-window-dtype)" : "") +
+                                (exact ? "; the output is bf16's" : "; the output differs from bf16's") +
+                                (packed ? "; a request with a row that has no packed form fails" : ""));
+        }
     }
     refuse(options.logits_dtype != LogitsDtype::FP32, "the logits are FP32");
     refuse(options.rope_yarn_factor != 1.0F, "--rope-yarn does not apply: the model has no RoPE (its relative attention "
@@ -308,30 +339,21 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                "no idle next-turn prefill yet");
     }
     if (options.purpose == EnginePurpose::Generation) {
-        // The VRAM and RAM figures size --max-context auto, --kv-capacity auto (the prefix cache's Device pool) and
-        // the automatic Host tier (--host-context-mib auto); a start that sizes none of them would leave them unread.
-        const bool sizes_vram = options.max_context_auto ||
-                                (cache.enabled && options.kv_capacity.mode == KvCapacityMode::Automatic);
+        // The VRAM and RAM figures size --max-context auto, --kv-capacity auto (the KV pool the lanes share) and the
+        // automatic Host tier (--host-context-mib auto); a start that sizes none of them would leave them unread.
+        const bool sizes_vram = options.max_context_auto || options.kv_capacity.mode == KvCapacityMode::Automatic;
         refuse_option(options.vram_headroom_bytes.has_value() && !sizes_vram, "--vram-headroom-mib",
-                      "sizes --max-context auto and the prefix cache's --kv-capacity auto; this start sizes neither");
+                      "sizes --max-context auto and --kv-capacity auto; this start sizes neither");
         refuse_option(options.vram_past_budget && !sizes_vram, "--vram-past-budget",
-                      "widens the VRAM --max-context auto and the prefix cache's --kv-capacity auto size from; this "
-                      "start sizes neither");
+                      "widens the VRAM --max-context auto and --kv-capacity auto size from; this start sizes neither");
         refuse_option(options.ram_free_bytes != kDefaultRamFreeBytes &&
                           !(cache.enabled && !cache.host_capacity_bytes.has_value()),
                       "--ram-free-mib", "sizes the prefix cache's automatic Host tier (--host-context-mib auto); this "
                       "start has none");
-        if (cache.enabled && options.kv_capacity.mode == KvCapacityMode::Explicit) {
-            // Each lane reserves its whole context in the pool, so a smaller pool would be raised to it.
-            refuse_option(options.max_context_auto, "--kv-capacity N",
-                          "with --max-context auto: each lane reserves its whole context, which --max-context auto "
-                          "sizes from the free VRAM (give --max-context N, or --kv-capacity auto)");
-            refuse_option(std::uint64_t{options.kv_capacity.explicit_tokens} <
-                              std::uint64_t{options.max_context} * options.max_concurrency,
-                          "--kv-capacity N",
-                          "must hold every lane's whole context (--max-context x --max-concurrency): each lane "
-                          "reserves it in the prefix cache's pool");
-        }
+        // The lanes share the pool, which holds at least one request's whole context (a smaller one would be raised).
+        refuse_option(options.kv_capacity.mode == KvCapacityMode::Explicit && !options.max_context_auto &&
+                          options.kv_capacity.explicit_tokens < options.max_context,
+                      "--kv-capacity N", "must hold one request's whole context (--max-context)");
     } else {
         // Causal scoring runs without the prefix cache, the drafter or the automatic sizings: as the other models
         // (normalize_engine_options), a scoring start with a generation configuration says what it leaves unused.
@@ -408,9 +430,10 @@ Inkling2Instance::~Inkling2Instance() = default;
 
 namespace {
 
-// The largest context every lane's KV holds beside the weights in `free_bytes` less the display headroom (each of the
-// --max-concurrency lanes reserves its whole context, so no request is ever paused), up to the model's positions, on
-// the 64-position page grid; empty when none fits. `vision_host`: the tower's pinned groups, as the Program plans them.
+// The largest context one request may hold: the KV pool of that one context fits beside the weights in `free_bytes`
+// less the display headroom (the --max-concurrency lanes share the pool, so a lone request may fill it), up to the
+// model's positions and an explicit --kv-capacity, on the 64-position page grid; empty when none fits. `vision_host`: the
+// tower's pinned groups, as the Program plans them.
 std::optional<std::uint32_t> largest_context(const EngineOptions& options, const models::inkling2::Config& config,
                                              const models::inkling2::VisionHostWeights* vision_host,
                                              std::uint32_t lora_rank, std::uint64_t free_bytes, std::uint64_t headroom) {
@@ -421,7 +444,9 @@ std::optional<std::uint32_t> largest_context(const EngineOptions& options, const
         program.vision_host                      = vision_host;
         return models::inkling2::Program::plan_device(program, config).fixed_bytes() + headroom <= free_bytes;
     };
-    const auto found = largest_fitting_context(config.text.max_position_embeddings, options.max_context, fits);
+    std::uint32_t upper = config.text.max_position_embeddings;
+    if (options.kv_capacity.mode == KvCapacityMode::Explicit) { upper = std::min(upper, options.kv_capacity.explicit_tokens); }
+    const auto found = largest_fitting_context(upper, std::min(options.max_context, upper), fits);
     if (!found) { return std::nullopt; }
     const std::uint32_t unit = static_cast<std::uint32_t>(ops::inkling2::kKeyUnit);
     return *found >= unit ? *found / unit * unit : *found;
@@ -443,12 +468,22 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     const std::uint32_t lora_rank = plan.lora() != nullptr ? plan.lora()->padded_rank : 0;
     const std::uint64_t adapter_bytes = (plan.lora() != nullptr ? plan.lora()->device_bytes(options.lossless) : 0) +
                                         (plan.ablate() != nullptr ? plan.ablate()->device_bytes() : 0);
+    // What the pool and --max-context auto size in, as the Qwen3.5 family's start reads it (kv_sizing_bytes): an
+    // automatic capacity's headroom off free device memory and the budget margin off the OS budget, not stacked; less
+    // the adapters, allocated with the Parameters. `retry`: the startup retry's extra headroom.
+    const bool automatic = options.kv_capacity.mode == KvCapacityMode::Automatic;
+    const auto sizing_of = [&](const VramSnapshot& s, std::uint64_t retry) -> std::uint64_t {
+        const std::uint64_t bytes = kv_sizing_bytes(s, automatic, static_cast<std::size_t>(headroom + retry),
+                                                    static_cast<std::size_t>(retry));
+        return bytes > adapter_bytes ? bytes - adapter_bytes : 0U;
+    };
     if (planned != nullptr) {
-        // Engine::plan: the free memory a start reads after its weights, so the largest context is the start's.
-        const std::uint64_t free_after =
-            planned_free_after_weights(free_device_bytes(vram), plan.device_bytes(), adapter_bytes);
+        // Engine::plan: the memory a start reads after its weights, so the largest context and the pool are the start's.
+        const std::uint64_t sizing_after =
+            planned_free_after_weights(kv_sizing_bytes(vram, automatic, static_cast<std::size_t>(headroom), 0),
+                                       plan.device_bytes(), adapter_bytes);
         const auto* vision_host        = plan.vision_host() ? &*plan.vision_host() : nullptr;
-        planned->max_context           = largest_context(options, plan.config(), vision_host, lora_rank, free_after, headroom);
+        planned->max_context = largest_context(options, plan.config(), vision_host, lora_rank, sizing_after, headroom);
         if (options.max_context_auto) {
             if (!planned->max_context) {
                 plan_refuse(*planned, "--max-context auto: no context fits beside the weights in the free VRAM");
@@ -458,13 +493,13 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         }
         models::inkling2::ProgramOptions program = program_options(options, lora_rank);
         program.vision_host                      = vision_host;
-        if (program.prefix_cache) { program.kv_pages = cache_pool_pages(options, program, plan.config(), free_after, headroom); }
+        if (!program.causal_scoring) { program.kv_pages = pool_pages(options, program, plan.config(), sizing_after, headroom); }
         const models::inkling2::ProgramDevicePlan device_plan = models::inkling2::Program::plan_device(program, plan.config());
         planned->architecture                   = std::string(models::architecture_name(models::Architecture::Inkling2Loop));
         planned->vram.weights_bytes             = plan.device_bytes();
         if (adapter_bytes != 0) { planned->vram.adapter_bytes = adapter_bytes; }
         planned->vram.kv_bytes                  = device_plan.kv;
-        planned->vram.kv_tokens                 = options.max_context * options.max_concurrency;
+        planned->vram.kv_tokens                 = static_cast<std::uint32_t>(pool_tokens(device_plan.kv_pages));
         planned->vram.minimum_reservation_bytes = device_plan.fixed_bytes();
         planned->vram.workspace_bytes           = device_plan.workspace;
         planned->vram.planned_bytes =
@@ -508,33 +543,53 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     const auto* vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
     if (options.max_context_auto) {
         const VramSnapshot after = open_vram_budget_source(device.device, options.vram_past_budget)->query();
-        const std::uint64_t free_after = free_device_bytes(after) > adapter_bytes ? free_device_bytes(after) - adapter_bytes : 0;
-        const auto context = largest_context(options, model->config(), vision_host, lora_rank, free_after, headroom);
+        const auto context = largest_context(options, model->config(), vision_host, lora_rank, sizing_of(after, 0), headroom);
         if (!context) { throw std::runtime_error("--max-context auto: no context fits beside the weights in the free VRAM"); }
         options.max_context = *context;
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "--max-context auto: %u tokens, the largest context each of the %u lanes holds here (every "
-                           "lane reserves its whole context: no request is paused)",
+                           "--max-context auto: %u tokens, the largest context one request holds here (the %u lanes "
+                           "share the KV pool)",
                            options.max_context, options.max_concurrency);
     }
     models::inkling2::ProgramOptions program = program_options(options, lora_rank);
     program.vision_host                      = vision_host;
-    if (program.prefix_cache) {
-        const VramSnapshot now                     = open_vram_budget_source(device.device, options.vram_past_budget)->query();
-        options.context_cache.host_capacity_bytes  = cache_host_bytes(options, pinned_bytes, now);
-        program.prefix_host_bytes                  = *options.context_cache.host_capacity_bytes;
+    if (!program.causal_scoring) {
+        const VramSnapshot now = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+        if (program.prefix_cache) {
+            options.context_cache.host_capacity_bytes = cache_host_bytes(options, pinned_bytes, now);
+            program.prefix_host_bytes                 = *options.context_cache.host_capacity_bytes;
+        }
         const std::uint64_t free_now = free_device_bytes(now) > adapter_bytes ? free_device_bytes(now) - adapter_bytes : 0;
-        program.kv_pages = cache_pool_pages(options, program, model->config(), free_now, headroom);
+        program.kv_pages = pool_pages(options, program, model->config(), sizing_of(now, 0), headroom);
         const models::inkling2::ProgramDevicePlan sized = models::inkling2::Program::plan_device(program, model->config());
+        // An explicit context or capacity that does not fit is refused here, with its figures, before any allocation.
+        if (sized.fixed_bytes() + headroom > free_now) {
+            const std::uint64_t mib = 1ULL << 20U;
+            throw std::runtime_error(
+                "Inkling 2: the KV pool (" + std::to_string(pool_tokens(sized.kv_pages)) + " tokens, " +
+                std::to_string(sized.kv / mib) + " MiB), the lanes' state and the workspaces need " +
+                std::to_string((sized.fixed_bytes() + headroom) / mib) + " MiB with the display headroom beside the " +
+                "weights, and " + std::to_string(free_now / mib) + " MiB of VRAM is free: lower --max-context or " +
+                "--kv-capacity (--max-context auto takes the largest that fits)");
+        }
         constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
-        const std::uint64_t lane_pages =
-            static_cast<std::uint64_t>(models::inkling2::pages_per_lane(options.max_context)) * options.max_concurrency;
-        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
-                           "Inkling 2: prefix cache: %u KV pages (%.1f GiB: the lanes' contexts and %llu pages of cached "
-                           "blocks), Host tier %.1f GiB",
-                           sized.kv_pages - 1U, static_cast<double>(sized.kv) / kGiB,
-                           static_cast<unsigned long long>(sized.kv_pages - 1U > lane_pages ? sized.kv_pages - 1U - lane_pages : 0U),
-                           static_cast<double>(program.prefix_host_bytes) / kGiB);
+        const std::uint64_t cached = sized.kv_pages - 1U > models::inkling2::pages_per_lane(options.max_context)
+                                         ? sized.kv_pages - 1U - models::inkling2::pages_per_lane(options.max_context)
+                                         : 0U;
+        if (program.prefix_cache) {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "Inkling 2: KV pool: %llu tokens (%.1f GiB) the %u lanes share, one request's context "
+                               "and %llu pages more for cached blocks; Host tier %.1f GiB",
+                               static_cast<unsigned long long>(pool_tokens(sized.kv_pages)),
+                               static_cast<double>(sized.kv) / kGiB, options.max_concurrency,
+                               static_cast<unsigned long long>(cached), static_cast<double>(program.prefix_host_bytes) / kGiB);
+        } else {
+            publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                               "Inkling 2: KV pool: %llu tokens (%.1f GiB) the %u lanes share (no prefix cache: a paused "
+                               "request replays its whole ledger)",
+                               static_cast<unsigned long long>(pool_tokens(sized.kv_pages)),
+                               static_cast<double>(sized.kv) / kGiB, options.max_concurrency);
+        }
     }
     const auto& packed = model->packed();
     if (packed.source_bytes != 0) {
@@ -571,7 +626,48 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         resources.chat_template_jinja                 = template_override;
         instance->frontend = models::inkling2::Frontend(resources, frontend_options(*instance->model, options));
     }
-    instance->program = std::make_unique<models::inkling2::Program>(instance->parameters, device, program);
+    std::size_t free_before_program = 0, device_total = 0;
+    (void)cudaMemGetInfo(&free_before_program, &device_total);
+    try {
+        instance->program = std::make_unique<models::inkling2::Program>(instance->parameters, device, program);
+    } catch (const std::exception& error) {
+        // An automatic pool that met device memory the plan does not count (the driver's own, a graph's) starts once
+        // more with 1 GiB more headroom, so fewer KV pages, as the Qwen families' startup retries; an explicit size
+        // cannot shrink.
+        const std::string what = error.what();
+        const bool memory = what.find("out of memory") != std::string::npos ||
+                            what.find("cudaErrorMemoryAllocation") != std::string::npos;
+        if (!memory || program.causal_scoring || options.kv_capacity.mode != KvCapacityMode::Automatic) { throw; }
+        (void)cudaGetLastError(); // an allocation failure is not sticky; clear its record
+        constexpr std::uint64_t kRetryHeadroom = 1ULL << 30U;
+        const VramSnapshot now       = open_vram_budget_source(device.device, options.vram_past_budget)->query();
+        program.kv_pages = pool_pages(options, program, instance->model->config(), sizing_of(now, kRetryHeadroom),
+                                      headroom + kRetryHeadroom);
+        const models::inkling2::ProgramDevicePlan retried =
+            models::inkling2::Program::plan_device(program, instance->model->config());
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
+                           "Inkling 2: %s at startup; retrying with %llu MiB more VRAM headroom (a smaller automatic KV "
+                           "pool: %llu tokens)",
+                           what.c_str(), static_cast<unsigned long long>(kRetryHeadroom >> 20U),
+                           static_cast<unsigned long long>(pool_tokens(retried.kv_pages)));
+        (void)cudaMemGetInfo(&free_before_program, &device_total);
+        instance->program = std::make_unique<models::inkling2::Program>(instance->parameters, device, program);
+    }
+    {
+        // What the Program took (its buffers, the KV pool and the startup graphs) against what its plan counts.
+        std::size_t free_after_program = 0;
+        (void)cudaMemGetInfo(&free_after_program, &device_total);
+        const models::inkling2::ProgramDevicePlan& planned_device = instance->program->device_plan();
+        constexpr double kMiB = 1024.0 * 1024.0;
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
+                           "Inkling 2: the Program took %.0f MiB of device memory; its plan counts %.0f MiB (%.0f MiB of "
+                           "it the CUDA graphs' allowance)",
+                           static_cast<double>(free_before_program > free_after_program
+                                                   ? free_before_program - free_after_program
+                                                   : 0U) / kMiB,
+                           static_cast<double>(planned_device.fixed_bytes()) / kMiB,
+                           static_cast<double>(planned_device.graphs) / kMiB);
+    }
     // --prefix-cache-file: the Host tier restored from a file written for this artifact and these options (the KV
     // format, the drafter, the 8-bit weights and 16-bit expert activations change what the cache holds).
     LoadSummary::PrefixCacheRestore restore;
