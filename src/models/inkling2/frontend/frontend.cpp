@@ -1,6 +1,8 @@
 #include "models/inkling2/frontend/frontend.h"
 
+#include "models/inkling2/frontend/constraints.h"
 #include "runtime/prefix_cache/block_hash.h"
+#include "text/grammar.h"
 #include "text/jinja.h"
 #include "text/tokenizer.h"
 #include "text/unicode.h"
@@ -11,6 +13,7 @@
 #include <array>
 #include <chrono>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -49,6 +52,30 @@ Json parse_object(std::string_view json, std::string_view what) {
     return value;
 }
 
+// A text part's text; a LoadedTools part's declarations in Inkling's own declaration form: the template's tool_declare
+// specs ({description, name, parameters, type}, sorted keys, compact), after a line that says they are now available.
+// The official template emits its tool_declare block only before the conversation, so tools that arrive later are
+// declared in the message that brings them.
+std::string part_text(const MessagePart& part) {
+    if (part.kind != MessagePartKind::LoadedTools) { return part.text; }
+    nlohmann::json specs = nlohmann::json::array();
+    for (const std::string& tool : part.tool_jsons) {
+        const Json declaration = parse_object(tool, "a loaded tool declaration");
+        const Json& fn         = declaration.contains("function") ? declaration.at("function") : declaration;
+        nlohmann::json spec    = nlohmann::json::object();
+        spec["description"]    = fn.contains("description") && fn.at("description").is_string()
+                                     ? fn.at("description").get<std::string>()
+                                     : std::string();
+        spec["name"]           = fn.value("name", std::string());
+        spec["parameters"]     = fn.contains("parameters") && !fn.at("parameters").is_null()
+                                     ? nlohmann::json::parse(fn.at("parameters").dump())
+                                     : nlohmann::json::object();
+        spec["type"]           = declaration.value("type", std::string("function"));
+        specs.push_back(std::move(spec));
+    }
+    return "These tools are now also available:\n" + specs.dump();
+}
+
 // One message as the template reads it (its OpenAI-shaped fields); its images, in order, appended to `media` (null:
 // images are refused, the Engine runs without --vision).
 Json message_json(const ChatMessage& message, std::vector<const OwnedMedia*>* media) {
@@ -67,7 +94,7 @@ Json message_json(const ChatMessage& message, std::vector<const OwnedMedia*>* me
         images = true;
     }
     if (message.parts.size() == 1 && !images) {
-        out["content"] = message.parts.front().text;
+        out["content"] = part_text(message.parts.front());
     } else if (message.parts.empty()) {
         out["content"] = "";
     } else {
@@ -77,7 +104,7 @@ Json message_json(const ChatMessage& message, std::vector<const OwnedMedia*>* me
                 parts.push_back({{"type", "image"}});
                 media->push_back(&part.media);
             } else {
-                parts.push_back({{"type", "text"}, {"text", part.text}});
+                parts.push_back({{"type", "text"}, {"text", part_text(part)}});
             }
         }
         out["content"] = std::move(parts);
@@ -107,16 +134,14 @@ std::string tool_name(const Json& tool) {
     return fn.at("name").get<std::string>();
 }
 
-// A strict tool asks that every call's arguments satisfy its schema. Inkling 2 parses calls unconstrained (the
-// constrained tool route is a later slice), so a strict tool is refused rather than accepted unchecked
-// (docs/inkling2-mini.md: an unsupported feature fails with a clear error). strict false or absent is the default.
-void refuse_strict(const Json& tool) {
+// A declaration as the constrained route reads it: its name, its parameter schema and whether it is strict (a strict
+// tool's calls must satisfy that schema; strict false or absent is the default).
+DeclaredTool declared_tool(const Json& tool, std::size_t index) {
     const Json& fn = tool.contains("function") ? tool.at("function") : tool;
-    if (fn.is_object() && fn.contains("strict") && fn.at("strict").is_boolean() && fn.at("strict").get<bool>()) {
-        throw RequestError(RequestErrorKind::InvalidToolConstraint,
-                           "strict tool schemas are not available for Inkling 2 yet (send strict false or leave it out)",
-                           {}, RequestErrorSource::Tools);
-    }
+    DeclaredTool out{.name = tool_name(tool), .declaration_index = index};
+    if (fn.contains("parameters") && !fn.at("parameters").is_null()) { out.parameters = fn.at("parameters").dump(); }
+    out.strict = fn.contains("strict") && fn.at("strict").is_boolean() && fn.at("strict").get<bool>();
+    return out;
 }
 
 constexpr std::uint64_t mix64(std::uint64_t state, std::uint64_t value) noexcept {
@@ -191,7 +216,8 @@ struct Frontend::Impl {
     Impl(const FrontendResources& resources, const FrontendOptions& options)
         : tokenizer(resources.tokenizer),
           tmpl(std::string(resources.chat_template_jinja), "chat_template.jinja"),
-          max_context(options.max_context), vision(options.vision), max_cells(options.vision_max_cells) {
+          max_context(options.max_context), vision(options.vision), max_cells(options.vision_max_cells),
+          grammar_cache_bytes(options.grammar_cache_bytes) {
         if (tokenizer == nullptr) { throw std::invalid_argument("inkling2 frontend: no tokenizer"); }
         if (max_context == 0) { throw std::invalid_argument("frontend max_context must be nonzero"); }
         const auto id = [&](const char* spelling) {
@@ -308,30 +334,60 @@ struct Frontend::Impl {
             throw std::invalid_argument(std::string("chat template: ") + error.what());
         }
         Rendered out;
+        // The answer's opener's two tokens follow the rendered text: its encoding takes the rest of `max_tokens`.
+        const std::size_t opener = input.options.open_answer ? 2U : 0U;
         out.ids = tokenizer
-                      ->encode_with_boundaries(rendered.text, {}, {.parse_added_tokens = true, .max_tokens = max_tokens},
+                      ->encode_with_boundaries(rendered.text, {},
+                                               {.parse_added_tokens = true,
+                                                .max_tokens         = max_tokens > opener ? max_tokens - opener : 0U},
                                                rendered.literal_spans)
                       .input_ids;
         out.text = std::move(rendered.text);
+        // PromptOptions::open_answer: the reply's answer opener ends the prompt (the model writes no thinking block
+        // first), so the next token is the answer's first.
+        if (input.options.open_answer) {
+            out.ids.push_back(markers.message_model);
+            out.ids.push_back(markers.content[0]);
+            out.text += "<|message_model|><|content_text|>";
+        }
         return out;
     }
 
-    // The calls a turn may make: the declared and deferred tools, less the withdrawn ones; any name when the client
-    // keeps its own.
+    // The calls a turn may make: the listed tools the conversation did not withdraw, then the deferred ones; any name
+    // when the client keeps its own. withdrawn_tool_names names listed declarations only (PromptOptions): a tool the
+    // conversation redefined is withdrawn as listed and callable through its newer declaration among the deferred
+    // ones, so the withdrawal never reaches them (as Qwen's tool contract).
     [[nodiscard]] std::shared_ptr<const ToolNames> tool_names(const PromptOptions& options) const {
         auto names  = std::make_shared<ToolNames>();
         names->open = options.open_tool_names;
+        const auto withdrawn = [&](const std::string& name) {
+            return std::find(options.withdrawn_tool_names.begin(), options.withdrawn_tool_names.end(), name) !=
+                   options.withdrawn_tool_names.end();
+        };
+        std::size_t index = 0;
         for (const auto* list : {&options.tool_jsons, &options.deferred_tool_jsons}) {
+            const bool listed = list == &options.tool_jsons;
             for (const std::string& tool : *list) {
-                const Json declaration = parse_object(tool, "a tool declaration");
-                refuse_strict(declaration);
-                names->declared.insert(tool_name(declaration));
+                DeclaredTool declared = declared_tool(parse_object(tool, "a tool declaration"), index++);
+                if (listed && withdrawn(declared.name)) { continue; }
+                names->declared.insert(declared.name);
+                names->tools.push_back(std::move(declared));
             }
         }
-        for (const std::string& withdrawn : options.withdrawn_tool_names) { names->declared.erase(withdrawn); }
         if (names->declared.empty() && !names->open) { return nullptr; }
         return names;
     }
+
+    // The constraint compiler, built at its first use (warm_constraints builds it beside the Engine's startup).
+    [[nodiscard]] text::GrammarCompiler& grammars() const {
+        std::call_once(grammar_once, [&] {
+            grammar_compiler = make_grammar_compiler(*tokenizer, markers, defaults.token_ids, grammar_cache_bytes);
+        });
+        return *grammar_compiler;
+    }
+    std::size_t grammar_cache_bytes = 0;
+    mutable std::once_flag grammar_once;
+    mutable std::unique_ptr<text::GrammarCompiler> grammar_compiler;
 
     [[nodiscard]] StopPolicy merge(const StopPolicy& caller) const {
         StopPolicy result;
@@ -362,9 +418,10 @@ struct Frontend::Impl {
 
 PromptSummary PreparedPrompt::summary() const {
     if (!data_) { throw std::logic_error("prepared prompt is empty"); }
-    // The model opens its thinking blocks in its output, at every effort (none included).
+    // The model opens its thinking blocks in its output, at every effort (none included), unless the prompt opened
+    // the answer (PromptOptions::open_answer).
     PromptSummary out{.starts_in_reasoning = false,
-                      .opens_reasoning     = true,
+                      .opens_reasoning     = !data_->answer_opened,
                       .prompt_tokens       = static_cast<std::uint32_t>(data_->token_ids.size())};
     out.has_media = !data_->images.empty();
     for (const PromptImage& image : data_->images) { out.media.push_back(image.image.source); }
@@ -446,8 +503,9 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
         data->stats.media_preprocess_seconds = std::chrono::duration<double>(Clock::now() - media_start).count();
         data->stats.media_preprocess_work_seconds = data->stats.media_preprocess_seconds;
     }
-    data->token_ids = std::move(rendered.ids);
-    data->tools     = impl_->tool_names(input.options);
+    data->token_ids     = std::move(rendered.ids);
+    data->tools         = impl_->tool_names(input.options);
+    data->answer_opened = input.options.open_answer;
     // The prefix cache's keys: each image's content key accumulated into every block at or past its first token's.
     {
         namespace pc         = runtime::prefix_cache;
@@ -519,7 +577,9 @@ PreparedPrompt Frontend::prepare_tokens(std::vector<TokenId> token_ids, bool all
 }
 
 std::vector<TokenId> Frontend::tokenize_text(std::string_view text) const {
-    const std::vector<int> ids = impl_->tokenizer->encode(text, {.parse_added_tokens = false});
+    // A marker's text encodes as the marker (Engine::tokenize_text, as Qwen's frontend): a /v1/score continuation can
+    // spell Inkling's answer opener.
+    const std::vector<int> ids = impl_->tokenizer->encode(text);
     return {ids.begin(), ids.end()};
 }
 
@@ -549,17 +609,32 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt, const 
                                             const std::optional<OutputConstraint>& constraint,
                                             const ToolChoice& tool_choice) const {
     if (!prompt) { throw std::invalid_argument("output session needs a prepared prompt"); }
-    if (constraint) {
-        const RequestErrorKind kind = constraint->kind == OutputConstraintKind::Grammar  ? RequestErrorKind::InvalidGrammar
-                                      : constraint->kind == OutputConstraintKind::Choice ? RequestErrorKind::InvalidChoice
-                                      : constraint->kind == OutputConstraintKind::Regex  ? RequestErrorKind::InvalidRegex
-                                                                                         : RequestErrorKind::UnsupportedJsonSchema;
-        throw RequestError(kind, "constrained output is not available for Inkling 2 yet");
+    // The constrained route (constraints.h): a content constraint, a tool policy, or both.
+    const std::optional<ToolPolicy> tools = select_tool_policy(prompt.data().tools.get(), tool_choice);
+    if (prompt.data().answer_opened && (constraint || tools)) {
+        // The grammars frame a whole turn; a prompt that opened the answer (/v1/decide) takes token constraints only.
+        throw std::invalid_argument("a prompt that opens the answer takes no output constraint or tool policy");
     }
-    if (tool_choice.mode == ToolChoiceMode::Required || tool_choice.allowed_names) {
-        throw RequestError(RequestErrorKind::InvalidToolConstraint,
-                           "required or named tool choices are not available for Inkling 2 yet", {},
-                           RequestErrorSource::Tools);
+    std::shared_ptr<text::GrammarSession> matcher;
+    if (constraint || tools) {
+        const RequestErrorKind kind =
+            tools ? RequestErrorKind::InvalidToolConstraint : text::constraint_error_kind(constraint->kind);
+        const RequestErrorSource source = tools ? RequestErrorSource::Tools : RequestErrorSource::OutputConstraint;
+        // The grammar's end is the model's stop token, and its language the decoded text.
+        if (!caller_stop.token_ids.empty() || !caller_stop.strings.empty() || !caller_stop.include_model_defaults ||
+            caller_stop.publish_stop_token || output.raw || output.preserve_special_tokens) {
+            throw RequestError(kind, "constraints require default EOS, text output, no custom stops, and one output language",
+                               {}, source);
+        }
+        try {
+            // A new grammar's token-mask compile runs beside the prefill (GrammarCompiler::Compile::Deferred).
+            matcher = compile_turn_grammar(impl_->grammars(), impl_->markers, constraint, tools ? &*tools : nullptr,
+                                           text::GrammarCompiler::Compile::Deferred);
+        } catch (const RequestError&) {
+            throw;
+        } catch (const std::invalid_argument& error) {
+            throw RequestError(kind, error.what(), {}, source);
+        }
     }
     OutputSession::Settings settings;
     settings.tokenizer        = impl_->tokenizer;
@@ -568,11 +643,14 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt, const 
     settings.output           = output;
     settings.thinking         = thinking;
     settings.thinking_control = impl_->thinking_control;
-    // tool_choice none: the turn's calls are its text. The free route parses calls unconstrained (the constrained
-    // tool route, ToolConstraintMode::Basic's protection, is a later slice).
-    settings.tools = tool_choice.mode == ToolChoiceMode::None ? nullptr : prompt.data().tools;
+    // tool_choice none: the turn makes no call (its grammar has none, or, free, a call is text).
+    settings.tools         = tool_choice.mode == ToolChoiceMode::None ? nullptr : prompt.data().tools;
+    settings.grammar       = std::move(matcher);
+    settings.answer_opened = prompt.data().answer_opened;
     return OutputSession(std::move(settings));
 }
+
+void Frontend::warm_constraints() const { (void)impl_->grammars(); }
 
 const StopPolicy& Frontend::default_stop_policy() const noexcept { return impl_->defaults; }
 

@@ -450,7 +450,8 @@ Invalid choices and regexes use `invalid_choice` and `invalid_regex`, with the r
 
 These constraints apply to answer content; thinking is separate. GBNF supports recursive rules,
 Unicode and repetition. All modes support streaming and all speculative backends, including
-Qwen3.8-Flash-Next MTP and n-gram copy rounds. For assistant
+Qwen3.8-Flash-Next MTP and n-gram copy rounds and Inkling 2's DSpark (whose turn framing is described in
+[its guide](inkling2-mini.md#constrained-output-and-tool-calls)). For assistant
 continuation, the grammar covers the existing assistant content plus the generated suffix. Completion uses the model's EOS tokens;
 output limits and cancellation can produce an incomplete answer. JSON modes can be combined with
 active tools; GBNF, choice and regex require no active tools or `tool_choice:"none"`.
@@ -647,6 +648,10 @@ The three protocols share one constrained tool implementation:
 | OpenAI named function | Exactly one call to that function |
 | Anthropic named `tool` | One or more calls to that tool |
 | OpenAI `parallel_tool_calls:false` / Anthropic `disable_parallel_tool_use:true` | At most one call; exactly one when a call is required |
+
+Inkling 2 applies the same choices to its own call blocks (JSON in `<|content_invoke_tool_json|>`, described in
+[its guide](inkling2-mini.md#constrained-output-and-tool-calls)); the `<tool_call>`, parameter and streaming rules below
+are the Qwen models', and an Inkling 2 call arrives whole when its block closes.
 
 OpenAI `allowed_tools` supports `auto` and `required`; an entry naming a tool as the other kind (a
 declared function as `custom`, or the reverse) is a 400 `invalid_tool_choice`. Selection changes generation permissions,
@@ -1759,11 +1764,16 @@ cache keeps serving the conversation, and the first prompt carries none of the d
 
 - **Rendering.** Listed tools render in the template's tool section exactly as before; a request
   that defers nothing renders token-identically to one without these features. A result that loads
-  tools ends with `You now also have access to the following functions:`, a blank line, and the
-  definitions inside `<tools>`...`</tools>`, one JSON function definition per line in the form the
-  listed tools use (with `input_examples` when declared). The text depends only on the loaded
-  definitions, so a continuation Infernix runs and a later request that replays the same history
-  render the same tokens. Each tool loads once per result.
+  tools ends with the definitions in the model's own declaration wording. On the Qwen models that is
+  `You now also have access to the following functions:`, a blank line, and the definitions inside
+  `<tools>`...`</tools>`, one JSON function definition per line in the form the listed tools use (with
+  `input_examples` when declared). On Inkling 2 it is `These tools are now also available:` and the
+  definitions as its template's `tool_declare` block lists tools (one compact JSON array of
+  `description`, `name`, `parameters` and `type`); its template declares tools only before the
+  conversation, so tools loaded later are declared in the message that brings them, a form its
+  calls on them have not been measured with. The text depends only on the loaded definitions, so a
+  continuation Infernix runs and a later request that replays the same history render the same
+  tokens. Each tool loads once per result.
 - **Calls.** Every declared tool, deferred or not, belongs to the tool-call contract, which the
   Engine builds from the listed tools followed by the deferred ones (`PromptOptions::deferred_tool_jsons`).
   A call to a deferred tool parses, and is constrained under basic constraints or `strict:true`,
@@ -1956,7 +1966,7 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   - `scalar`: a number of at most `digits` digits (1-15, default 8) that may be negative or have a
     decimal part, closed by the model with `}`; answers `value`, the `text` the model wrote, and the
     errors `malformed_scalar`, `too_many_digits` or `run_cut_short` instead of a guess. Unlike ignis,
-    the colon after `{"value` is a choice between `":` and `":-`, the single token the tokenizer
+    the colon after `{"value` is a choice between `":` and `":-`, the single token the Qwen tokenizer
     writes for a colon followed by a minus sign: ignis forces `":` and offers a separate `-`, a
     sequence the model almost never writes, which left a negative answer about 1 % of the mass.
   - `point` and `box`: a position (`x`, `y`) or bounding box (`x0`, `y0`, `x1`, `y1`) on a
@@ -1965,6 +1975,11 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
     `method: "chain"`. A state without exactly one image is refused (`spatial_needs_one_image`).
   Their prompts are ignis's texts (`point` at three digits is the one its pointing measurements
   used); `answer_mass` is the lowest share of the distribution any chosen step's tokens held.
+  The primitives spell a number one digit a step. A model whose tokenizer writes digits in groups
+  (`"10"` one token, as Inkling 2's does) never writes a number that way, so the digits' share of the
+  distribution collapses and the answer is noise (a spider's legs read 60 at a mass of 5e-9 on Inkling
+  2): such a server refuses the generated types (`question_type_unsupported`, HTTP 400) and serves
+  the readout types.
 - **Option order is part of the prompt**: each option is shown under the label at its position, so
   reordering options asks a different question.
 - **`answer_mass`** is the declared labels' share of the whole next-token distribution. Near 1 the
@@ -1977,7 +1992,10 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   digits out of range, or a type not listed here (`question_type_unsupported`; ignis's
   attention-read `locate` and head-based `point`/`box` are not served) refuses the whole request with
   HTTP 400. Thinking is refused (`thinking_unsupported`): the answer
-  is read where the prompt ends, where a thinking prompt opens a reasoning block.
+  is read where the prompt ends, where a thinking prompt opens a reasoning block. Every question's prompt ends where
+  the answer starts: a Qwen template's prompt with thinking off already does, and on Inkling 2, which writes its own
+  reply header and thinks at every effort, the prompt ends with that header (`<|message_model|><|content_text|>`), so
+  the model answers without a thinking block (the prompts were measured on Qwen; Inkling's accuracy on them is not).
 - **Evidence placement and reuse.** JSON evidence follows the instruction in the system message, and
   content parts lead the user turn and end at an explicit prefix-cache boundary. The first question
   runs alone; the rest run in waves of `--max-concurrency` and resume from the cached evidence, so
@@ -2015,11 +2033,11 @@ log-likelihood requests of evaluation harnesses such as lm-evaluation-harness.
 
 | Field | Meaning |
 |---|---|
-| `apply_chat_template` | **Required**, `true` or `false`. `true` renders the prompt exactly as `/v1/chat/completions` renders it, generation prompt included; `false` encodes `prompt` as raw text with no template and no special tokens. There is no default, because it decides which distribution is measured. |
+| `apply_chat_template` | **Required**, `true` or `false`. `true` renders the prompt exactly as `/v1/chat/completions` renders it, generation prompt included; `false` encodes `prompt` as raw text with no template and no special token added. There is no default, because it decides which distribution is measured. |
 | `prompt` | A string. With the template it is one user message. |
 | `messages` | Chat Completions turns, text only (`score_text_only` otherwise). Needs `apply_chat_template: true`. Exactly one of `prompt` and `messages`. |
 | `enable_thinking`, `reasoning_effort`, `preserve_thinking`, `chat_template_kwargs` | Template options, parsed as on `/v1/chat/completions`. Refused when `apply_chat_template` is false (`template_option_without_template`). |
-| `continuation` | **Required**, non-empty. Encoded as raw text after the prompt; each of its tokens is one scored position. Position 0 is the prompt's own next-token distribution, whatever the continuation's first token is. |
+| `continuation` | **Required**, non-empty. Encoded as raw text after the prompt; each of its tokens is one scored position. Position 0 is the prompt's own next-token distribution, whatever the continuation's first token is. Raw text (here and a raw `prompt`) encodes a special token's text as that token on every model, as Hugging Face's tokenizers do by default: on Inkling 2, whose chat prompt ends after a closed message, a continuation that starts with `<\|message_model\|><\|content_text\|>` scores the reply header at positions 0 and 1 and the answer's first token at position 2. |
 | `top_k` | `0` to `256`: the most probable tokens returned per position, in descending order. Above `256` is refused (`top_k_out_of_range`), never narrowed. |
 | `hidden_states` | Optional, `true` or `false` (default). `true` also returns every layer's hidden state at the prompt's last token, the position whose distribution is position 0 (below). Not on `--lossless` (`invalid_score_request`). |
 | `model` | Optional. Resolved as on `/v1/chat/completions`: another name than the server's answers `404` `model_not_found` (unless `--any-model-name`). The response's `model` is the server's public model ID. |
@@ -2197,7 +2215,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--no-thinking` | disable thinking by default | thinking on |
 | `--preserve-thinking` | preserve closed-turn assistant reasoning by default (Qwen templates; Inkling 2 refuses it) | off |
 | `--tolerant-tool-calls` | recover complete tool calls cut by a malformed wrapper, a trailing suffix or the output budget instead of demoting them to text, and (with `--end-in-thinking allow`) complete calls stranded in thinking the model never closed. Qwen tool calls; Inkling 2 refuses it | off |
-| `--tool-parameter-names open\|declared` | on the constrained tool route, `declared` lets a call to a non-strict tool that declares parameters name only those (each once, in any order), and a value keeps a quoted `<parameter=NAME>` line its call cannot take as its text (see the constrained route). Inkling 2 has no constrained tool route and refuses `declared` | `open` |
+| `--tool-parameter-names open\|declared` | on the constrained tool route, `declared` lets a call to a non-strict tool that declares parameters name only those (each once, in any order), and a value keeps a quoted `<parameter=NAME>` line its call cannot take as its text (see the constrained route). Inkling 2's constrained tool route has no such policy (its calls are JSON objects), and it refuses `declared` | `open` |
 | `--restore-reasoning` | give a Chat Completions assistant message sent back without reasoning the reasoning this server generated for it: a tool-call message by its call ids, an answer by its text and the conversation before it. Changes the prompt the model sees from the history the client sent (see Chat Completions) | off |
 | `--cors` | permissive browser CORS headers | off |
 | `--usage-chunk-choice` | give the streamed usage chunk a zero-delta choice, for strict client parsers that reject the OpenAI-conformant empty `choices` array | off |

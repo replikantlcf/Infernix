@@ -530,7 +530,16 @@ checkpoint's `response_template` through transformers' `ResponseParser`, markers
 session one token a round, in rounds of 2 to 16 with a discarded preview each, and whole, and checks its stop
 strings, thinking budget, reasoning ban and raw output; `infernix_inkling2_frontend_real_test` converts the golden
 conversations to Engine requests (their ids again), echoes each generated turn back as history (reporting where a
-non-canonical turn departs) and checks the refusals of this slice and the context limit.
+non-canonical turn departs) and checks the refusals of this slice and the context limit;
+`infernix_inkling2_constraints_real_test` walks the constrained route (`src/models/inkling2/frontend/constraints.h`)
+through the frontend and the output session: for each content kind, tool policy (auto under Basic, required, named,
+none, parallel false, a strict tool), a JSON answer beside tools and a thinking budget, seeded walks draw every token
+from its position's mask and must end in the turn's language (the JSON answer with its schema's shape, the regex and
+choice texts, calls to callable tools with object arguments); a token outside a mask must be refused, and the masks'
+cost is printed by legal-token count; `infernix_inkling2_decide_real_test` builds `/v1/decide`'s label alphabet on the
+tokenizer, requires every generated primitive to be refused (`question_type_unsupported`: the tokenizer writes digits
+in groups) and checks a prompt that opens the answer (it ends with `<|message_model|><|content_text|>`, opens no
+reasoning, and its session publishes the first token as content).
 `infernix_inkling2_forward_real_test` (GPU) runs the forward on `INFERNIX_INKLING2_ARTIFACT` against a CPU reference's
 per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`): teacher-forced stages within 2^-5 of
 their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports
@@ -546,7 +555,8 @@ column equal to the same column projected alone.
 `infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2 through the public Engine against an eager
 one-request Engine prefilling 16 columns a call: the golden prompt's greedy continuation, CUDA graphs, four sampled
 requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's logits equal to the forward test's
-(`INFERNIX_INKLING2_LOGITS_GUARD`) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
+prompt route (`INFERNIX_INKLING2_PROMPT_LOGITS_GUARD`, which the forward test's `INFERNIX_INKLING2_PROMPT_LOGITS_OUT`
+writes; without it that one check is skipped and says so) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
 128, 1,000 and 4,096, one beside a decoding request) gives the greedy continuation and the scoring logits of chunks of
 16 byte for byte; under `--q8-weights` (refused with `--reproducible`) an eager one-request Engine is again the
 reference for graphs, C = 4, chunks of 7 and the long prompt in one call; it reports a chat turn, a thinking-budget
@@ -555,11 +565,27 @@ the full pools runs as such a variant too (accepted with `--reproducible`), with
 10,000-token prompt's continuation the same in chunks of 4,096 and 1,000; bf16p must give bf16's tokens throughout.
 A forced MoE stall (the down pass's error word, through a test seam) must fail its request with the stall's error, and
 the next request must equal an undisturbed run (`INFERNIX_INKLING2_STALL_ONLY=1` runs that case alone).
+`infernix_inkling2_constrained_engine_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) runs constrained requests (JSON
+Schema greedy and sampled, regex, choice, a required tool choice with a strict tool, Basic tool protection) through the
+public Engine: an eager Engine without a drafter is the reference, and CUDA graphs, C = 4 beside unconstrained requests
+(each giving its solo tokens), DSpark (auto with graphs, 7 drafts eager) and DSpark with `--lm-head-draft` must give
+its tokens, each answer in its language. Token constraints (`/v1/decide`'s generated primitives) on a prompt that opens
+the answer must keep every token in its step's set and the forced steps exact, step 0's draw (restricted
+probabilities, mass, observed log-probabilities, captured logits) must match an unconstrained readout of the same
+position within 2e-4, and graphs, C = 4 beside other requests and a DSpark Engine must give the eager tokens and draws
+bit for bit. It reports a free tools turn's raw text and whether a text turn with a tool declared gives the same tokens
+under Basic protection as free.
 `infernix_inkling2_options_test` (CPU only) passes every launch option Inkling 2 refuses through infernix-serve's parser,
 `normalize_inkling2_options` and `serve::refuse_unsupported_options` (each must be refused by its flag), and the
 configurations its callers start with (the server's and the launcher's defaults, tools/ablate's engines,
 infernix_bench's, the real tests' and infernix-perplexity's options), which must start; a scoring start must report
 the generation options it leaves unused.
+`infernix_inkling2_withdraw_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) reports a row as non-finite through
+`runtime::testing::set_nonfinite_fault`, as the other families' withdrawal tests do: a failed prompt's entries leave the
+prefix cache (its retry resumes from nothing and equals a cache-off run, which also reports its
+`cache_created_prompt_tokens`); with two lanes, a request prefilling beside the failure is unaffected and keeps its own
+entries (a prompt publishes at its prefill's end, so this case does not reach the withdrawal's pinned remainder); with
+`--prefix-cache-file`, a restarted Engine resumes the clean prompt and not the failed one.
 `infernix_inkling2_lossless_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) checks the `--lossless` route's cache form
 (generation) against its window form (scoring), the exact oracle: a 1,226-token sequence's logits byte for byte over
 calls of mixed widths (one wider than a sliding visit's ring, single-column decode calls, calls across the ring's wrap

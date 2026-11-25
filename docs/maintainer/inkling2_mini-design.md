@@ -547,7 +547,7 @@ per visit:  [attention mixer] → [projection q,k,v,r,gate,sink(,taps)] → [att
 | Frontend | `src/models/inkling2/frontend/` | renderer, output session, image preprocessing (the pre-tokenizer is the shared core's `Inkling` pipeline) |
 | Shared BPE core | `src/text/tokenizer.{h,cpp}` (moved from `qwen3_5/frontend/`) | the byte-level BPE tokenizer with two fixed pipelines (`TokenizerPipeline::Qwen`: NFC and Qwen's split; `Inkling`: no normalizer, the o200k-style split with case classes, `ignore_merges`), each pipeline's description in `tokenizer.json` checked against it. Two explicit consumers justify the move |
 | Ops | `src/ops/w4a4_sparse_moe/`; `src/ops/inkling2/` (`visit.cu`: the mixers, message gates, short convs and the experts' rows fused at the K1/K4-K5 boundaries of [§8.2](#82-the-visit-chain); `attention.cu`: the attention prologue and decode/verify attention); contracts `include/infernix/ops/{w4a4_sparse_moe,inkling2_visit,inkling2_attention}.h` | [§9](#9-attention-ops)-[§12](#12-residual-mixing-message-gates-and-short-convolutions); the fused kernels made separate `attn_res_mix`/`short_conv` Ops unnecessary |
-| Kernel cores reused | `ops/offloaded_sparse_moe/cuda/narrow_a4_mma.cuh`, `narrow_rows_a4.cuh`, `wide_expert.cuh`; `ops/linear/bf16_p12/`; `ops/common/{rowsplit_ring,mbarrier,mma}.cuh`; `ops/kernel/sampling.cuh` | the expert cores move to `ops/common/` once two Ops use them; the offloaded Op keeps its planning |
+| Kernel cores reused | `ops/offloaded_sparse_moe/cuda/narrow_a4_mma.cuh`, `wide_expert.cuh`; `ops/linear/bf16_p12/`; `ops/common/{rowsplit_ring,mbarrier,mma}.cuh`; `ops/kernel/sampling.cuh` | the expert cores move to `ops/common/` once two Ops use them; the offloaded Op keeps its planning |
 | Runtime reuse | `src/runtime/prefix_cache/`, `src/runtime/speculative/` (calibrated length), Scheduler, EngineCore | model-agnostic, unchanged |
 | Converter | `tools/convert/inkling2_loop.py` + recipe `inkling2_mini` | [§18](#18-artifact-and-conversion) |
 | Tests | `tests/ops/` per Op; `tests/models/inkling2/` | [§16](#16-numerics-and-qualification) |
@@ -1475,8 +1475,11 @@ fixture where summation order is visible ([op development §6.3](op-development.
   next-turn rendering as Qwen's.
 - **Reasoning effort.** OpenAI `reasoning_effort` and Anthropic thinking budgets map to the template's effort (strings as
   its table; numbers in [0, 0.99]); the default is the template's 0.9 (D6).
-- **Output session.** Channels from `response_template`: thinking, content, tool calls (JSON per call). Constrained tool
-  calls use the existing JSON grammar inside `<|content_invoke_tool_json|>` (TokenSpeed's `inkling2_json` frames the same).
+- **Output session.** Channels from `response_template`: thinking, content, tool calls (JSON per call). Constrained
+  output (built 2026-11-24: `frontend/constraints.cpp`, [constrained-decoding §4.4](constrained-decoding.md#44-inkling-2-mini))
+  states the whole turn's block framing as one grammar: thinking blocks, then the answer block holding the content
+  constraint, or call blocks holding `{"name": ..., "args": ...}` under the tool policy (TokenSpeed's `inkling2_json`
+  frames the same answer block).
 - **Thinking budget.** A turn may hold several thinking blocks, so the budget counts them together and holds for the
   whole turn (Qwen's one `<think>` block makes its one-shot control a turn budget; Inkling's does not): once the
   control has closed a block or a block has ended at the budget, `reasoning_ban()` refuses `<|content_thinking|>` at

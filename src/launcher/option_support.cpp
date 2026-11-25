@@ -71,8 +71,8 @@ constexpr std::array kRules = {
     Rule{"--ngram-volume", kFlash},
     Rule{"--ngram-residency", kFlash},
     // Thinking and tools: Inkling's template has an effort instead of preserve_thinking, its output session has no loop
-    // guard or tolerant tool-call parsing, and it has no constrained tool route (infernix-serve refuses each:
-    // serve::refuse_unsupported_options). Its thinking budgets work as every model's.
+    // guard or tolerant tool-call parsing, and its constrained tool route has no parameter-name policy (infernix-serve
+    // refuses each: serve::refuse_unsupported_options). Its thinking budgets work as every model's.
     Rule{"--preserve-thinking", kQwen},
     Rule{"--tolerant-tool-calls", kQwen},
     Rule{"--tool-parameter-names", kQwen},
@@ -133,7 +133,11 @@ bool supports_option(const ScannedModel& model, std::string_view flag) {
     if (kind == ModelKind::Unknown) { return true; }
     if (flag == "--expert-a4-activations") { return kind == ModelKind::FlashNext && fp4_local(model); }
     if (flag == "--a16-activations") { return takes_a16(model); }
-    if (flag == "--lm-head-draft") { return model.has_proposal; } // on Inkling: its proposal/token_rank parameter
+    if (flag == "--lm-head-draft") {
+        // On Inkling its proposal/token_rank parameter, and the DSpark drafter it shortlists for (the Engine refuses
+        // the flag without one).
+        return model.has_proposal && (kind != ModelKind::Inkling2 || model.has_dspark);
+    }
     if (std::find(kNeedsVision.begin(), kNeedsVision.end(), flag) != kNeedsVision.end() && !model.has_vision) {
         return false;
     }

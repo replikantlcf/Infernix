@@ -307,11 +307,26 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
                              .arguments_json = std::move(call.arguments_json)});
         }
         target.parts.reserve(source.parts.size());
+        bool rendered = false; // an earlier part of the message renders content
         for (MessagePart& part : source.parts) {
+            const bool renders = part.kind != MessagePartKind::Text || !part.text.empty();
             switch (part.kind) {
             case MessagePartKind::Text:
                 target.parts.push_back(fi::ChatPart::text_part(std::move(part.text)));
                 break;
+            case MessagePartKind::LoadedTools: {
+                // Qwen's tool-section wording and framing, so a loaded definition reads like a listed one (after a
+                // blank line when the message already renders something).
+                std::string text = rendered ? "\n\n" : "";
+                text += "You now also have access to the following functions:\n\n<tools>";
+                for (const std::string& tool : part.tool_jsons) {
+                    text += '\n';
+                    text += tool;
+                }
+                text += "\n</tools>";
+                target.parts.push_back(fi::ChatPart::text_part(std::move(text)));
+                break;
+            }
             case MessagePartKind::Media: {
                 if (part.media.bytes.empty()) {
                     throw std::invalid_argument("frontend media input contains no owning bytes");
@@ -336,6 +351,7 @@ std::vector<fi::ChatMessage> convert_messages(std::vector<ChatMessage> messages)
             default:
                 throw std::invalid_argument("frontend message-part kind is invalid");
             }
+            rendered = rendered || renders;
         }
         result.push_back(std::move(target));
     }
@@ -916,6 +932,11 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     ContextCacheHints cache_hints = std::move(input.context_cache);
     if (cache_hints.markers.size() > kMaximumExplicitPromptCacheMarkers) {
         throw std::invalid_argument("PromptInput supports at most four explicit cache markers");
+    }
+    // PromptOptions::open_answer: the template's generation prompt with thinking off already ends in the answer.
+    if (options.open_answer && (options.enable_thinking != false ||
+                                options.continuation != PromptContinuationMode::NewAssistantTurn)) {
+        throw std::invalid_argument("a prompt that opens the answer needs a new assistant turn with thinking off");
     }
     const auto tool_call_output =
         fi::build_tool_call_output_contract(options.tool_jsons, options.deferred_tool_jsons, options.open_tool_names,
