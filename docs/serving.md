@@ -366,7 +366,9 @@ The endpoint supports:
   processing without generation. As an extension (OpenAI rejects it), `-1` means no explicit limit:
   the field is treated as omitted, so the other spelling or `--default-max-tokens` applies;
 - `temperature`, `top_p`, presence/frequency penalties, and signed integer `seed`;
-- the compatible `top_k` (`0..20`) and `min_p` (`0..1`) sampler extensions;
+- the compatible `top_k` (`0..20`; 0 is no limit: the whole vocabulary on Inkling 2 with `top_p` 1 and `min_p` 0
+  ([Inkling 2 Mini](inkling2-mini.md)), the 20-candidate cap otherwise and on the other models) and `min_p` (`0..1`)
+  sampler extensions;
 - up to four non-empty stop strings, applied to the answer only: not to reasoning, and not inside a
   tool call the model opened with its `<tool_call>` token (between it and `</tool_call>`), whose
   arguments are the tool's data (as on the Responses and Messages endpoints);
@@ -532,7 +534,11 @@ remains a structured call: valid JSON retains its represented type and other tex
 the tool consumer can report the validation error and continue the agent loop. Schemas that name no
 type this way (no type keyword, an invalid type name, a remote, missing or circular reference)
 retain untyped inference. Infernix does not apply defaults, enforce required
-properties, or perform recursive JSON Schema validation on this route.
+properties, or perform recursive JSON Schema validation on this route. A call that leaves out a
+property its tool's schema lists under `required` is published as the model wrote it (a value it
+did not write would be invented); `tool_call_parse.required_arguments_missing` and
+`infernix_tool_call_required_arguments_missing_total` count such calls on every route and model,
+Basic protection's included (it keeps a call's form, not its schema; a strict tool cannot omit one).
 
 On the unconstrained route, string parameters preserve function/tool-call markers and balanced nested
 `<parameter=...>...</parameter>` text as value bytes. The Qwen wire format has no delimiter escape,
@@ -2109,7 +2115,7 @@ The table lists executable defaults. The startup example selects a long-context 
 
 | Option | Meaning | Default |
 |---|---|---:|
-| `--config FILE` | read options, and the artifact path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it | unset |
+| `--config FILE` | read options, and the artifact path, from a TOML file ([Configuration file](#configuration-file)); command-line options override it, except that a repeatable option's values add to the file's and a flag the file sets stays set | unset |
 | `--plan FILE` | size a start with the other options on this machine without loading the model, write the plan to `FILE` as JSON and exit `0` (fits), `3` (does not fit) or `1` (no plan) ([Sizing a start without loading](#sizing-a-start-without-loading)) | unset: start the server |
 | `--host H` | listen address | `127.0.0.1` |
 | `--port N` | listen port | `8080` |
@@ -2172,7 +2178,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--response-store-max-records N` | maximum locally retained Responses objects | `1024` |
 | `--response-store-max-mib N` | total local Response envelope/Item/context budget | `256` |
 | `--route-trace PATH` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) only: write the expert-routing trace `tools/expert_cache_replay/host_tier.py` replays — a header, one record per prefill, forced, decode and verify round, and one per CUDA-graph instantiation; no decode-path work when unset. `PATH` may not be the model artifact or another output file (`--log-file`, `--request-log-jsonl`, `--prefix-cache-file`) | disabled |
-| `--kv-dtype bf16\|bf16p\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage; `vq2` and `k4v2` are the 2-bit and 4-bit-K vector-quantized formats ([CLI](cli.md#context-and-memory)); `bf16` stores K as BF16 and V as FP16 (exact for every BF16 value with 2^-17 <= \|v\| < 2^16), and with `--lossless` V as BF16; `bf16p` stores the same values as `bf16` losslessly in 12 bits a value plus an 8-byte side record per row, 23 % fewer bytes (the same memory holds 1.31 times the tokens, in the KV cache and the prefix cache), with the same output as `bf16`; a request whose K or V holds a row with more than 6 values outside its 14-binade exponent window fails with an error (none was seen in the 27B's or 35B-A3B's KV). Inkling 2: the format of its full visits' pools (`bf16`, `bf16p`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`), its sliding windows staying BF16 K / FP16 V ([options](cli.md)) | `bf16` |
+| `--kv-dtype bf16\|bf16p\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage; `vq2` and `k4v2` are the 2-bit and 4-bit-K vector-quantized formats ([CLI](cli.md#context-and-memory)); `bf16` stores K as BF16 and V as FP16 (exact for every BF16 value with 2^-17 <= \|v\| < 2^16), and with `--lossless` V as BF16; `bf16p` stores the same values as `bf16` losslessly in 12 bits a value plus an 8-byte side record per row, 23 % fewer bytes (the same memory holds 1.31 times the tokens, in the KV cache and the prefix cache), with the same output as `bf16`; a request whose K or V holds a row with more than 6 values outside its 14-binade exponent window fails with an error (none was seen in the 27B's or 35B-A3B's KV). Inkling 2: the format of its full visits' pools (`bf16`, `bf16p`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`), its sliding windows following it (`bf16` and `bf16p` in their own format, every other format as `int8`; [options](cli.md)) | `bf16` |
 | `--logits-dtype fp32\|bf16` | the vocabulary head's logits, which the sampler, greedy selection, draft acceptance, constraints and scoring read, on every route (Inkling 2 refuses `bf16`): `fp32`, the head's sums without a final rounding, or `bf16`, each logit rounded once to BF16 as Hugging Face Transformers returns them (near-equal logits then become exact ties, which selection breaks by token id); for comparisons with engines and references that round them. With `--lossless` each exact sum is correctly rounded to the chosen dtype | `fp32` |
 | `--spec auto\|off\|mtp\|dflash\|dflash2\|dspark` | speculative backend. Inkling 2 Mini: `dspark` drafts with the artifact's bundled DSpark drafter (`--draft-tokens 1..7`, or `auto`: the calibrated count of 7 drafts a round verifies), one request decoding at a time (rounds of several requests decode plainly); greedy and sampled output equal plain decoding's, token for token; `auto` (with `--draft-tokens auto`) drafts with the bundled DSpark drafter (measured faster: on the sampled prose fixture 194.5 against 191.2 tok/s plain, infernix_bench, 2026-11-22, RTX 5090), plainly when the artifact bundles none ([options](cli.md)). `auto` (with `--draft-tokens auto`; a fixed length and `--spec-min-p` are refused) takes the drafter measured fastest overall among those the artifact can run ([recommended settings](../README.md#quick-start-windows)): on Qwen3.8-Flash-Next DFlash2 when `--draft-model` gives its drafter or the drafter's companion artifact is the only one in the model's folder (with several there, MTP until `--draft-model` names one), else MTP; on a Qwen3.5-family artifact with offloaded experts (the 122B-A10B) MTP; on any other Qwen3.5-family artifact DFlash2 (the Qwen3.8-27Bs), then MTP (the Qwen3.6-35B-A3B and 27Bs), then DFlash, as bundled; plain decode without one and on `--lossless`. Startup reports the choice; `/metrics` and the request log name the chosen backend. Without `--spec` the server runs `auto` with `--draft-tokens auto`, so a fixed `--draft-tokens N` or `--spec-min-p` needs a named backend; `off` decodes plain | `auto` |
 | `--draft-tokens N\|auto` | MTP `1..7` (Qwen3.5/3.6 `1..5`); DFlash/DFlash2 `1..15` (Qwen3.8-Flash-Next DFlash2 `1..7`). `N` drafts and verifies N tokens every round (fewer only near the output limit). `auto` with DFlash or DFlash2: each round drafts the whole block and verifies the number its drafts' calibrated probabilities make fastest; on Qwen3.8-Flash-Next DFlash2 a block of 7 ([guide](qwen3_8-flash-next.md#run)); on Qwen3.5/3.6 the `adaptive-dflash` fast path where that is qualified (the NVFP4 Qwen3.8-27B, a block of 15 whose rounds of several requests verify 7; the Qwen3.6-35B-A3B, a block of 7; [DFlash](maintainer/dflash.md#automatic-verify-width-qwen38-27b--qwen36-35b-a3b)), elsewhere, and with `--reproducible`, the artifact's fastest fixed length every round (7 on the 27B, 3 on the 35B-A3B). On the 122B-A10B, whose verify columns each bring their own expert misses, `auto` with either drafter decodes without one (no draft length was faster than plain decode; the drafter is not loaded). `auto` (MTP): each round drafts the length the request's learned acceptance makes fastest, `0..7` on Qwen3.8-Flash-Next (whose one-request rounds also apply the cumulative acceptance cut, [design §11.3](maintainer/qwen3_8-flash-next-design.md#113-draft-length)); on Qwen3.5/3.6 it is the `adaptive-mtp` fast path (`1..5`) where that is qualified (the NVFP4 Qwen3.8-27B and Qwen3.6-35B-A3B); elsewhere, and with `--reproducible`, every round drafts the artifact's fastest fixed length (5 on the NVFP4 27B, 3 otherwise; none on the 122B-A10B, as above), which startup reports | unset |
@@ -2222,7 +2228,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--claude-code-usage-compat` | Anthropic streaming only: report a provisional `0` as `message_start`'s `input_tokens` (its cache-read split stays exact, terminal usage unchanged), so a Claude Code version that keeps the start value when the terminal `message_delta` corrects it to `0` cannot count the prompt twice (see [Anthropic Messages](#anthropic-messages)) | off |
 | `--temperature F` | process-level temperature override | unset |
 | `--top-p F` | process-level top-p override | unset |
-| `--top-k N` | process-level top-k override (`0..20`; zero selects the top-20 cap) | unset |
+| `--top-k N` | process-level top-k override (`0..20`; zero is no limit: the whole vocabulary on Inkling 2 with top-p 1 and min-p 0, the top-20 cap otherwise) | unset |
 | `--min-p F` | process-level min-p override | unset |
 | `--presence-penalty F` | process-level presence-penalty override | unset |
 | `--frequency-penalty F` | process-level frequency-penalty override | unset |
@@ -2430,6 +2436,8 @@ curl http://127.0.0.1:8080/metrics
 | `infernix_requests_total{outcome}`, `infernix_response_failures_total` | Generation attempts entering preparation and subsequent response failures; protocol/model validation failures and token-count requests are excluded |
 | `infernix_chat_reasoning_missing_total{message}`, `infernix_chat_reasoning_restored_total{message}` | Chat Completions assistant messages received without reasoning (`tool_call`: every tool-call message; `answer`: answers whose response from this server had reasoning), and those `--restore-reasoning` restored |
 | `infernix_tool_call_arguments_unwrapped_total` | Generated tool calls whose only parameter, an `arguments` their tool does not declare, held the whole argument object and was unwrapped (see the tool-parameter conversion above) |
+| `infernix_tool_call_required_arguments_missing_total` | Generated tool calls whose arguments leave out a property their declared tool's schema requires, published as written (strict tools cannot) |
+| `infernix_tool_call_notation_total` | Inkling 2 tool calls read from the XML notation the model drifts into (a text block of `<invoke name=...>` calls; [Inkling 2 Mini](inkling2-mini.md#constrained-output-and-tool-calls)) |
 | `infernix_time_to_first_token_seconds` | Histogram updated once at the first committed token, including preparation, queueing and binding |
 | `infernix_request_duration_seconds`, `infernix_request_queue_seconds` | Histograms for settled generation outcomes, including cancellation; exceptional failures have separate counts |
 
@@ -2635,7 +2643,10 @@ counts; anything else is ignored, and the request itself is unaffected.
 `request_done.result.tool_call_parse` records whether a complete marker was seen, the structured
 call count, empty non-string arguments omitted during normalization, schema-mismatched arguments
 preserved for consumer validation, `duplicate_parameters_repaired`, `arguments_unwrapped` (calls
-whose lone undeclared `arguments` object became their arguments), and a stable fallback reason.
+whose lone undeclared `arguments` object became their arguments), `required_arguments_missing`
+(calls that leave out a property their tool's schema requires, published as written),
+`notation_calls` (Inkling 2 calls read from the XML notation the model drifts into; see
+[Inkling 2 Mini](inkling2-mini.md#constrained-output-and-tool-calls)), and a stable fallback reason.
 On the unconstrained route a parameter named more than once in one call keeps its last value, as in
 JSON object syntax, and counts once in `duplicate_parameters_repaired` for each repeat instead of
 demoting the call to text (a constrained call cannot repeat a name).
@@ -2702,7 +2713,7 @@ request: `enabled` when the server has one (`--ngram-archive-mib`), `bound` when
 bound to a draft session, `published` when its input and output were published into it,
 `generation` as the session's latest completed generation, `sources` and `session_bytes` as the
 bound session's retained source count and bytes, `total_bytes` as the whole archive's bytes, and
-`sampling_seed` as the effective seed after request-domain separation for a request that named a
+`sampling_seed` as the effective seed after request-domain separation (the default route only: `--reproducible` keeps the caller's seed) for a request that named a
 session, otherwise `null`.
 
 For `server_start.memory`, `workspace.capacity_bytes` is the only physical workspace allocation.
@@ -2810,7 +2821,9 @@ until it finished.
 not be published), `host_image_write_refusals` and `host_block_write_refusals` (snapshots and
 blocks refused Host slabs, which then stay Device-only), `device_slot_evictions` (Device snapshot
 slots taken from another snapshot) and `device_slot_refusals` (slot requests refused);
-`free_device_snapshot_slots` is an end-of-interval gauge. `host_image_writes`, `host_block_writes`,
+`free_device_snapshot_slots` is an end-of-interval gauge. Of these, the Qwen3.8-Flash-Next prefix cache keeps
+`taps_retried` (it retries a tap refused for room at the next prefill call boundary) and reports 0 for the others,
+which count Qwen3.5's Device snapshot slots and Host refusals; Inkling 2 reports 0 for all of them. `host_image_writes`, `host_block_writes`,
 `host_image_restores`, `host_block_restores`, `host_write_bytes`, and `host_restore_bytes` count
 Host-tier write-through and restores, and `host_write_copies` and `host_restore_copies` the copy
 calls that moved those bytes (a restore enqueues its copies in batches, one call a model layer's KV
@@ -2958,7 +2971,8 @@ between requests, and snapshots of a lane's state at taps), with three differenc
   it gets, bit for bit, on every route. A continuing turn resumes at the previous prompt's end and prefills the
   previous reply again (about 16,000 tokens a second on an RTX 5090).
 - **Snapshots live in the Host tier** (`--host-context-mib`, which must not be `0`): a tap copies the lane's window
-  and convolution rings (about 190 MiB with BF16 rings, plus 9 MiB of the DSpark drafter's rings) straight to pinned
+  and convolution rings (about 190 MiB with `--kv-dtype bf16`'s BF16 windows, 107 MiB with the INT8 windows of `int8`
+  and the other quantized formats, 158 MiB with `bf16p`; plus 9 MiB of the DSpark drafter's rings) straight to pinned
   RAM, and a resumed request copies them back before its first prefill call. The drafter's full-attention context
   is stored in the KV pages beside the model's, so a resumed request keeps drafting.
 - **No request is ever paused**: every lane reserves its whole context when it binds, so the cache holds the pages no

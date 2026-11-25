@@ -1,6 +1,7 @@
 #include "models/inkling2/frontend/frontend.h"
 
 #include "models/inkling2/frontend/constraints.h"
+#include "models/output_text.h"
 #include "runtime/prefix_cache/block_hash.h"
 #include "text/grammar.h"
 #include "text/jinja.h"
@@ -139,7 +140,10 @@ std::string tool_name(const Json& tool) {
 DeclaredTool declared_tool(const Json& tool, std::size_t index) {
     const Json& fn = tool.contains("function") ? tool.at("function") : tool;
     DeclaredTool out{.name = tool_name(tool), .declaration_index = index};
-    if (fn.contains("parameters") && !fn.at("parameters").is_null()) { out.parameters = fn.at("parameters").dump(); }
+    if (fn.contains("parameters") && !fn.at("parameters").is_null()) {
+        out.parameters = fn.at("parameters").dump();
+        out.required   = required_properties(fn.at("parameters"));
+    }
     out.strict = fn.contains("strict") && fn.at("strict").is_boolean() && fn.at("strict").get<bool>();
     return out;
 }
@@ -238,9 +242,11 @@ struct Frontend::Impl {
             defaults.token_ids.end()) {
             throw std::invalid_argument("inkling2 generation_config.json must stop at <|content_model_end_sampling|>");
         }
-        // generation_config.json sets temperature 1 alone; the sampler takes at most 20 candidates.
+        // generation_config.json sets temperature 1 alone (the whole vocabulary). The preset keeps top-k 20 (the
+        // shipped default); top_k 0 samples the whole vocabulary (ModelSamplingDefaults::full_vocabulary: every draw,
+        // DSpark's verify columns included, goes through ops::sample).
         const SamplingPreset preset{.temperature = 1.0F, .top_k = 20, .top_p = 1.0F};
-        sampling = {.thinking = preset, .non_thinking = preset};
+        sampling = {.thinking = preset, .non_thinking = preset, .full_vocabulary = true};
         std::vector<TokenId> control;
         if (!options.thinking_budget_message.empty()) {
             for (const int token : tokenizer->encode(options.thinking_budget_message, {.parse_added_tokens = false})) {
@@ -647,6 +653,15 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt, const 
     settings.tools         = tool_choice.mode == ToolChoiceMode::None ? nullptr : prompt.data().tools;
     settings.grammar       = std::move(matcher);
     settings.answer_opened = prompt.data().answer_opened;
+    // Calls written in the XML notation the model drifts into (candidates JC-01: 18 of 50 calls on Basalt #540's
+    // probe): the turn's callable tools (the policy's, or every declared one when the calls are free), strict ones
+    // left out.
+    if (settings.tools != nullptr) {
+        for (const DeclaredTool& tool : tools ? tools->tools : settings.tools->tools) {
+            if (!tool.strict) { settings.notation_tools.push_back(tool); }
+        }
+        settings.parallel_calls = tool_choice.parallel;
+    }
     return OutputSession(std::move(settings));
 }
 

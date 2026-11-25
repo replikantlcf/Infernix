@@ -275,7 +275,7 @@ Defaults per family (README "Recommended settings per model"):
 |---|---|
 | all | `--max-concurrency 2 --kv-dtype int8 --preserve-thinking --tolerant-tool-calls --pending-timeout-ms 900000`, and `--spec auto --draft-tokens auto` when a drafter is available |
 | Qwen3.8-Flash-Next | `--max-context 262144 --lm-head-draft`, the best DFlash2 drafter found (`--draft-model`) and n-gram volume (`--ngram-volume`, unless `<artifact>.ngram` exists) |
-| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --prefill-chunk 4096 --max-context auto` (the context the GPU's memory holds beside the artifact, below) |
+| Qwen3.8-27B | `--lm-head-draft --ngram-draft-tokens auto --max-context auto` (the context the GPU's memory holds beside the artifact, below) |
 | Qwen3.6-27B, Qwen3.6-35B-A3B | `--lm-head-draft` where the artifact has a proposal head; the 27B's context as for Qwen3.8-27B |
 | Qwen3.5-122B-A10B | `--max-context 262144` |
 
@@ -476,9 +476,10 @@ OpenAI and Anthropic SDKs. **Endpoints**, at the top of every page, copies eithe
 **Settings → API keys** creates named keys (`inx-` and 32 letters and digits, shown once; the
 launcher keeps their SHA-256), each **API** (the `/v1` routes) or **Admin** (also the web UI and its
 management API from other computers), with when it was last used. With no key, `/v1` is open; with
-any key, `/v1` needs one, as `Authorization: Bearer` or `x-api-key`. The event log and the usage page
-name the key each request came with. Listening on another address than loopback without a key logs
-a warning.
+any key, `/v1` needs one, as `Authorization: Bearer` or `x-api-key`, except the health check
+(`/health` and `/v1/health`, the state and the loaded model's alias), which stays open as
+infernix-serve's `/health` does. The event log and the usage page name the key each request came
+with. Listening on another address than loopback without a key logs a warning.
 
 The web UI and its management API (`/launcher/api`) answer this computer without a key. From
 another computer they need **Manage from other computers** on, and then follow the keys as `/v1`

@@ -56,11 +56,13 @@ hf download wallawalla47/Inkling-2-Mini-Infernix Inkling-2-Mini-Infernix.inferni
 ## Run
 
 ```bat
-infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --spec dspark --draft-tokens auto --lm-head-draft
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft
 ```
 
 - `--max-context auto` takes the largest context the free VRAM holds for every lane. Without it
   `infernix-serve` uses 8,192 tokens and `infernix` 2,048.
+- `--kv-dtype int8` stores the KV cache, the sliding windows included, in 8 bits: about half the memory
+  of the default `bf16`, for slightly different output ([KV formats](#kv-formats)).
 - `--spec dspark --draft-tokens auto` is what the default `--spec auto` chooses for this artifact.
 - `--lm-head-draft` is optional: it changes the speed of drafting, never the output.
 - Add `--vision` for images. Its tower and image buffers stay in VRAM and reduce the context.
@@ -71,11 +73,20 @@ A single request from the command line (`--max-concurrency` and the cache option
 `infernix-serve`):
 
 ```bat
-infernix.exe Inkling-2-Mini-Infernix.infernix --prompt "Explain what a looped transformer is." --max-context 32768 --max-new 2048 --spec dspark --draft-tokens auto --lm-head-draft
+infernix.exe Inkling-2-Mini-Infernix.infernix --prompt "Explain what a looped transformer is." --max-context 32768 --max-new 2048 --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft
 ```
 
 When a request sets no sampling options the engine uses temperature 1.0, top-p 1.0 and top-k 20: the
-checkpoint's generation config sets the temperature, and 20 is the sampler's candidate limit.
+checkpoint's generation config sets the temperature (over the whole vocabulary), and top-k 20 is the shipped
+default. `top_k: 0` (`--top-k 0`) with top-p 1 and min-p 0 samples the whole vocabulary, as the generation config
+asks, by Gumbel-max (each verify column of DSpark draws the same way, so drafting changes nothing). At temperature 1
+the top-20 cap leaves out 2.5 % of the probability on average on prose answers (median 0.34 %, 90th percentile 8.1 %,
+99th 22 %; 2,182 sampled positions of eight answers, 2026-11-24). With top-p below 1 or min-p above 0, top-k 0 keeps
+the 20-candidate domain, and `--lossless` always keeps it (its bits do not change). The whole-vocabulary draw is the
+cheaper sampler call (an RTX 5090 op bench: 14 against 19 us at one row, 17-18 against 44 us at eight), but DSpark
+accepts fewer drafts, since more draws leave the drafter's top token: on four seeded prose prompts (each run three
+times, DSpark auto, one request) decode went from 222.0 to 213.7 tokens/s (-3.7 %) and acceptance from 0.364 to
+0.340, with different texts in the two settings (2026-11-24).
 
 ### Check a configuration first
 
@@ -83,7 +94,7 @@ checkpoint's generation config sets the temperature, and 20 is the sampler's can
 exits `0` (fits), `3` (does not fit) or `1` (no plan):
 
 ```bat
-infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --max-concurrency 2 --spec dspark --draft-tokens auto --lm-head-draft --vision --plan plan.json
+infernix-serve.exe Inkling-2-Mini-Infernix.infernix --max-context auto --max-concurrency 2 --kv-dtype int8 --spec dspark --draft-tokens auto --lm-head-draft --vision --plan plan.json
 ```
 
 See [Sizing a start without loading](serving.md#sizing-a-start-without-loading).
@@ -177,14 +188,17 @@ speeds. Measured effects of the options are in the [CLI options](cli.md#common-o
 
 ## KV formats
 
-`--kv-dtype` selects how the eight full-attention visits store their keys and values. The 40 sliding
-visits' windows stay BF16 keys and FP16 values in every format.
+`--kv-dtype` selects how the eight full-attention visits store their keys and values, and with it the
+40 sliding visits' windows: `bf16` and `bf16p` keep their windows in the same format, and every other
+format stores its windows as `int8`. `int8` is recommended: its windows and pools take about half the
+memory of `bf16`'s, so the same VRAM holds more context and more of the prefix cache. It decodes within
+0.4 % of `bf16` and prefills up to 1.5 % slower ([performance](#performance)).
 
 | Format | Stored as | Output against `bf16` |
 |---|---|---|
 | `bf16` (default) | BF16 keys, FP16 values | the reference |
 | `bf16p` | the same values packed losslessly to 12 bits | identical; a request with a row that has no packed form fails |
-| `int8` | 8-bit, two scales a row | changes |
+| `int8` (recommended) | 8-bit, two scales a row | changes |
 | `fp8` | E4M3, one scale a row | changes |
 | `nvfp4` | NVFP4 | changes |
 | `k8v4` | `fp8` keys, `nvfp4` values | changes |
@@ -263,6 +277,21 @@ declared with `strict: true`, `parallel_tool_calls: false`, and the protection o
   tools (`auto`) is either the answer or the calls.
 - Calls arrive whole when they close, not streamed argument by argument as Qwen's constrained calls are. A call's
   arguments are its `args` object as the model wrote it (with or without a constraint).
+- The model sometimes writes a call in an XML notation it was never shown, as a text block:
+  `<invoke name="NAME"><parameter name="KEY">VALUE</parameter>...</invoke>`, bare or inside
+  `<tool_call><function_calls>`, a parameter with or without `string="true"` (18 of 50 replies on Basalt #540's
+  one-tool edit probe, temperature 0, here as on Basalt; 2026-11-24). Such a block is the calls it holds, on every route
+  (Basic protection included, unlike Qwen, whose constrained content keeps these spellings as text), when all of these
+  hold: it begins with `<tool_call>`, `<function_calls>` or `<invoke ` after whitespace; it holds nothing but closed
+  invokes of the turn's callable tools (wrappers closed); a call block or the turn's end follows it. A strict tool's
+  call stays text (its arguments were never held to its schema), as do more than one call under `parallel_tool_calls:
+  false`, any XML in thinking, `tool_choice: none`, a block cut by the output limit or followed by the limit, and a
+  block a stop string ends (matched as if never held). A value ends at the `</parameter>` that a parameter or
+  `</invoke>` follows (one quoted inside the value is the value's); it is the model's text, entities undecoded;
+  `string="true"` keeps it as a string; otherwise it is the JSON it holds when that is a type its property declares
+  (any when it declares none) and a string otherwise. Such a block publishes nothing until it is decided; text then
+  publishes exactly as unheld. `tool_call_parse.notation_calls` and `infernix_tool_call_notation_total` count these
+  calls.
 - A constrained request needs the model's own end of turn: custom stop strings and raw output are refused beside a
   constraint. `--tool-parameter-names declared` remains a Qwen option and is refused.
 - DSpark keeps drafting under a constraint: each verified position samples under its own mask, so the output is the
@@ -336,6 +365,11 @@ RTX 5090, PCIe Gen5 x8, default route, `--kv-dtype bf16`, one request unless not
 | Prefill | 16,261 tok/s at 2,048 tokens, 16,184 at 10,000, 15,733 at 16,384 |
 | Decode, several requests (total) | 312 / 452 / 648 tok/s at 2 / 4 / 8 requests |
 | Largest `--max-context auto`, one lane, BF16 KV (`--plan`, about 30 GiB of VRAM for the model) | 302,528 tokens; 297,728 with `--lm-head-draft`; 243,584 with `--lm-head-draft --vision` |
+| The same with `--kv-dtype int8` | 526,656 tokens; 518,400 with `--lm-head-draft`; 424,704 with `--lm-head-draft --vision` |
+
+With `--kv-dtype int8` (2026-11-25, the same bench against `bf16` in one build, two runs each): plain decode 205.6
+tok/s after a 2,048-token prompt and 194.5 after 10,000 (`bf16` 204.8 / 195.0); prefill 16,243 tok/s at 2,048 tokens
+and 16,003 at 10,000 (`bf16` 16,344 / 16,243).
 
 Measured with `infernix_bench` on the published artifact (2026-11-24). Plain decode, prefill and several requests are
 means of three runs after a warmup. The DSpark rows are two runs each of a chat and a prose prompt (1,200 tokens,

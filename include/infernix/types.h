@@ -954,6 +954,10 @@ struct SamplingPreset {
 struct ModelSamplingDefaults {
     SamplingPreset thinking;
     SamplingPreset non_thinking;
+    // The family samples the whole vocabulary for top_k 0 (with top_p 1 and min_p 0; candidates JM-40): its draws,
+    // speculative ones included, all go through a sampler that takes the whole domain. Otherwise top_k 0 means the
+    // sampler's 20-candidate cap.
+    bool full_vocabulary = false;
 
     [[nodiscard]] constexpr const SamplingPreset& for_mode(SamplingMode mode) const noexcept {
         return mode == SamplingMode::Thinking ? thinking : non_thinking;
@@ -975,7 +979,7 @@ struct SamplingOverrides {
 // Complete parameters after Engine resolution. Target runtimes consume only this type.
 struct ResolvedSamplingParameters {
     float temperature       = 0.0F;
-    std::int32_t top_k      = 20;
+    std::int32_t top_k      = 20; // [1,20]; 0 (no limit) only on a family whose defaults declare full_vocabulary
     float top_p             = 1.0F;
     float min_p             = 0.0F;
     float presence_penalty  = 0.0F;
@@ -1235,6 +1239,12 @@ struct ToolCallParseDiagnostics {
     // Calls whose only parameter, `arguments`, which their tool does not declare, held the whole argument
     // object and was unwrapped.
     std::uint32_t arguments_unwrapped             = 0;
+    // Published calls whose arguments leave out a property their declared tool's schema requires (counted, never
+    // completed: Basic protection keeps a call's form, not its schema).
+    std::uint32_t required_arguments_missing      = 0;
+    // Calls read from an XML notation the model was not given (Inkling 2: `<invoke name="NAME">` calls that make up a
+    // whole text block).
+    std::uint32_t notation_calls                  = 0;
     ToolCallParseFallbackReason fallback_reason   = ToolCallParseFallbackReason::None;
     // Tolerant tool-call mode turned output the strict parser rejects into structured calls.
     bool tolerant_recovered = false;
