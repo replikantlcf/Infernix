@@ -411,7 +411,7 @@ routes this design has not built yet (prefill, DSpark, prefix reuse, vision, str
 | A sliding visit's prefill attends over a staging ring: the window before the chunk copied in, the chunk's keys appended, the window that ends the chunk copied back to the sequence's ring | `executor.cpp` `visit()` (`ring_copy`, `prefill_ring`) | the M8 prefill route over the StateImage's 17-page window ring ([§9.3](#93-prefill)) |
 | A named tool choice forced by the prompt: it ends with `<|message_model|>NAME<|content_invoke_tool_json|>`, the turn resumes inside the call's JSON and the decoder starts in it | `inkling_output.h` `InklingToolCallDecoder` | needs the tool choice at preparation (PromptOptions has none today); with it, a required choice of one name needs no grammar |
 | The prompt opens the answer's text block for typed decisions and reranking (the token read is the answer's) | `docs/inkling2.md` | a readout recipe for the frontend, if typed decisions come to this family |
-| DSpark drafts for one decoding request at a time, up to 3 drafts a round: a controller picks the width from how far the request's drafts survive and the round times it measured at each width, and a round verifies only through its first draft at probability ≤ 0.5. Reported: greedy 1.14-1.41×, temperature 1 0.99-1.24×, 1.46-2.68 tokens a round | `runtime/engine/inkling2_core.cpp` `round_drafts`, `spark_controller`; `docs/inkling2.md` | §13.4's confidence-calibrated length with the measured cost line covers both rules; its short chains and modest gains are a bound for its W4A8 arithmetic and 15-20 launches a visit, not for this design's draft cost (§13.5). The lone-request rule is the cost line's answer at C > 1 until M6 measures otherwise |
+| DSpark drafts for one decoding request at a time, up to 3 drafts a round: a controller picks the width from how far the request's drafts survive and the round times it measured at each width, and a round verifies only through its first draft at probability ≤ 0.5. Reported: greedy 1.14-1.41×, temperature 1 0.99-1.24×, 1.46-2.68 tokens a round | `runtime/engine/inkling2_core.cpp` `round_drafts`, `spark_controller`; `docs/inkling2.md` | §13.4's confidence-calibrated length with the measured cost line covers both rules; its short chains and modest gains are a bound for its W4A8 arithmetic and 15-20 launches a visit, not for this design's draft cost (§13.5). The lone-request rule held until 2026-11-25; rounds of several rows now draft together (§13.7) |
 | Rollback is a frontier move over rings sized to the window plus a verify block (window + 32) | `tests/models/inkling2/test_dspark_kernels.cpp` | as [§7.2](#72-stateimage)-[§7.3](#73-speculative-rollback) (1088 = 1024 + 64, conv rings of 32) |
 | Prefix reuse resumes only where a state was kept: a sequence's state when its request ends, a checkpoint of its window rings where the prompt's last user turn closes, and pinned host images at shared-prefix ends and of a sequence's state before another request takes it | `docs/inkling2.md` "Prefix reuse"; `inkling2_core.cpp` (Qwen3.5's `RewriteCheckpointKind::TurnClosure`) | the hybrid prefix cache's endpoint and output-boundary snapshots ([§7.4](#74-prefix-cache)); M4's frontend supplies the turn-closure rewrite checkpoint as Qwen3.5's does |
 
@@ -1311,6 +1311,16 @@ text. Measured: a round's draft 2.16 → 1.24 ms (7 drafts, `--q8-weights` and `
 fixtures (conv / struct / prose, auto, -r 2) `--q8-weights` 272.9 / 557.1 / 218.9 → 294.5 / 608.2 / 234.2 tok/s,
 `--a8-activations` 276.1 / 610.3 / 212.7 → 296.5 / 665.1 / 227.6.
 
+The drafter's attention (2026-11-26): its full layer reads every key of the request's context each round (four rows
+at 100K drafted in 9 ms beside a 35 ms verify call). A row's keys are now split into ranges of whole 32-key tiles, at
+least 128 keys a range and at most 42 ranges in the full layer (9 over the sliding layer's 1,032 keys;
+`dspark_attention_splits`); each CTA streams its range's BF16 keys and values through a two-stage `cp.async` ring, the
+softmax in registers, and a merge combines the ranges. Drafts only, as above; the op test's FP64 oracle holds at 2K to
+24K keys (worst 0.04-0.71 of its bound; the bench's longer contexts are timed, not checked). Measured (RTX 5090, op bench, one row's 8 queries): 2K keys 0.068 → 0.027 ms,
+32K 0.461 → 0.135, 100K 1.309 → 0.371 (1.1 TB/s), 200K 2.608 → 0.736; one request on a ~100K-token prompt (the owner's
+configuration, §13.7) decoded 6.6 % faster than the deployed build of 2026-11-25 (243083c14, so the comparison also
+holds the later commits).
+
 A Q8 head (`--q8-weights`, `--a8-activations`) then runs the drafter's 7 rows on 8-bit inputs (`Forward::project_head`
 with the drafter's own 8-bit input rows: `projections_mma`'s tensor cores instead of the skinny route's FMA chains;
 the only Q8 route that takes the head's unaligned FP32 rows). Drafts only, as above. Measured (2026-11-23, Basalt's
@@ -1319,6 +1329,76 @@ fixtures, auto, -r 2, against the skinny route on the same build): `--q8-weights
 conv 304.9 → 305.5 (within ±10). The policy's cost constants (0.12 a verify column, 0.18 a proposal) were re-tuned
 against the same fixtures (0.17 / 0.29 measured, 0.145 / 0.235, 0.22 / 0.29, and a concave 0.14 / 0.30 + 0.15 for the
 first column): none beat them on both routes once the 8-bit head was in, so they stand.
+
+### 13.7 Rounds of several rows
+
+Built 2026-11-25 (the owner's request after the dashboard showed no drafts at three to four requests decoding at
+100-160K contexts; before it a round of several rows decoded plainly, §3's lone-request rule).
+
+- **Exactness.** The decode route is width-invariant to 128 columns (every decode Op column-invariant, the experts in
+  16-column passes, attention per lane in groups of at most 16), so a lane's verify columns in a call with other lanes'
+  columns are its plain decoding's bit for bit; the forward test's `wide_lanes` checks 8 lanes in calls of 64, 64 and
+  36 columns against single-column decoding. The sampler draws each column 8 rows at a time (its route for the widths
+  plain rounds and a one-row round use). So a round of several rows commits each request's plain tokens on every route
+  that drafts, the reproducible one included.
+- **Shape.** Every row's block is drafted at once (`Drafter::draft(steps, stream, rows)`: row 0 on the round's
+  stream, the others on streams of their own forked from it and joined back inside the draft's graph, each row with
+  a workspace, round words and draft slot of its own), then one verify call takes n (K + 1) columns: each row's
+  pending input and its share of the n × K drafts, the rows in lane order. Its graph is keyed by (rows, K), not by
+  the shares: the forward alone (no launch names a lane: each lane's columns stay one attention group below the conv
+  ring's and window's wide paths) with attention sized for a row's widest group (`CallPlan::group_width`, 8), so any
+  split of the columns replays it (the forward test's `split_replay`: captured at (8, 6, 1, 1), replayed at (4, 4, 4,
+  4) and (7, 5, 3, 1), each split's eager logits bit for bit). The sample follows it eagerly, so a constrained row's
+  masks are filled while it runs. A batch size takes 14 graphs (7 widths, 7 draft lengths); the rounds keep the 42
+  most recently used (three batch sizes), which the graphs' allowance counts (42 × 3 MiB, taken from the automatic KV
+  pool like the rest of the allowance).
+- **Width and shares.** The n × K drafts go one at a time to the row whose expected tokens (`expected_draft_tokens`,
+  each row at most the drafts it has, capped by its budget) the next one raises most: a row's gain falls draft by
+  draft (each reach is the one before it times an acceptance), so this greedy deal is the best at each count, and one
+  pass to n × steps gives every count's. K maximizes the dealt tokens at n × K over the verify call's device time at
+  K. That cost line moves with the context (attention is per lane and reads its keys once for all its columns; the
+  experts' union grows per column), so the rounds measure it themselves: per row count and per bucket of the rows'
+  longest context (2K, 4K, ... 128K and beyond), EWMAs of the plain round's device time and of each width's verify
+  call, interpolated between measured widths. Every 8th round verifies K + 1 drafts of each row, which keeps the
+  longer widths' cost measured and every row's acceptance (a row dealt no drafts observes none). A row's next draft is
+  2 past what it verified, as a one-row round's. (Keyed by row count alone, costs measured at 100K steered 2K rounds,
+  which kept drafting at 18 % acceptance and ran 17 % slower than plain, 2026-11-26.) A row count whose drafted
+  rounds commit fewer tokens per host millisecond than its plain rounds decodes plainly, drafting again every 16
+  rounds; a plain round every 64 drafted rounds keeps the plain rate measured. A fixed `--draft-tokens N` verifies N
+  of each row every round.
+- **Eligibility.** Every row as a one-row round requires (its one pending input, F ≥ 1, no penalties, no token
+  constraint), with a whole block of context left; a grammar row's columns sample under its own masks and a reasoning
+  ban ends its row at the first close it draws. Otherwise, and without CUDA graphs, the round decodes plainly.
+- **Measured** (2026-11-26, RTX 5090, the owner's configuration: 240K context, 4 lanes, INT8 KV, `--lm-head-draft`, the
+  thinking budget, vision offload; the same build with these rounds on and off, warm-up discarded, B A A B, 512
+  tokens a request): four requests on a shared ~100K-token prefix 138.9 / 138.3 against 123.1 / 123.4 tok/s by wall
+  (+12 %, the worst pair +12.1 %), four ~2K-token requests 472.2 / 466.4 against 421.3 / 432.9 (+8 to +12 %, the
+  worst pair +7.7 %). Each request's tokens are its plain decoding's (the Engine tests, every KV format, grammars,
+  C = 8 at 7 drafts). The forward's cost of a verify column, in plain rounds of the same rows: 0.14-0.25 at one row,
+  0.07-0.10 at two, 0.05-0.07 at four, ~0.04 at eight (4K), 0.08-0.11 at two rows of 100K.
+- **Measured, the rows at once and their shares** (2026-11-26, the same configuration and workloads, seeded so every
+  arm samples the same text; §13.5's attention kernel in both arms). The rows' drafts on streams of their own against
+  one after another: a four-row round's draft 2.7 → 2.0 ms at 100K, 141.2 / 142.4 against 139.3 / 138.6 tok/s (+2.1 %,
+  the worst pair +1.4 %), and 481.1 / 479.4 against 468.6 / 472.4 at 2K (+2.1 %, the worst pair +1.5 %). Shares dealt
+  by expected tokens against K each (3 servers an arm, 4 repetitions each, seeds shifted per repetition): at 100K the
+  first repetition 155.6-157.6 against 150.0-151.2 tok/s (+3.9 %, the worst pair +2.9 %), the later ones (the whole
+  prompt cached) +6.9 %, every server ahead of every K-each server at the same repetition; at 2K the later repetitions
+  487.5-514.1 against 474.4-499.9 (+3.1 %, the worst pair +0.7 %), but the first (a cold cost bucket) level on average
+  with a wider spread: 511.3 / 446.0 / 510.8 against 508.7 / 481.0 / 482.0 (−0.2 %; with the first version below, 2 of
+  5 dealt servers ran 9-13 % low against the K-each lows' ~5 %). The low servers left 375 and 143 rounds plain by the
+  rates while the bucket's rates were few (dealt 52 / 375 / 76, K each 29 / 143 / 57). Read from the code, not tested:
+  the rates' EWMAs take a cold bucket's first sample at full weight, and a drafted rate that starts low recovers by a
+  tenth a probe, one probe in 16 rounds. Both arms ran with the group allowance; it costs nothing measured (the
+  forward's 4 lanes × 1-8 columns at 2K, group width 8 against 0: within 0.1 % at every width; the rows rounds'
+  verify times at 100K as before it, within their spread). The deal's expected gain the rounds report: +12 % at four
+  rows of 100K, +6 % at 2K. Only four rows were timed (two and three as the runs' tails; eight not at all). A first version that chose K by K-each tokens and dealt every round (rows dealt
+  none never observed their acceptance) measured +2.5-2.9 % at 100K and 465.0 / 509.3 against 492.3 / 496.2 at 2K.
+  Each request's tokens are its plain decoding's under natural shares and under a test seam's skewed ones (rows
+  verifying none and all of their drafts, grammar rows among them; the Engine and constrained tests).
+- **Not yet:** the drafter's kernels run once a row (its layers' weights read n times; the rows overlap on their
+  streams); one launch over every row's columns, and a warm-up of a cold bucket's rates, are the next steps. A row
+  took every draft it had while it could have drafted more in ~20 % of four-row rounds at 100K (its next round drafts
+  2 past those, so the cap follows a round later).
 
 ---
 
@@ -1332,7 +1412,8 @@ K/V through the codec before reading it, so in-chunk and cached keys are the sam
 ([§9.3](#93-prefill)). The model has no recurrent layer whose kernel chunking regroups sums (its convs read a 3-position
 history), so, as TokenSpeed notes for KV-only models, a prefix resumes at any token bit for bit. Then publication and
 resumes are exact at any prefill-computed frontier, chunks can be any width (the default is the fastest measured,
-4,096 columns today, no wider than the context), and the prompt's last two calls merge (L23). Where an Op cannot be made invariant, the Qwen rule
+4,096 columns today, no wider than the context). Unlike Flash-Next (L23), the prompt's last two calls do not merge:
+each call is at most the chunk (`advance_prefill`), so a prompt just past a chunk multiple pays one more call. Where an Op cannot be made invariant, the Qwen rule
 applies instead: a canonical chunk grid and grid-only publication on the reproducible route.
 
 Built (2026-11-21): the first prefill route keeps the decode route's arithmetic at every width instead of a second

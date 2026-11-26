@@ -30,12 +30,18 @@
 // 7. The prompt route (CallPlan::prompt: tensor-core projections, router and experts): the 32 positions as one prompt
 //    call give the bits of prompt calls of 8, and the greedy continuation equals the reference's. Reported: its
 //    argmax elsewhere and its largest logit difference from the reference and from the decode route.
+// 8. Batched verification widths: eight lanes in calls of 64, 64 and 36 columns give each lane's single-column decode
+//    logits bit for bit.
+// 9. One graph for every split: a 4-lane 16-column call captured at (8, 6, 1, 1) replays at (4, 4, 4, 4) and
+//    (7, 5, 3, 1) with each split's eager logits bit for bit.
 //
 // Timing (environment): INFERNIX_INKLING2_PROFILE = width (the captured decode round, INFERNIX_INKLING2_CONTEXT
 // positions before it; INFERNIX_INKLING2_SKELETON = serial or trigger also times the same graph with every kernel
 // empty, = kernel-name parts "a|b" with those kernels empty, = names lists the round's kernels and their node counts);
 // INFERNIX_INKLING2_PREFILL_PROFILE = width (one prompt call, each Op's time;
-// INFERNIX_INKLING2_PREFILL_DECODE runs it on the decode route instead, for comparison).
+// INFERNIX_INKLING2_PREFILL_DECODE runs it on the decode route instead, for comparison);
+// INFERNIX_INKLING2_LANES_PROFILE = n (captured rounds of n lanes x 1-8 columns after INFERNIX_INKLING2_CONTEXT
+// positions a lane, default 4096: the cost of a batched verification's columns).
 //
 // Diagnostics (environment): INFERNIX_INKLING2_DRIFT prints the free-running drift per visit and the NLL detail;
 // INFERNIX_INKLING2_HYBRID = blocks | input | perturb runs a hybrid (the reference's blocks and message sources, or its
@@ -45,6 +51,7 @@
 #include "artifact/reader.h"
 #include "core/device.h"
 #include "infernix/ops/inkling2_attention.h"
+#include "infernix/ops/inkling2_dspark.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/execution/parameters.h"
 #include "models/inkling2/load.h"
@@ -56,6 +63,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -911,6 +919,207 @@ bool lanes_alone(const m::Parameters& p, m::Forward& solo, State& solo_state, co
     return ok;
 }
 
+// 8. Batched verification widths: 8 lanes of 8 columns (64 columns, the widest call a round of batched drafts makes),
+//    8 more each, then 1 and 8 alternating (36): each lane's logits equal its single-column decode calls' bit for bit,
+//    so a lane's verified columns are its plain decoding's whatever the other lanes verify beside it.
+bool wide_lanes(const m::Parameters& p, m::Forward& solo, State& solo_state, const Reference& ref, bool a8) {
+    const auto& c = p.model.config().text;
+    const std::int32_t* ids = ref.get<std::int32_t>("ids");
+    constexpr int kLanes = 8;
+    const int widths[3][kLanes] = {{8, 8, 8, 8, 8, 8, 8, 8}, {8, 8, 8, 8, 8, 8, 8, 8}, {1, 8, 1, 8, 1, 8, 1, 8}};
+    const auto token = [&](int lane, int position) { return ids[(position + 3 * lane) % kPositions]; };
+    m::Forward multi(p, kLanes, m::kMaxForwardColumns,
+                     a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8);
+    State multi_state(multi.layout(), kLanes);
+    std::vector<std::vector<float>> together(kLanes), alone(kLanes);
+    int at[kLanes] = {};
+    for (const auto& call : widths) {
+        m::CallPlan plan;
+        plan.first.assign(kLanes, 0);
+        for (int l = 0; l < kLanes; ++l) {
+            for (int i = 0; i < call[l]; ++i) {
+                plan.tokens.push_back(token(l, at[l] + i));
+                plan.lane.push_back(l);
+                plan.position.push_back(at[l] + i);
+            }
+        }
+        const auto logits = run_call(p, multi, multi_state, plan, nullptr);
+        for (int t = 0; t < plan.columns(); ++t) {
+            const float* row = logits.data() + static_cast<std::size_t>(t) * c.vocab_size;
+            together[plan.lane[t]].insert(together[plan.lane[t]].end(), row, row + c.vocab_size);
+        }
+        for (int l = 0; l < kLanes; ++l) { at[l] += call[l]; }
+    }
+    bool ok = true;
+    for (int l = 0; l < kLanes; ++l) {
+        solo_state.reset();
+        for (int position = 0; position < at[l]; ++position) {
+            m::CallPlan plan;
+            plan.first = {0};
+            plan.tokens.push_back(token(l, position));
+            plan.lane.push_back(0);
+            plan.position.push_back(position);
+            const auto logits = run_call(p, solo, solo_state, plan, nullptr);
+            alone[l].insert(alone[l].end(), logits.begin(), logits.end());
+        }
+        const bool same = together[l].size() == alone[l].size() &&
+                          std::memcmp(together[l].data(), alone[l].data(), alone[l].size() * 4) == 0;
+        ok = ok && same;
+        std::printf("lane %d (%d positions) in 8-lane calls of 64, 64 and 36 columns: %s\n", l, at[l],
+                    same ? "its single-column decode logits bit for bit" : "DIFFERENT");
+    }
+    return ok;
+}
+
+// 9. One graph for every split of a call's columns: a 4-lane call of 16 columns captured at (8, 6, 1, 1) with
+//    attention sized for groups of 8 (CallPlan::group_width) and replayed with the tokens, lanes and positions of
+//    (4, 4, 4, 4) and (7, 5, 3, 1) gives each split's eager logits bit for bit, from the same state (the eager calls
+//    sized for their own widest group: the allowance changes no bit).
+bool split_replay(const m::Parameters& p, const Reference& ref, bool a8) {
+    const auto& c = p.model.config().text;
+    const std::int32_t* ids = ref.get<std::int32_t>("ids");
+    constexpr int kLanes = 4, kContext = 8;
+    const auto token = [&](int lane, int position) { return ids[(position + 7 * lane) % kPositions]; };
+    m::Forward fw(p, kLanes, m::kMaxForwardColumns,
+                  a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8);
+    State state(fw.layout(), kLanes);
+    const auto plan = [&](const std::array<int, kLanes>& counts, int from) {
+        m::CallPlan out;
+        out.first.assign(kLanes, 0);
+        out.group_width = 8;
+        for (int l = 0; l < kLanes; ++l) {
+            for (int i = 0; i < counts[static_cast<std::size_t>(l)]; ++i) {
+                out.tokens.push_back(token(l, from + i));
+                out.lane.push_back(l);
+                out.position.push_back(from + i);
+            }
+        }
+        return out;
+    };
+    (void)run_call(p, fw, state, plan({kContext, kContext, kContext, kContext}, 0), nullptr); // each lane's context
+    state.save();
+    cudaStream_t stream = nullptr;
+    cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    const std::array<std::array<int, kLanes>, 3> splits = {{{8, 6, 1, 1}, {4, 4, 4, 4}, {7, 5, 3, 1}}};
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    fw.prepare(plan(splits[0], kContext));
+    cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+    fw.embed(stream);
+    for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, stream); }
+    fw.finish(state.view, stream);
+    cuda(cudaStreamEndCapture(stream, &graph), "capture");
+    cuda(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+    bool ok = true;
+    for (const auto& split : splits) {
+        const m::CallPlan call = plan(split, kContext);
+        m::CallPlan sized      = call; // the eager reference sized for its own widest group, as a call without one is
+        sized.group_width      = 0;
+        state.restore();
+        const auto eager = run_call(p, fw, state, sized, nullptr);
+        state.restore();
+        fw.prepare(call);
+        cuda(cudaGraphLaunch(exec, stream), "replay");
+        cuda(cudaStreamSynchronize(stream), "replay");
+        const auto got  = download(fw.buffers().logits, static_cast<std::size_t>(call.columns()) * c.vocab_size);
+        const bool same = std::memcmp(got.data(), eager.data(), got.size() * 4) == 0;
+        ok              = ok && same;
+        std::printf("a 16-column call captured at (8, 6, 1, 1), replayed at (%d, %d, %d, %d): %s\n", split[0], split[1],
+                    split[2], split[3], same ? "the eager logits bit for bit" : "DIFFERENT");
+    }
+    cuda(cudaGraphExecDestroy(exec), "destroy");
+    cuda(cudaGraphDestroy(graph), "destroy");
+    cuda(cudaStreamDestroy(stream), "stream");
+    return ok;
+}
+
+// Timing (INFERNIX_INKLING2_LANES_PROFILE = n lanes, INFERNIX_INKLING2_CONTEXT = each lane's positions before the
+// round, default 4096; INFERNIX_INKLING2_GROUP_WIDTH = the rounds' CallPlan::group_width, default 0): each lane's
+// context prefilled by prompt-route calls of 128 columns of the reference's ids
+// repeated, then a decode-route round of n lanes x K columns (K = 1 .. 8, a batched verification's shape) captured
+// and replayed 100 times (after 20 warm-up replays), timed by events. Prints each round's time, its cost per extra
+// column in plain n-lane rounds ((t_K / t_1 - 1) / (n (K - 1)): the draft-length policy's per-draft cost at that
+// batch) and the round's columns per second.
+void profile_lanes(const m::Parameters& p, const Reference& ref, int lanes, int context, bool a8) {
+    const auto& c = p.model.config().text;
+    const std::int32_t* ids = ref.get<std::int32_t>("ids");
+    m::Forward fw(p, lanes, m::kMaxForwardColumns,
+                  a8 ? ops::w4a4_moe::ExpertActivation::A8 : ops::w4a4_moe::ExpertActivation::Checkpoint, a8,
+                  window_from_env());
+    State state(fw.layout(), lanes, (context + 64) / ik::kKeyUnit + 1, window_from_env());
+    {
+        std::size_t free = 0, total = 0;
+        cuda(cudaMemGetInfo(&free, &total), "memory");
+        std::printf("lanes profile: %d lanes at context %d; %.1f MiB of VRAM free after the state\n", lanes, context,
+                    free / 1048576.0);
+    }
+    const auto token = [&](int lane, int position) { return ids[(position + 5 * lane) % kPositions]; };
+    for (int l = 0; l < lanes; ++l) {
+        for (int c0 = 0; c0 < context; c0 += m::kMaxForwardColumns) {
+            m::CallPlan plan;
+            plan.prompt = true;
+            plan.first.assign(static_cast<std::size_t>(l) + 1, 0);
+            for (int t = c0; t < std::min(context, c0 + m::kMaxForwardColumns); ++t) {
+                plan.tokens.push_back(token(l, t));
+                plan.lane.push_back(l);
+                plan.position.push_back(t);
+            }
+            fw.prepare(plan);
+            fw.embed(nullptr);
+            for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, nullptr); }
+            fw.finish(state.view, fw.final_inputs(), nullptr, 0, 0); // no head: a prefill chunk's
+        }
+    }
+    cuda(cudaDeviceSynchronize(), "context");
+    cudaStream_t stream = nullptr;
+    cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "stream");
+    cudaEvent_t start = nullptr, stop = nullptr;
+    cuda(cudaEventCreate(&start), "event");
+    cuda(cudaEventCreate(&stop), "event");
+    double one = 0;
+    const char* group_width = std::getenv("INFERNIX_INKLING2_GROUP_WIDTH");
+    for (int K = 1; K <= ik::kDSparkBlock; ++K) {
+        m::CallPlan plan;
+        plan.first.assign(static_cast<std::size_t>(lanes), 0);
+        plan.group_width = group_width != nullptr ? std::atoi(group_width) : 0;
+        for (int l = 0; l < lanes; ++l) {
+            for (int i = 0; i < K; ++i) {
+                plan.tokens.push_back(token(l, context + i));
+                plan.lane.push_back(l);
+                plan.position.push_back(context + i);
+            }
+        }
+        (void)run_call(p, fw, state, plan, nullptr); // warm: every first-call attribute set before the capture
+        cudaGraph_t graph = nullptr;
+        cudaGraphExec_t exec = nullptr;
+        fw.prepare(plan);
+        cuda(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal), "capture");
+        fw.embed(stream);
+        for (std::uint32_t v = 0; v < c.visits(); ++v) { fw.visit(v, state.view, stream); }
+        fw.finish(state.view, stream);
+        cuda(cudaStreamEndCapture(stream, &graph), "capture");
+        cuda(cudaGraphInstantiate(&exec, graph, 0), "instantiate");
+        for (int i = 0; i < 20; ++i) { cuda(cudaGraphLaunch(exec, stream), "warm"); }
+        constexpr int kRuns = 100;
+        cuda(cudaEventRecord(start, stream), "event");
+        for (int i = 0; i < kRuns; ++i) { cuda(cudaGraphLaunch(exec, stream), "time"); }
+        cuda(cudaEventRecord(stop, stream), "event");
+        cuda(cudaEventSynchronize(stop), "event");
+        float ms = 0;
+        cuda(cudaEventElapsedTime(&ms, start, stop), "event");
+        const double round = ms / kRuns;
+        if (K == 1) { one = round; }
+        const double per_column = K == 1 ? 0.0 : (round / one - 1.0) / (static_cast<double>(lanes) * (K - 1));
+        std::printf("timing: %d lanes x %d columns at context %d: %.4f ms a round (%.3f a column in plain rounds; "
+                    "%.1f columns/s)\n", lanes, K, context, round, per_column, 1000.0 * lanes * K / round);
+        cuda(cudaGraphExecDestroy(exec), "destroy");
+        cuda(cudaGraphDestroy(graph), "destroy");
+    }
+    cuda(cudaEventDestroy(start), "event");
+    cuda(cudaEventDestroy(stop), "event");
+    cuda(cudaStreamDestroy(stream), "stream");
+}
+
 } // namespace
 
 int main() {
@@ -978,6 +1187,12 @@ int main() {
         }
         if (const char* width = std::getenv("INFERNIX_INKLING2_PREFILL_PROFILE"); width != nullptr) {
             profile_prefill(parameters, std::max(1, std::atoi(width)));
+            return 0;
+        }
+        if (const char* lanes = std::getenv("INFERNIX_INKLING2_LANES_PROFILE"); lanes != nullptr) {
+            const char* ctx = std::getenv("INFERNIX_INKLING2_CONTEXT");
+            profile_lanes(parameters, ref, std::clamp(std::atoi(lanes), 1, 8), ctx != nullptr ? std::max(1, std::atoi(ctx)) : 4096,
+                          a8);
             return 0;
         }
 
@@ -1183,6 +1398,8 @@ int main() {
         }
         ok = graph_replay(parameters, forward, state, ref) && ok;
         ok = lanes_alone(parameters, forward, state, ref, a8) && ok;
+        ok = wide_lanes(parameters, forward, state, ref, a8) && ok;
+        ok = split_replay(parameters, ref, a8) && ok;
         std::printf(ok ? "PASS\n" : "FAIL\n");
         return ok ? 0 : 1;
     } catch (const std::exception& error) {

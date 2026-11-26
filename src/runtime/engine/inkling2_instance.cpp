@@ -142,12 +142,48 @@ std::uint64_t pool_tokens(std::uint32_t pages) {
 }
 
 // --host-context-mib auto: the Host tier takes the RAM the plan (its pinned weights) leaves beyond --ram-free-mib, as
-// the other models' tiers do (expert_memory.h).
-std::uint64_t cache_host_bytes(const EngineOptions& options, std::uint64_t pinned_bytes, const VramSnapshot& vram) {
-    if (options.context_cache.host_capacity_bytes) { return *options.context_cache.host_capacity_bytes; }
+// the other models' tiers do (expert_memory.h); with --ram-resize auto, its growth room too
+// (auto_host_context_ceiling_bytes: what the plan would give it with the RAM other programs hold now free, within what
+// Windows lets the process page-lock). `report`: the start's line naming the tier's size and the bound that set it.
+struct HostTier {
+    std::uint64_t bytes   = 0;
+    std::uint64_t ceiling = 0; // 0: no growth room
+};
+HostTier cache_host_tier(const EngineOptions& options, std::uint64_t pinned_bytes, const VramSnapshot& vram, bool report) {
+    if (options.context_cache.host_capacity_bytes) { return {*options.context_cache.host_capacity_bytes, 0}; }
     const expert_offload::HostMemoryDemand demand =
         expert_ram_demand(options, {.expert_banks = 0, .other_pinned = pinned_bytes}, 0, vram);
-    return auto_host_context_bytes(expert_offload::plan_host_memory(host_memory_snapshot(), demand));
+    const HostMemorySnapshot snapshot              = host_memory_snapshot();
+    const expert_offload::HostMemoryLedger ledger = expert_offload::plan_host_memory(snapshot, demand);
+    HostTier out;
+    out.bytes = auto_host_context_bytes(ledger);
+    if (options.ram_resize) { out.ceiling = auto_host_context_ceiling_bytes(snapshot, demand, out.bytes); }
+    if (report) {
+        // Which bound set it: the RAM left beyond the reserve and the plan, the commit left, or the page-lock room.
+        constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+        const std::uint64_t used        = demand.reserve + ledger.planned + ledger.expert_ram;
+        const std::uint64_t physical    = ledger_left_bytes(ledger);
+        const std::uint64_t commit      = snapshot.available_commit > used ? snapshot.available_commit - used : 0U;
+        const std::optional<std::uint64_t> pins = ledger_pin_left_bytes(ledger);
+        const char* bound = pins && *pins <= std::min(physical, commit) ? "the room Windows lets the GPU page-lock"
+                            : commit < physical                         ? "the commit limit (the page file)"
+                                                                        : "the RAM available beyond --ram-free-mib";
+        char ceiling[96] = "";
+        if (out.ceiling > out.bytes) {
+            std::snprintf(ceiling, sizeof(ceiling), "; up to %.1f GiB as RAM frees", static_cast<double>(out.ceiling) / kGiB);
+        }
+        char room[48] = "unlimited";
+        if (pins) { std::snprintf(room, sizeof(room), "%.1f GiB left", static_cast<double>(*pins) / kGiB); }
+        publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info,
+                           "Inkling 2: Host tier auto: %.1f GiB, set by %s (RAM %.1f of %.1f GiB available, reserve "
+                           "%.1f, the plan %.1f; commit left %.1f GiB; page-lock room %s)%s",
+                           static_cast<double>(out.bytes) / kGiB, bound,
+                           static_cast<double>(snapshot.available_physical) / kGiB,
+                           static_cast<double>(snapshot.total_physical) / kGiB, static_cast<double>(demand.reserve) / kGiB,
+                           static_cast<double>(ledger.planned) / kGiB, static_cast<double>(commit) / kGiB, room, ceiling);
+        report_engine(options, DiagnosticLevel::Debug, ledger.describe());
+    }
+    return out;
 }
 
 std::string read_text(const std::filesystem::path& path) {
@@ -221,7 +257,8 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
     refuse_option(!options.expert_stripe_path.empty(), "--expert-stripe", kResidentExperts);
     refuse_option(!options.route_trace_path.empty(), "--route-trace", kResidentExperts);
     refuse_option(!options.context_cost.preset_path.empty(), "--context-cost-presets",
-                  "calibrates the Qwen prefix caches' cost model; Inkling 2's prefix cache has none");
+                  "calibrates the Qwen prefix caches' measured cost model; Inkling 2's prefix cache weighs a read "
+                  "against a re-prefill with a fixed fit of its own rates");
     refuse_option(options.media_cache_bytes != kDefaultMediaCacheBytes, "--media-cache-mib", kQwenMedia);
     refuse_option(options.media_live_bytes != kDefaultMediaLiveBytes, "--media-live-mib", kQwenMedia);
     refuse_option(options.media_preprocess_threads != 0, "--media-preprocess-threads", kQwenMedia);
@@ -346,10 +383,11 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                       "sizes --max-context auto and --kv-capacity auto; this start sizes neither");
         refuse_option(options.vram_past_budget && !sizes_vram, "--vram-past-budget",
                       "widens the VRAM --max-context auto and --kv-capacity auto size from; this start sizes neither");
+        // The reserve sizes an automatic Host tier and, under --ram-resize auto, is what any Host tier keeps free.
         refuse_option(options.ram_free_bytes != kDefaultRamFreeBytes &&
-                          !(cache.enabled && !cache.host_capacity_bytes.has_value()),
-                      "--ram-free-mib", "sizes the prefix cache's automatic Host tier (--host-context-mib auto); this "
-                      "start has none");
+                          !(cache.enabled && (!cache.host_capacity_bytes.has_value() || options.ram_resize)),
+                      "--ram-free-mib", "sizes the prefix cache's automatic Host tier (--host-context-mib auto) and the "
+                      "RAM it keeps free under --ram-resize auto; this start has neither");
         // The lanes share the pool, which holds at least one request's whole context (a smaller one would be raised).
         refuse_option(options.kv_capacity.mode == KvCapacityMode::Explicit && !options.max_context_auto &&
                           options.kv_capacity.explicit_tokens < options.max_context,
@@ -522,7 +560,7 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         if (pinned != 0) { planned->ram.pinned_bytes = pinned; }
         std::uint64_t host_tier = 0;
         if (program.prefix_cache) {
-            host_tier                       = cache_host_bytes(options, pinned, vram);
+            host_tier                       = cache_host_tier(options, pinned, vram, false).bytes;
             planned->ram.host_context_bytes = host_tier;
         }
         planned->ram.planned_bytes      = pinned + host_tier;
@@ -537,7 +575,10 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         }
         return {};
     }
+    // --chat-template is read before the weights load, so a file that cannot be read fails the start at once (a
+    // template that does not parse still fails when the frontend is built, after the load).
     std::string template_override;
+    if (!options.chat_template_path.empty()) { template_override = read_text(options.chat_template_path); }
     const std::uint64_t pinned_bytes = plan.materialization().pinned_capacity_bytes;
     auto model = models::inkling2::materialize_model(std::move(plan), device, &options.startup_observer);
     const auto* vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
@@ -553,14 +594,26 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     }
     models::inkling2::ProgramOptions program = program_options(options, lora_rank);
     program.vision_host                      = vision_host;
+    // An automatic Host tier (sized below from the RAM free now): trimmed after the start and grown as RAM frees under
+    // --ram-resize auto.
+    const bool host_auto = program.prefix_cache && !options.context_cache.host_capacity_bytes;
+    // What the pool was sized from and the headroom it kept (a startup retry adds to it), for the KV capacity's
+    // resolution below.
+    std::uint64_t pool_sizing_bytes = 0, pool_headroom = headroom;
     if (!program.causal_scoring) {
         const VramSnapshot now = open_vram_budget_source(device.device, options.vram_past_budget)->query();
         if (program.prefix_cache) {
-            options.context_cache.host_capacity_bytes = cache_host_bytes(options, pinned_bytes, now);
-            program.prefix_host_bytes                 = *options.context_cache.host_capacity_bytes;
+            const HostTier tier                       = cache_host_tier(options, pinned_bytes, now, true);
+            options.context_cache.host_capacity_bytes = tier.bytes;
+            program.prefix_host_bytes                 = tier.bytes;
+            program.prefix_host_ceiling_bytes         = tier.ceiling;
+            // The resolved options name the growth room as the Qwen families' do (the server's startup line).
+            options.context_cache.host_growth_capacity_bytes.reset();
+            if (tier.ceiling > tier.bytes) { options.context_cache.host_growth_capacity_bytes = tier.ceiling; }
         }
         const std::uint64_t free_now = free_device_bytes(now) > adapter_bytes ? free_device_bytes(now) - adapter_bytes : 0;
-        program.kv_pages = pool_pages(options, program, model->config(), sizing_of(now, 0), headroom);
+        pool_sizing_bytes = sizing_of(now, 0);
+        program.kv_pages  = pool_pages(options, program, model->config(), pool_sizing_bytes, headroom);
         const models::inkling2::ProgramDevicePlan sized = models::inkling2::Program::plan_device(program, model->config());
         // An explicit context or capacity that does not fit is refused here, with its figures, before any allocation.
         if (sized.fixed_bytes() + headroom > free_now) {
@@ -621,7 +674,6 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         }
     }
     if (!options.chat_template_path.empty()) {
-        template_override = read_text(options.chat_template_path);
         models::inkling2::FrontendResources resources = instance->model->resources();
         resources.chat_template_jinja                 = template_override;
         instance->frontend = models::inkling2::Frontend(resources, frontend_options(*instance->model, options));
@@ -641,8 +693,9 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         (void)cudaGetLastError(); // an allocation failure is not sticky; clear its record
         constexpr std::uint64_t kRetryHeadroom = 1ULL << 30U;
         const VramSnapshot now       = open_vram_budget_source(device.device, options.vram_past_budget)->query();
-        program.kv_pages = pool_pages(options, program, instance->model->config(), sizing_of(now, kRetryHeadroom),
-                                      headroom + kRetryHeadroom);
+        pool_sizing_bytes = sizing_of(now, kRetryHeadroom);
+        pool_headroom     = headroom + kRetryHeadroom;
+        program.kv_pages  = pool_pages(options, program, instance->model->config(), pool_sizing_bytes, pool_headroom);
         const models::inkling2::ProgramDevicePlan retried =
             models::inkling2::Program::plan_device(program, instance->model->config());
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Warning,
@@ -659,14 +712,34 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         (void)cudaMemGetInfo(&free_after_program, &device_total);
         const models::inkling2::ProgramDevicePlan& planned_device = instance->program->device_plan();
         constexpr double kMiB = 1024.0 * 1024.0;
+        const std::uint64_t taken = free_before_program > free_after_program ? free_before_program - free_after_program : 0U;
+        // The plan's share the Program did not take is kept for its later allocations (the graphs instantiated as
+        // rounds first need them, the driver's own): the memory map shows it apart from the free memory.
+        instance->program->set_reserved_bytes(planned_device.fixed_bytes() > taken ? planned_device.fixed_bytes() - taken : 0U);
         publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Debug,
                            "Inkling 2: the Program took %.0f MiB of device memory; its plan counts %.0f MiB (%.0f MiB of "
                            "it the CUDA graphs' allowance)",
-                           static_cast<double>(free_before_program > free_after_program
-                                                   ? free_before_program - free_after_program
-                                                   : 0U) / kMiB,
-                           static_cast<double>(planned_device.fixed_bytes()) / kMiB,
+                           static_cast<double>(taken) / kMiB, static_cast<double>(planned_device.fixed_bytes()) / kMiB,
                            static_cast<double>(planned_device.graphs) / kMiB);
+        // The KV capacity's resolution, which the Engine lays over the Program's memory summary (with_kv_capacity) for
+        // the metrics, the request log and the startup lines, as the Qwen families fill theirs: the requested mode
+        // (auto stays auto), the pool's pages in the occupied-pages gauge's unit (the scratch page holds nothing; fixed
+        // at startup, so its maximum too), the bytes the plan counted and what the pool was sized from; the automatic
+        // headroom is set below. The minimum reservation and the slack have no Inkling counterpart: left 0.
+        KvCapacityResolution& resolution = instance->kv_capacity_resolution;
+        resolution.mode                  = options.kv_capacity.mode;
+        resolution.main_page_groups      = planned_device.kv_pages > 0 ? planned_device.kv_pages - 1U : 0U;
+        resolution.maximum_main_page_groups             = resolution.main_page_groups;
+        resolution.resolved_tokens                      = static_cast<std::uint32_t>(pool_tokens(planned_device.kv_pages));
+        resolution.bytes_per_additional_main_page_group = static_cast<std::size_t>(planned_device.page_bytes);
+        resolution.runtime_reservation_bytes            = static_cast<std::size_t>(planned_device.fixed_bytes());
+        resolution.available_after_weights_bytes        = static_cast<std::size_t>(pool_sizing_bytes);
+        resolution.available_after_startup_bytes =
+            free_device_bytes(open_vram_budget_source(device.device, options.vram_past_budget)->query());
+    }
+    // The headroom an automatic pool kept free, which the memory map shows (EngineCore's metrics read it here).
+    if (automatic && !program.causal_scoring) {
+        instance->kv_capacity_resolution.automatic_headroom_bytes = static_cast<std::size_t>(headroom);
     }
     // --prefix-cache-file: the Host tier restored from a file written for this artifact and these options (the KV
     // format, the drafter, the 8-bit weights and 16-bit expert activations change what the cache holds).
@@ -693,6 +766,11 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
             .required_host_bytes = loaded.required_host_bytes,
             .host_bytes          = loaded.host_bytes,
         };
+    }
+    // --ram-resize auto: the Host tier follows the RAM other programs need (an automatic tier also trims to the reserve
+    // after the start and grows into its room as RAM frees), as the Qwen families' do.
+    if (options.ram_resize && program.prefix_cache && !program.causal_scoring) {
+        instance->program->start_ram_resize(options.ram_free_bytes, host_auto);
     }
 
     const auto& stats = instance->model->storage_stats();
