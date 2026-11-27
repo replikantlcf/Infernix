@@ -3,8 +3,9 @@
 DFlash backends propose several tokens with one masked-block forward, conditioned on committed
 target hidden features. The target verifies the proposal causally and remains the output authority.
 Infernix implements DFlash and DFlash2 as optional components of the
-[Qwen3.5 model](qwen3_5-model.md), and DFlash2 for Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) as a
-companion artifact loaded beside the main one ([Qwen3.8-Flash-Next](#qwen38-flash-next)). Their
+[Qwen3.5 model](qwen3_5-model.md), and DFlash2 for Qwen3.8-Flash-Next (`Qwen4ExpForCausalLM`) and Inkling 2 Mini
+(`Inkling2LoopForCausalLM`) as a companion artifact loaded beside the main one
+([Qwen3.8-Flash-Next](#qwen38-flash-next), [Inkling 2 Mini](#inkling-2-mini)). Their
 private config and bindings select the stored weights; startup chooses one backend, draft width
 and proposal head.
 
@@ -20,19 +21,19 @@ convolution tap/group dimensions and selector rank/top-k. The hidden width and e
 semantics come from the target. Exact fields are parsed in
 [`config.cpp`](../../src/models/qwen3_5/config.cpp).
 
-| Quantity | Official 35B-A3B DFlash | Official 27B DFlash2 | Flash-Next DFlash2 (incoai) |
-|---|---:|---:|---:|
-| Hidden width H | 2048 | 5120 | 2560 |
-| Draft layers | 6 | 5 | 5 |
-| Intermediate width | 6144 | 17408 | 7680 |
-| Q heads / KV heads / head dimension | 32 / 8 / 128 | 32 / 8 / 128 | 32 / 8 / 128 |
-| Target block IDs | `[1,6,11,16,22,27,32,37]` | `[5,19,33,47,61]` | `[5,15,25,35,45]` |
-| Attention pattern | Five local layers, then one full layer | Five local layers | Five local layers |
-| Sliding-window scalar S | 4096 | 2048 | 2048 |
-| Norm epsilon / RoPE theta | `1e-6` / `1e7` | `1e-6` / `1e7` | `1e-6` / `1e4` |
-| Dynamic convolution | — | Two taps, group width 16 | Two taps, group width 16 |
-| Candidate selector | Per-position argmax | Top-16 conditional path, rank 256 | Top-16 conditional path, rank 256 |
-| Training block (anchor + masks) | — | — | 8 |
+| Quantity | Official 35B-A3B DFlash | Official 27B DFlash2 | Flash-Next DFlash2 (incoai) | Inkling 2 Mini DFlash2 (incoai) |
+|---|---:|---:|---:|---:|
+| Hidden width H | 2048 | 5120 | 2560 | 2304 |
+| Draft layers | 6 | 5 | 5 | 5 |
+| Intermediate width | 6144 | 17408 | 7680 | 6912 |
+| Q heads / KV heads / head dimension | 32 / 8 / 128 | 32 / 8 / 128 | 32 / 8 / 128 | 32 / 8 / 128 |
+| Target block IDs | `[1,6,11,16,22,27,32,37]` | `[5,19,33,47,61]` | `[5,15,25,35,45]` | visits `[5,23,41]` and the final state |
+| Attention pattern | Five local layers, then one full layer | Five local layers | Five local layers | Five local layers |
+| Sliding-window scalar S | 4096 | 2048 | 2048 | 2048 |
+| Norm epsilon / RoPE theta | `1e-6` / `1e7` | `1e-6` / `1e7` | `1e-6` / `1e4` | `1e-6` / `1e4` |
+| Dynamic convolution | — | Two taps, group width 16 | Two taps, group width 16 | Two taps, group width 16 |
+| Candidate selector | Per-position argmax | Top-16 conditional path, rank 256 | Top-16 conditional path, rank 256 | Top-16 conditional path, rank 256, softcap 30 after the correction |
+| Training block (anchor + masks) | — | — | 8 | 8 |
 
 The current Engine accepts startup draft count K in `1..15` and concurrency B in `1..8`. The
 physical block width is `W=K+1`, containing one anchor and K masks. K is a runtime choice, not a
@@ -191,7 +192,8 @@ For each mask hidden h_i, the selected head produces stable top-16 unary scores 
 token IDs C_i. An indexed proposal head remaps shortlist rows before codebook access. Unary top-16
 selection does not apply target penalties, temperature or top-k/top-p/min-p.
 
-Qwen3.8-27B's full head (FP8 row or q8, 248,320 x 5,120) is screened (since 2026-11-09, candidates RV-41): at load
+Qwen3.8-27B's full head (FP8 row, q8 or NVFP4, 248,320 x 5,120) is screened (since 2026-11-09, candidates RV-41;
+the NVFP4 head of NVIDIA's NVFP4-QAD since 2026-11-27): at load
 the engine fits a 2-bit copy of it (`ops::screened_head_fit`, 357.6 MB of VRAM, beside the KV cache's share), and a
 round of at most 16 mask columns (one request's) takes its top 16 from `ops::screened_head_topk`: every row scored by
 the copy, the rows near each column's best rescored exactly in FP32 and the 16 best kept. They are the full head's top
@@ -216,6 +218,21 @@ the draft width), so acceptance moved both ways: NVIDIA +7.2 % (acceptance 2.05 
 both), official -0.4 % (1.73 -> 1.66) for one prompt each. Greedy output on the reproducible route stayed identical
 at ~150, ~2,000 and ~20,000-token prompts on all three, with acceptance equal in 7 of the 9 and 1.7-2.2 % lower in
 two.
+
+The NVFP4 head (NVIDIA's NVFP4-QAD, 715 MB: E2M1 codes, an E4M3 scale per 16 weights and the matrix multiplier) is
+fitted and rescored from the same decoded values its A16 projection reads. Measured on QAD-Exact (RTX 5090,
+2026-11-27, INT8 KV): cold op times (`infernix_linear_topk_bench`) at 7, 16 and 32 columns were 515, 742 and 1,137 us
+for `linear_topk` over the full head, 240, 271 and 535 us screened (32 columns in two calls), and 218, 269 and 421 us
+for `--lm-head-draft`'s Q4 proposal head. End to end (`infernix_decode_quality_gen`, `--draft-tokens auto
+--ngram-draft-tokens auto`, one request, 24 code segments of 1,280 + 384 tokens and 24 thinking-on chats of 400
+tokens), on the reproducible route, where every arm decoded the same greedy text and two passes agree within 0.4 %:
+the screened full head against it unscreened +1.9 % on code and +1.8 % on chats, against `--lm-head-draft` +4.3 % and
++0.6 % (on code the screened arm proposed 12,263 drafts against 12,820 and had 7,424 accepted against 7,344). On
+the default route, where the arms decode different texts (about +-3 % a cell), against `--lm-head-draft`: code +5.5,
++1.7 and +0.9 % at one, two and four requests, sampled docs +6.5, -2.5 and -1.4 %, chats +1.3 % (geometric mean
++1.7 %). Wider batched rounds (past 32 mask columns, more than four requests) were not measured: they take the full head's
+`linear_topk`. Without `--lm-head-draft` the proposal head is not loaded, so the screen's 357.6 MB costs no KV against
+it (314,688 tokens either way at two lanes). The recommended 27B setting still names `--lm-head-draft`.
 
 Let predecessor/successor codebooks have shape `[vocab_size,R]` and the hidden projection have
 shape `[R,H]`. The current selector receives its projected hidden g_i as BF16, candidate scores as
@@ -435,6 +452,101 @@ has the 27B drafter's mathematics at the geometry above; the fused Ops register 
   (the drafter's Op sequence, no state) and
   [`program/dflash2_program.cpp`](../../src/models/qwen4_exp/program/dflash2_program.cpp) (ring,
   features, io, graphs).
+
+## Inkling 2 Mini
+
+The Inkling 2 drafter ([incoai/Inkling-2-Mini-DFlash2](https://huggingface.co/incoai/Inkling-2-Mini-DFlash2)) is the
+same mathematics at Inkling 2 Mini's widths, with three differences: its features are DSpark's (the inputs of layer
+visits 5, 23 and 41 and the final-normed state, concatenated: no stream mean), its block's inputs are the target's
+normed embeddings, and its selector applies a softcap of 30 to each edge after adding the correction
+(`selector_softcap_mode` `after_correction`; `candidate_selector_path`'s `edge_softcap`). `tools.convert --components
+dflash2 --recipe inkling2_mini_dflash2` writes the companion (Q8 projections as Flash-Next's; the codebooks cut to the
+real 200,058-token vocabulary); `--spec dflash2 --draft-model FILE` loads it beside any Inkling 2 artifact, and DSpark
+is then not bound. Its context ring holds committed positions only (a verify call's committed columns are written at
+its round's commit). The rounds are Inkling 2's ([design §13.8](inkling2_mini-design.md#138-the-dflash2-companion---spec-dflash2---draft-model)):
+a draft is kept only when it equals the target's own draw, so speculation never changes the output.
+
+Since verification is equality with the target's draw, a whole-vocabulary sampled row's drafts (`full_vocabulary`,
+`top_k 0`) can be coupled with the draws themselves (`candidate_selector_path`'s `couple_draws`, which Inkling's
+drafter passes): draft i is the candidate maximizing edge/T + the Gumbel noise sample() gives that token at verify
+column i (keyed at the produced position, `sampling_full_noise`). It is an exact draw from q, so q and the drafts' law
+are unchanged; the draft is the target's draw wherever the two laws agree at that noise, instead of only when the
+target draws the drafter's argmax. At 7 drafts a round and temperature 1 (the real test's four prompts, 256 tokens
+each, the same tokens either way) it raised the tokens a round from 3.14 to 3.48. The default top-20 rows keep greedy
+drafts: coupling them by sample()'s inverse-CDF uniform over the candidates in descending order of q lowered the tokens
+a round from 3.49 to 3.33 there, likely because a rank is shared only up to the smaller of the two laws' probabilities
+(a drafter less confident than the target at its likeliest token gives up the target's own draw there). Served (one request, short prompts, 512 tokens,
+`--lm-head-draft`, two runs each), the coupled whole-vocabulary drafts decoded at 341.3 tok/s against the greedy
+drafts' 324.3 (+5.3 %; the two arms' top-20 and greedy phases, identical in what they draft, differed by 0.1-0.3 %).
+
+The companion's MLP may be NVFP4 (recipe `inkling2_mini_dflash2_nvfp4_mlp`, 16-bit activations): the gate/up runs as
+the NVFP4 linear ([13824, 2304]) then `silu_mul` over its two halves, and the down through
+`linear_dynamic_grouped_conv_add`'s NVFP4 route, the NVFP4 linear ([2304, 6912]) into the projected matrix then the Q8
+route's finish. Their sliced-K schedules take at most 4 K-warps (a block K of 256: 2304 and 6912 are no multiples of
+512), and widths to 8 take the 8-token tile (the 1-2 column GEMV and SIMT schedules read K in phases of 512). At 8
+columns NVFP4 A16 against Q8 A16 on a shape both register ([5120, 6144], linear_bench) took 17.0 against 23.1 us,
+23.1 against 25.0 at 16 and 64.1 against 66.1 at 64; at Inkling's shapes (other benches: SwiGLU fused for Q8, the
+NVFP4 linear without silu_mul) 17.0 us against 23.7 for the gate/up and 12.9 against 19.6 (with its finish) for the
+down at 8 columns, about even at 32-64. Served (draft 0.761 against 0.785 ms) it ran 0.5-0.9 % faster than the Q8
+companion one request at a time on short prompts, level on long ones, within the spread at four and eight short
+requests and 4.1 % faster with four questions on a 122K-token prefix, with the same acceptance on short prompts (0.9 %
+lower on long ones) but 1.4-2.0 % fewer tokens a round at a fixed 7 drafts, so the Q8 recipe stays the recommended one. The attention output (9.4 M
+parameters a layer against the MLP's 47.8 M) and the feature projection (21 M, once a round) would save about a fifth
+and a tenth of the MLP's 0.024 ms more; q/k/v and the context projections stay Q8 either way
+(`attn_input_proj`'s drafter form and `context_kv_materialize` read Q8).
+
+Four changes made a DFlash2 round cheaper (2026-11-27, from an nsys profile of the round: draft 583 us of device time
+one request at a time, the commit context 50 us). The commit context (the gather of a verify call's accepted columns
+and their materialization into the rings) is captured as one CUDA graph per row count beside the draft graphs, with
+its words staged in pinned memory (eager without CUDA graphs); the drafts it leads to are unchanged (the same accepted
+and drafted counts one request at a time). Its graphs (one per row count, up to eight) raise the startup's graph
+allowance by 24 MiB, 1,536 tokens of the KV pool (547,456 against 548,992 at eight lanes). The ten conv prepares a draft run Flash-Next's fused prepare kernel, at
+H 2304 with 6 warps a CTA and up to 16 columns a chunk (6.75 against 12.9 us at block 8 and one to four rows, 8.8
+against 12.9-14.9 at five to eight). The feature projection ([2304, 9216]) has its own Q8 shape with Flash-Next's
+sliced-K schedule (8 columns 17.5-18.9 against 27.2 us, 16: 21.1-21.6 against 89.2, 32: 31.4 against 90.6, 64: 49.8
+against 88.7). `logits_topk` takes a group's top sixteen with one warp a 512-row group and column (sixteen warp-wide
+maxima over 16 keys a lane) instead of a 128-row sort, the same candidates by construction (it was 15.9 us at one
+row's 7 columns, 33.7 at four rows'; at Qwen3.8-Flash-Next's full 248,320-row head, which a text head without a
+fused selection also drafts from, 11.0-11.1 against 40.1-41.2 us at 7 columns and 42.9-44.3 against 282-285 at 56).
+Served (one request at a time eight short prompts, then four questions on a ~30K-token and on a 122K-token prefix,
+then four short requests at once; alternating runs, two each, the same texts), the draft's device time fell from
+0.674-0.679 to 0.586-0.587 ms and output tok/s by wall rose 1.6 % on the short prompts (the only phase beyond the
+runs' spread), 0.6 % on the ~30K-token prefix, 0.5 % on the 122K-token prefix and 3.6 % with four requests at once
+(within the spread: 551.5-589.0 against 584.0-596.9).
+The new kernels change the drafter's bits (2,373 against 2,364 accepted drafts on the short prompts), not the output.
+The attention output and MLP down projections run 144 CTAs on 170 SMs (16 output rows each); 16 K-warps and
+double-buffered stages for them measured slower and level, and a split-K across CTAs (about 50 us a draft at most)
+was not built.
+
+The draft length (`--draft-tokens auto`) is `calibrated_draft_length` over the request's deciles, with one-row costs
+in plain one-row rounds that follow the request's context (`kDFlash2ContextCosts`, linear in log2 of the context
+between anchors, the end anchors beyond them): to 4,096 tokens 0.12 a verified draft and 0.16 for the proposal; at
+25,856 tokens a verify call's fixed 0.203 beyond a plain round, 0.129 a draft and 0.098 the proposal; at 122,486
+tokens 0.183, 0.156 and 0.071. The two long anchors are fitted (2026-11-27, on the cheaper rounds above) to wall round
+times at fixed lengths 1-7 against plain rounds there, one request at a time. Rounds of several rows take their width
+from the device times they measure. With the fixed costs everywhere (2026-11-26, wall tok/s over eight short prompts
+one at a time, four questions on a 122K-token prefix one at a time, and four short requests at once), auto beat every
+fixed length from 3 to 7 one request at a time by 5-8 % (the best fixed lengths 4 and 3) and tied fixed 3 at four
+requests. Against the fixed costs everywhere (2026-11-27, alternating runs, three each), the context's costs decoded
+0.7 % faster on the 122K-token prefix (every run above the fixed costs' runs, by 0.05 tok/s at the closest), 0.1 %
+with four questions on a ~30K-token prefix and 3.0 % with four short requests at once (both within the spread); short
+prompts run the same rounds. Between 4,096 and 25,856 tokens the interpolated costs were not measured on their own:
+in the agentic replay DFlash2's requests of 8K-32K decoded as before (131.5 tok/s both times) while the longer ones
+gained 1.1-1.2 %. Three other one-row costs were measured and not kept, each faster in some phases and
+slower beyond the runs' spread in another (alternating runs, two each):
+
+| One-row costs | 8 short prompts | 8 prompts, `top_k 0` | 122K-token prefix | 4 requests at once |
+|---|---|---|---|---|
+| Fitted to the round times at fixed 1-7 drafts (short context): 1.351 + 0.107 a draft, of which 0.129 the proposal | +0.9 % | +1.1 % | -1.4 % | +1.1 % (within the spread) |
+| The device times each context bucket measures (the proposal and the verify call at each width) | -5.2 % | -0.9 % | +1.2 % | +3.2 % |
+| Fitted by context, the short anchor too (at ~270 tokens 0.215 + 0.106 a draft, 0.107 the proposal) | +0.1 % | not run | +0.9 % | -2.0 % |
+
+The short-context fits are a short context's: at 122K a verified draft costs 0.156 plain rounds there against 0.106
+(each verify column attends over the whole context), so they under-cost a draft and the rounds verify too many
+(acceptance 0.46 against 0.49). The device times leave out what a draft costs the host (its commit, the read-back), so
+the rounds verified too many drafts on short prompts (35 % accepted against 48 %). The short anchor's fit verified
+more drafts on the eight short prompts (5,090 against 4,952) for no more accepted (2,370 against 2,373): level one
+request at a time, slower with four at once.
 
 ## Execution flow
 
