@@ -1,6 +1,7 @@
 #include "ops/op_family.h"
 #include "ops/linear/linear_test_common.h"
 #include "ops/op_tester.h"
+#include "infernix/ops/linear_add.h"
 
 #include <cuda_runtime.h>
 
@@ -39,6 +40,8 @@ constexpr std::array kGeometries{
     Geometry{2560, 12800, 383U},
     // Shapes NInfer tunes for its own 2560-wide groupings (not Flash-Next recipe B packings).
     Geometry{6144, 2560, 367U},  Geometry{10240, 2560, 373U}, Geometry{12288, 2560, 379U},
+    // A DSpine drafter's attention output (n5120_k6144's schedules).
+    Geometry{5120, 4096, 389U},
     // An unregistered geometry on the runtime-shape route (predicated SIMT, then MMA tiles).
     Geometry{2560, 4096, 331U}};
 
@@ -235,6 +238,37 @@ int q8_a16_hc_wide_widths() {
     cudaFree(y);
     return failures;
 }
+// ops::linear_add_supported answers as linear_add's registrations (a DSpine drafter's projections that it misses
+// project, then add): format, layout and shape, with no data pointer.
+int linear_add_registration() {
+    using infernix::QType;
+    using infernix::QuantLayout;
+    const struct {
+        QType qtype;
+        QuantLayout layout;
+        std::int32_t n, k;
+        bool expected;
+    } cases[] = {
+        {QType::Q8_G32_FP16, QuantLayout::RowSplit, 5120, 17408, true},
+        {QType::Q8_G32_FP16, QuantLayout::RowSplit, 2048, 4096, true},
+        {QType::Q8_G32_FP16, QuantLayout::RowSplit, 5120, 4096, false},
+        {QType::Q8_G32_FP16, QuantLayout::Contiguous, 5120, 17408, false},
+        {QType::NVFP4, QuantLayout::BlockScaleK16M128x4, 5120, 17408, true},
+        {QType::NVFP4, QuantLayout::BlockScaleK16M128x4, 5120, 4096, false},
+        {QType::NVFP4, QuantLayout::RowSplit, 5120, 6144, false},
+        {QType::BF16, QuantLayout::Contiguous, 5120, 6144, true},
+        {QType::BF16, QuantLayout::Contiguous, 5120, 4096, false},
+    };
+    int failures = 0;
+    for (const auto& c : cases) {
+        if (infernix::ops::linear_add_supported(c.qtype, c.layout, c.n, c.k) != c.expected) {
+            std::cerr << "linear_add_supported [" << c.n << "," << c.k << "] answered "
+                      << (c.expected ? "unsupported" : "supported") << '\n';
+            ++failures;
+        }
+    }
+    return failures;
+}
 } // namespace
 
 INFERNIX_OP_TEST(linear_q8_a16) {
@@ -243,7 +277,8 @@ INFERNIX_OP_TEST(linear_q8_a16) {
         return 77;
     }
     try {
-        const int failures = q8_a16_conformance() + q8_a16_column_invariance() + q8_a16_hc_wide_widths();
+        const int failures =
+            linear_add_registration() + q8_a16_conformance() + q8_a16_column_invariance() + q8_a16_hc_wide_widths();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " Q8_A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

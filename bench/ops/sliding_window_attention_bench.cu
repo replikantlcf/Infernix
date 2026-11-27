@@ -270,7 +270,8 @@ public:
     void launch(cudaStream_t stream) {
         ops::sliding_window_attention(q_tensor_, query_k_tensor_, query_v_tensor_,
                                       positions_tensor_, valid_tensor_, lane_tensor_, kGeometry,
-                                      static_cast<std::uint32_t>(window_), kScale, context_view_,
+                                      static_cast<std::uint32_t>(window_),
+                                      ops::SlidingWindowMask::Symmetric, kScale, context_view_,
                                       envelope_, workspace_, output_tensor_, stream);
     }
 
@@ -443,7 +444,8 @@ int main(int argc, char** argv) {
                     const ops::SlidingWindowAttentionExecutionEnvelope envelope{
                         0, static_cast<std::uint32_t>(maximum)};
                     const auto plan = ops::detail::sliding_window_attention_resolve_plan(
-                        static_cast<std::uint32_t>(options.window), tokens, batch, envelope);
+                        static_cast<std::uint32_t>(options.window), ops::SlidingWindowMask::Symmetric, tokens,
+                        batch, envelope);
                     bench::TimedGraph graph;
                     if (options.execution != Execution::Eager) {
                         data.launch(stream);
