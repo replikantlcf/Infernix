@@ -155,8 +155,9 @@ What is exact and what is estimated (`estimated` is always `true`):
   the chat template as the start's frontend does); its Program then re-plans with the fast paths
   selected, so its actual frames can differ slightly from `expert_frames`. Both families'
   `expert_frames` leave off the 64 MiB chunk per record-size pool a start keeps free (a GGUF import's
-  layers have up to seven). A start reads the CUDA kernel images (about 4.5 GiB of RAM) before its RAM
-  ledger, which then sees them used; the plan, which launches no kernel, counts them as process growth.
+  layers have up to seven). A start reads the CUDA kernel images (about 1.5 GiB of RAM) on a thread of
+  its own beside its weight read, after its RAM ledger, which counts them as process growth, as the
+  plan does (it launches no kernel).
 - The Qwen3.5 family's capacity is resolved against the free VRAM read where a start reads it
   (under Windows with a DXGI budget, at most the budget less the process's usage, which can be GiBs
   below the driver's free figure; a KV sized past it would be demoted to system memory), less
@@ -184,6 +185,7 @@ What is exact and what is estimated (`estimated` is always `true`):
 | `GET /metrics` | Prometheus counters, gauges and latency histograms |
 | `GET /metrics?format=json` | JSON snapshot: engine identity, live gauges, totals, and the last 128 terminal requests (`Accept: application/json` also selects it) |
 | `GET /monitor` | each request the Engine holds now: phase, lane, service turn, recovery and progress ([Request monitor](#request-monitor)) |
+| `GET /slots` | llama.cpp's slot array, one object per lane, for supervisors written for llama.cpp's server ([Slots](#slots)) |
 | `GET /v1/models` | configured OpenAI model alias, effective `max_model_len`, and llama.cpp-compatible `meta` and `chat_template_caps` objects |
 | `GET /v1/models/{id}` | lookup of the configured alias, `max_model_len`, `meta` and `chat_template_caps` |
 | `POST /v1/chat/completions` | OpenAI-style chat generation |
@@ -361,7 +363,8 @@ The endpoint supports:
   separators, and empty wire content remains an empty turn;
 - User `image_url` parts, tool-result `image_url` parts used by compatible clients, and the User
   `video_url` extension using HTTP(S) or data URIs; image detail is omitted, `auto` or `high` (both the
-  model's native full-quality preprocessing);
+  model's native full-quality preprocessing) or `low` (the picture's longer side capped at 512 px,
+  its aspect kept, on every vision model);
 - nonnegative `max_completion_tokens` and the legacy `max_tokens` spelling; zero performs prompt
   processing without generation. As an extension (OpenAI rejects it), `-1` means no explicit limit:
   the field is treated as omitted, so the other spelling or `--default-max-tokens` applies;
@@ -394,7 +397,7 @@ The endpoint supports:
 
 Options whose observable behavior the Engine cannot provide are rejected when they request that
 behavior. This includes nonzero `logit_bias`, requested log probabilities, audio/file input or
-audio output, image detail other than `auto` or `high`, web search, moderation, low/high verbosity, stored
+audio output, image detail other than `auto`, `high` or `low`, web search, moderation, low/high verbosity, stored
 Chat Completions, and non-empty legacy `functions`.
 Each capability rejection identifies the affected field and the guarantee Infernix cannot provide.
 
@@ -1209,7 +1212,7 @@ String `input` is normalized to one user `message` with an `input_text` part. Ar
 | `input_text` | message content part containing string `text` |
 | `output_text` | assistant-message replay part containing string `text` |
 | `refusal` | assistant-message replay part; its text enters assistant history |
-| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted, `auto` or `high`; requires server `--vision` |
+| `input_image` | user- or assistant-message part with HTTP(S) or data-URI `image_url`; detail omitted, `auto`, `high` or `low` (longer side capped at 512 px); requires server `--vision` |
 | `input_video` | Infernix extension with HTTP(S) or data-URI `video_url`; requires server `--vision` |
 | `reasoning` | raw replay Item with `reasoning_text` content; summary/encrypted metadata may accompany raw text but cannot replace it |
 | `function_call` | completed assistant call with optional `id` and namespace, plus required `call_id`, `name`, and JSON-object string `arguments` |
@@ -1244,7 +1247,7 @@ prompt representation.
 An `input_file` part in a user message or a tool result is a PDF document (`file_data`, a base64 PDF
 as a data URL or bare, or `file_url`; `filename` titles it), read as described in
 [Documents, PDFs and citations](#documents-pdfs-and-citations). A `file_id` input, `input_audio`, image `file_id`,
-image detail other than `auto` or `high`, reasoning metadata without raw
+image detail other than `auto`, `high` or `low`, reasoning metadata without raw
 reasoning text, partial tool Items, and other Item/content types are not supported. HTTP media URLs
 stored in a response chain are fetched again when that chain is continued; use data URIs when the
 historical media bytes must be immutable.
@@ -2013,6 +2016,19 @@ curl http://127.0.0.1:8080/v1/decide -H 'Content-Type: application/json' -d '{
   question failed returns the first question's error status instead.
 - Each question is one engine request in the request log and metrics (`protocol: "decide"`): a
   readout with one staged output token that is never returned, a generated primitive with its run.
+- **Scheduling.** Every question is a decision to the Engine. It is queued ahead of the waiting
+  requests that are not questions, takes the next prefill turn ahead of other prefilling requests,
+  and is paused under resource pressure only when nothing else can be. The priority is bounded, so
+  a stream of questions cannot starve other requests: each waiting request is still admitted after
+  at most `--max-concurrency` later arrivals (questions included), and a prefilling request waits
+  for questions only until others have prefilled twice its remaining prompt. `--decision-lanes N`
+  also reserves `N` more lanes that only questions take, so a question does not wait for a
+  generating request to finish (it can still wait for other questions, or for capacity); without it
+  a question needs a free lane like any request. On the Qwen3.5 family (the 27B, 35B and 122B) a
+  question publishes its evidence prefix to the prefix cache but no endpoint snapshot of its own, so
+  questions do not displace a conversation's cached state; Inkling 2 publishes no endpoint at a
+  finish in any case, and Qwen3.8-Flash-Next keeps its snapshots in RAM
+  ([resource scheduling §5.4](maintainer/resource-scheduling-and-context-cache.md#decisions)).
 
 ## Teacher-forced scoring
 
@@ -2132,10 +2148,12 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--vram-headroom-mib N\|auto` | VRAM in MiB that startup sizing leaves free for the display and other programs (`auto` = 1024 with a display on the GPU or when that is unknown, 256 without). Qwen3.5: after `--kv-capacity auto` sizes the KV pool (requires `auto`). Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): after the expert cache takes the rest ([details](qwen3_8-flash-next.md#vram)). Inkling 2: what `--max-context auto` and the prefix cache's `--kv-capacity auto` leave; a start that sizes neither refuses it | `auto` |
 | `--vram-past-budget` | Windows: also size into the VRAM the Windows per-process budget withholds (~0.6 GiB on an RTX 5090), measured at startup: with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) the expert cache (~240 more expert frames), otherwise the KV pool of `--kv-capacity auto` (more KV, so more context in VRAM and a larger Device prefix cache). Every startup reading, the Program's check that its allocations landed in VRAM and the free VRAM the server reports count it. That memory may be moved to system memory if another program needs VRAM: an expert cache then shrinks, while a KV pool stays and runs slower until the VRAM frees ([details](qwen3_8-flash-next.md#vram)). Inkling 2: for `--max-context auto` and the prefix cache's `--kv-capacity auto` only (a start that sizes neither refuses it) | off |
 | `--expert-tail-skip R` | Artifacts with offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B), approximate: trades quality for decode speed. In decode and verification rounds, a routed expert missing from VRAM that every token of the round routes at top-k rank `R` or lower (`1..k-1`, 0-based, with k = 10 on Flash-Next and 8 on the 122B; k-1 skips least) is neither copied nor computed: it adds zero and the other experts keep their router weights. The output changes, is slightly worse, and depends on which experts the cache holds; prefill is unchanged; the reproducible route (`--reproducible`) refuses it. Strata does the same by default at rank 7 (`STRATA_ROUTE_TAIL_SKIP=7`) ([details](qwen3_8-flash-next.md#expert-tail-skip)) | off |
-| `--expert-state FILE\|off` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. Without a usable file Qwen3.8-Flash-Next seeds the cache from a built-in calibrated expert order instead, and with one the SSD tier's RAM takes the experts the file never ranked in that order; the 122B seeds half its frames the same way from its own built-in calibrated order. `off` starts with an empty cache, no seed, and saves nothing; cold benchmarks need it. Beside it, `FILE.cpu-rates` keeps the CPU expert team's settled rates for this CPU, artifact and team: every start still reads the rates, and when its first two readings agree with the stored ones within 10 % it skips the 4 s settling pause (otherwise it settles in full and, on a quiet CPU, stores its own); the session always uses that start's readings, and a changed machine or configuration is simply a new entry | `<artifact>.expert-state` |
+| `--expert-state FILE\|off` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B): the expert cache's saved state. At startup the engine fills the VRAM expert cache with the experts the file ranks highest (about 1 s for a full cache) and starts their use counts from it; it writes the file when it stops and every 10 minutes between requests (through `FILE.tmp` and a rename). A file from another artifact or of another size is ignored and replaced. Without a usable file Qwen3.8-Flash-Next seeds the cache from a built-in calibrated expert order instead, and with one the SSD tier's RAM takes the experts the file never ranked in that order; the 122B seeds half its frames the same way from its own built-in calibrated order. `off` starts with an empty cache, no seed, and saves nothing; cold benchmarks need it. Beside it, `FILE.cpu-rates` keeps the CPU expert team's settled rates for this CPU, artifact and team. With `--cpu-rates saved` (the default) a start that finds its entry takes those rates as the session's with no readings; with `--cpu-rates measure` every start still reads the rates, and when its first two readings agree with the stored ones within 10 % it skips the 4 s settling pause (otherwise it settles in full and, on a quiet CPU, stores its own); a measuring session uses that start's readings, and a changed machine or configuration is simply a new entry | `<artifact>.expert-state` |
+| `--cpu-rates saved\|measure` | Qwen3.8-Flash-Next: `saved` takes the CPU expert team's rates from the stored entry beside the expert state (`<expert state>.cpu-rates`) when there is one, with no readings at startup (each reading waits up to 20 s for a quiet CPU, which on a busy desktop made a start take minutes); `measure` reads them at every start, as before. A first start, or a deleted file, measures and stores; a reading that only confirms the stored rates records nothing, so the entry is never ratcheted | `saved` |
 | `--expert-stripe FILE` | Offloaded experts (Qwen3.8-Flash-Next, Qwen3.5-122B-A10B) with the SSD expert tier: an expert stripe (`tools/flash_next/expert_stripe.py`) holding the tail of every expert record on a second drive; each record not in RAM is then read in two parts, its head from the artifact and its tail from the stripe, at the same time. The stripe must belong to the artifact. Unused when every expert fits in RAM ([guide](qwen3_8-flash-next.md#ssd-expert-tier)) | none |
 | `--max-concurrency N` | resident execution lanes; valid range `1..8` | `1` |
 | `--causal-scoring` | start the engine for teacher-forced scoring (the `CausalScoring` purpose `perplexity` and `certify` use): `POST /v1/score` answers and nothing generates, so there is no warm-up ([Teacher-forced scoring](#teacher-forced-scoring)) | off |
+| `--decision-lanes N` | `N` more lanes that only `/v1/decide` questions take, so a question does not wait for a generating request to finish ([Decisions](#decisions)); `--max-concurrency` plus `N` is at most 8, and the `max_concurrency` metric counts both. Each costs Device memory like any lane (a StateImage, buffers, Graph rows): an automatic `--kv-capacity` pool is that much smaller, an explicit one needs that much more free memory. On the Qwen3.5 family startup logs the planner's estimate of the cost (`decision lanes: ...`) | `0` |
 | `--max-pending-requests N` | additional requests allowed to wait for admission, 1 to 1024 (the HTTP pool starts a worker for each admitted or waiting request) | `16` |
 | `--pending-timeout-ms N` | maximum preparation-plus-admission wait | `30000` |
 | `--keep-alive-timeout-sec N` | how long an HTTP connection stays open after its response finishes, for the client's next request on the same connection (valid range `1..3600`). The server advertises it as `Keep-Alive: timeout=N` and closes an idle connection 10 s later. Client pools reuse connections between turns; when the server closes a connection first, a client can write its next request onto it (even one that checks a pooled socket before reusing it, if the close is in flight between the check and the write) and loses that request: Bun's `fetch` and the AI SDK do not retry a POST. The timeout close is graceful (a FIN first, then a short drain of anything the client sent), and a request that does arrive re-arms the window on both sides. Two kinds of client pool meet it: one that reads `Keep-Alive: timeout` retires the connection by the advertised deadline, before the server's close; one that ignores the header keeps its own idle timeout, which the window must exceed. Bun's `fetch` (opencode's client) is of the second kind, with a 5-minute idle timeout that fires 4-5 minutes after the last response, so the default outlasts it. Set the window above the longest idle timeout of the header-blind client pools you serve. Each open connection holds a request worker (an idle one wakes every 10 ms) for its whole idle window; the pool ceiling (`--max-http-clients`) bounds how many | `360` |
@@ -2181,7 +2199,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--kv-dtype bf16\|bf16p\|int8\|fp8\|nvfp4\|k8v4\|vq2\|k4v2` | KV-cache storage; `vq2` and `k4v2` are the 2-bit and 4-bit-K vector-quantized formats ([CLI](cli.md#context-and-memory)); `bf16` stores K as BF16 and V as FP16 (exact for every BF16 value with 2^-17 <= \|v\| < 2^16), and with `--lossless` V as BF16; `bf16p` stores the same values as `bf16` losslessly in 12 bits a value plus an 8-byte side record per row, 23 % fewer bytes (the same memory holds 1.31 times the tokens, in the KV cache and the prefix cache), with the same output as `bf16`; a request whose K or V holds a row with more than 6 values outside its 14-binade exponent window fails with an error (none was seen in the 27B's or 35B-A3B's KV). Inkling 2: the format of its full visits' pools (`bf16`, `bf16p`, `int8`, `fp8`, `nvfp4`, `k8v4`, `vq2`, `k4v2`), its sliding windows following it (`bf16` and `bf16p` in their own format, every other format as `int8`) unless `--kv-window-dtype` names theirs ([options](cli.md)) | `bf16` |
 | `--kv-window-dtype auto\|bf16\|bf16p\|int8` | Inkling 2 only (other artifacts refuse a value): the storage of its 40 sliding visits' windows (170 MiB a lane as `bf16`, 138 MiB as `bf16p` with the same values, 88 MiB as `int8`, which changes the output slightly); `auto` follows `--kv-dtype` (`bf16` under `bf16`, `bf16p` under `bf16p`, `int8` under every other format). `--lossless` takes `bf16` or `auto` only; `server_start.engine.kv_window_cache` records it ([options](cli.md)) | `auto` |
 | `--logits-dtype fp32\|bf16` | the vocabulary head's logits, which the sampler, greedy selection, draft acceptance, constraints and scoring read, on every route (Inkling 2 refuses `bf16`): `fp32`, the head's sums without a final rounding, or `bf16`, each logit rounded once to BF16 as Hugging Face Transformers returns them (near-equal logits then become exact ties, which selection breaks by token id); for comparisons with engines and references that round them. With `--lossless` each exact sum is correctly rounded to the chosen dtype | `fp32` |
-| `--spec auto\|off\|mtp\|dflash\|dflash2\|dspark` | speculative backend. Inkling 2 Mini: `dspark` drafts with the artifact's bundled DSpark drafter (`--draft-tokens 1..7`, or `auto`: the calibrated count of 7 drafts a round verifies), one request decoding at a time (rounds of several requests decode plainly); greedy and sampled output equal plain decoding's, token for token; `auto` (with `--draft-tokens auto`) drafts with the bundled DSpark drafter (measured faster: on the sampled prose fixture 194.5 against 191.2 tok/s plain, infernix_bench, 2026-11-22, RTX 5090), plainly when the artifact bundles none ([options](cli.md)). `auto` (with `--draft-tokens auto`; a fixed length and `--spec-min-p` are refused) takes the drafter measured fastest overall among those the artifact can run ([recommended settings](../README.md#quick-start-windows)): on Qwen3.8-Flash-Next DFlash2 when `--draft-model` gives its drafter or the drafter's companion artifact is the only one in the model's folder (with several there, MTP until `--draft-model` names one), else MTP; on a Qwen3.5-family artifact with offloaded experts (the 122B-A10B) MTP; on any other Qwen3.5-family artifact DFlash2 (the Qwen3.8-27Bs), then MTP (the Qwen3.6-35B-A3B and 27Bs), then DFlash, as bundled; plain decode without one and on `--lossless`. Startup reports the choice; `/metrics` and the request log name the chosen backend. Without `--spec` the server runs `auto` with `--draft-tokens auto`, so a fixed `--draft-tokens N` or `--spec-min-p` needs a named backend; `off` decodes plain | `auto` |
+| `--spec auto\|off\|mtp\|dflash\|dflash2\|dspark` | speculative backend. Inkling 2 Mini: `dspark` drafts with the artifact's bundled DSpark drafter (`--draft-tokens 1..7`, or `auto`: the calibrated count of 7 drafts a round verifies), requests decoding together drafting together (their drafts shared out by how likely each request's are to be accepted; [Inkling 2 Mini](inkling2-mini.md#dspark-drafting)); greedy and sampled output equal plain decoding's, token for token; `auto` (with `--draft-tokens auto`) drafts with the bundled DSpark drafter (measured faster: on the sampled prose fixture 194.5 against 191.2 tok/s plain, infernix_bench, 2026-11-22, RTX 5090), plainly when the artifact bundles none ([options](cli.md)). `auto` (with `--draft-tokens auto`; a fixed length and `--spec-min-p` are refused) takes the drafter measured fastest overall among those the artifact can run ([recommended settings](../README.md#quick-start-windows)): on Qwen3.8-Flash-Next DFlash2 when `--draft-model` gives its drafter or the drafter's companion artifact is the only one in the model's folder (with several there, MTP until `--draft-model` names one), else MTP; on a Qwen3.5-family artifact with offloaded experts (the 122B-A10B) MTP; on any other Qwen3.5-family artifact DFlash2 (the Qwen3.8-27Bs), then MTP (the Qwen3.6-35B-A3B and 27Bs), then DFlash, as bundled; plain decode without one and on `--lossless`. Startup reports the choice; `/metrics` and the request log name the chosen backend. Without `--spec` the server runs `auto` with `--draft-tokens auto`, so a fixed `--draft-tokens N` or `--spec-min-p` needs a named backend; `off` decodes plain | `auto` |
 | `--draft-tokens N\|auto` | MTP `1..7` (Qwen3.5/3.6 `1..5`); DFlash/DFlash2 `1..15` (Qwen3.8-Flash-Next DFlash2 `1..7`). `N` drafts and verifies N tokens every round (fewer only near the output limit). `auto` with DFlash or DFlash2: each round drafts the whole block and verifies the number its drafts' calibrated probabilities make fastest; on Qwen3.8-Flash-Next DFlash2 a block of 7 ([guide](qwen3_8-flash-next.md#run)); on Qwen3.5/3.6 the `adaptive-dflash` fast path where that is qualified (the NVFP4 Qwen3.8-27B, a block of 15 whose rounds of several requests verify 7; the Qwen3.6-35B-A3B, a block of 7; [DFlash](maintainer/dflash.md#automatic-verify-width-qwen38-27b--qwen36-35b-a3b)), elsewhere, and with `--reproducible`, the artifact's fastest fixed length every round (7 on the 27B, 3 on the 35B-A3B). On the 122B-A10B, whose verify columns each bring their own expert misses, `auto` with either drafter decodes without one (no draft length was faster than plain decode; the drafter is not loaded). `auto` (MTP): each round drafts the length the request's learned acceptance makes fastest, `0..7` on Qwen3.8-Flash-Next (whose one-request rounds also apply the cumulative acceptance cut, [design §11.3](maintainer/qwen3_8-flash-next-design.md#113-draft-length)); on Qwen3.5/3.6 it is the `adaptive-mtp` fast path (`1..5`) where that is qualified (the NVFP4 Qwen3.8-27B and Qwen3.6-35B-A3B); elsewhere, and with `--reproducible`, every round drafts the artifact's fastest fixed length (5 on the NVFP4 27B, 3 otherwise; none on the 122B-A10B, as above), which startup reports | unset |
 | `--lm-head-draft` | optimized proposal head. Inkling 2 Mini (with `--spec dspark` or `auto`): DSpark drafts from a shortlist of the most frequent tokens, built at load from the artifact's stored ranking (`proposal/token_rank`; an artifact without one is refused). Drafts only: the output is unchanged | off |
 | `--draft-model FILE` | Qwen3.8-Flash-Next with `--spec dflash2` (or `auto`, which then takes it): the DFlash2 drafter's companion artifact (`tools.convert --components dflash2`); `auto` without it looks for the companion in the model's folder. Qwen3.5/3.6 artifacts bundle their drafters and refuse it | unset |
@@ -2212,7 +2230,7 @@ The table lists executable defaults. The startup example selects a long-context 
 | `--cache-tap-min-gap N` | minimum tokens between ladder snapshots | `max(1024, prefill-chunk)`; Qwen3.8-Flash-Next counts the chunk as at most `4096` |
 | `--no-queue-holds` | turn off queue holds. With them, the snapshot each waiting request would resume from and its blocks are evicted after every other cache entry, the request furthest back in the queue first, and new snapshots or Host block writes that would need a held snapshot's slabs are skipped instead; without them eviction is plain LRU (Device) and GDSF (Host), so under a working set larger than the cache a queued request can lose its prefix while it waits ([spec §9.6](maintainer/hybrid-prefix-cache-spec.md#96-queue-holds)) On Inkling 2 the holds cover queued and paused requests alike. | holds on |
 | `--cache-tool-hold-secs N` | Qwen3.5: after a reply that ends in a tool call, hold the snapshots its next turn resumes from (and their blocks) like a queued request's, after every queued one, for `N` seconds (`0..3600`), since an agent client usually sends the next turn once its tool has run; `0` turns the holds off. Qwen3.8-Flash-Next has none and refuses a nonzero value ([spec §9.7](maintainer/hybrid-prefix-cache-spec.md#97-tool-call-holds)) | `30` (Qwen3.5) |
-| `--cache-next-turn-ms N` | after a reply that ended on its own, once the server has had nothing to run for `N` ms (`0..3600000`), prefill the conversation's history as its next request will render it ([next-turn prefill](#next-turn-prefill), [spec §7.9](maintainer/hybrid-prefix-cache-spec.md#79-next-turn-prefill)); it yields to any request at its next unit and never changes output; `0` turns it off. Qwen3.8-Flash-Next: off by default, refused with `--reproducible` and `--lossless` | `150` (Flash-Next `0`) |
+| `--cache-next-turn-ms N` | after a reply that ended on its own, once the server has had nothing to run for `N` ms (`0..3600000`), prefill the conversation's history as its next request will render it ([next-turn prefill](#next-turn-prefill), [spec §7.9](maintainer/hybrid-prefix-cache-spec.md#79-next-turn-prefill)); it yields to any request at its next unit and never changes output; `0` turns it off. Qwen3.8-Flash-Next: off by default, refused with `--reproducible` and `--lossless` | `150` (Inkling 2 `1000`, `0` with `--lossless`; Flash-Next `0`) |
 | `--cache-host-state fp32\|fp24\|bf16` | Qwen3.5: Host-tier form of snapshot recurrent (Gated DeltaNet) state; the attention KV cache keeps `--kv-dtype` and the Device copies stay exact. `fp24` and `bf16` round it to 15 or 7 mantissa bits, shrinking each 27B snapshot by 36 or 72 MiB (about 19 % and 39 % of a DFlash2 image), so the same Host tier keeps more snapshots and restores move fewer bytes; a snapshot restored from the Host then resumes from the rounded state, so output is no longer bit-identical to `fp32`. A cache file written with another form is not loaded; `fp24` and `bf16` are refused with `--reproducible` (whether a turn resumes from the Host depends on eviction) and for Qwen3.8-Flash-Next ([spec §5.6](maintainer/hybrid-prefix-cache-spec.md#56-host-state-precision)). Under the `fp16-gdn-state` fast-path candidate the pool itself stores the state as FP16, and the Host keeps those bytes exactly whatever this option says | `fp32`: exact |
 | `--prefix-cache-file PATH` | at startup, restore the Host tier from `PATH` if the file exists; when the server stops ([Stop the server](#stop-the-server)), save it there once running and queued requests are cancelled (every Host-backed snapshot, including those a later turn superseded, which a retried or re-sent prompt resumes from, and the block path each resumes through). A save cut short is abandoned and the previous file kept: one more Ctrl+C during the stop also deletes the unfinished `PATH.tmp`, while Windows ending a closed console's process about 5 s after the close leaves it until the next save, so stop large caches with Ctrl+C. `PATH` may be relative (resolved against the launch directory) or absolute, e.g. `--prefix-cache-file "e:\NInfer-Deploy-V3\file.cache"`. Its directory must exist, it may not be the model artifact or another output file (`--log-file`, `--request-log-jsonl`, `--route-trace`), and the flag needs a Host tier (not `--host-context-mib 0`). A file written for another artifact, KV format, speculative backend, RoPE scaling, prefill chunk, fast-path, lossless, 8-bit activation or `--expert-tail-skip` setting, `infernix-serve` binary or GPU model is ignored and replaced at shutdown. The startup log shows the read's progress and reports what was restored; with a `--host-context-mib` smaller than the file needs, the most valuable snapshots and only the blocks they resume through are restored, and the log warns with the size the file needs; when no snapshot fits, it warns that nothing was restored and that the save at shutdown replaces the file. Saving writes up to `--host-context-mib` of data. With `--ssd-context-gib`, the SSD tier is kept too: its file in `--ssd-context-dir` is named after `PATH` and stays when the server exits, the save names the snapshots and blocks it holds (with a hash of each slab, written beside the file's tables, so saving them writes no slab bytes), and the next start with the same `PATH`, SSD size and directory takes them back without reading them (the log reports `prefix cache SSD tier kept`); each is read only when a request resumes from it, and a slab whose bytes no longer match the saved hash (written over after the save, for example by a run that crashed) is dropped instead of used. | off: nothing is saved or restored |
 | `--ssd-context-gib N` | an SSD tier of `N` GiB below the Host tier, for every model ([spec §5.7](maintainer/hybrid-prefix-cache-spec.md#57-ssd-tier-opt-in)). When the Host tier fills, the snapshots it would give up next and their blocks are written to a scratch file in `--ssd-context-dir` (each block once while the SSD keeps it; superseded snapshots and blocks no snapshot needs are never written), and a request that resumes from them reads them back into the Host tier first (it waits in the queue meanwhile) instead of recomputing them. Snapshot images are stored losslessly compressed where that saves space (about 12 % of a Qwen3.8-Flash-Next image), and Qwen3.8-Flash-Next's copies leave out the DFlash2 drafter's context (about a quarter of an image; a restored request's drafter starts it afresh, which can cost speculative acceptance but never changes what the model computes). The file's space is reserved at startup and the file is removed when the server exits, unless `--prefix-cache-file` is set, which keeps it for the next start; it is read and written without the OS file cache, so it takes no RAM. Size it for the conversations you want to keep (a 160K-token Qwen3.8-Flash-Next conversation is about 2.4 GB with INT8 KV). WARNING: it writes to the drive whenever the Host tier fills, which wears an SSD, up to `--ssd-context-gib-per-hour`; the `throughput` log record (`context_cache.hybrid.ssd`) and `/metrics` (`ssd_context_write_bytes_total`) report what it wrote. Needs a Host tier and `--ssd-context-dir`. | off |
@@ -2573,11 +2591,50 @@ curl http://127.0.0.1:8080/monitor
 | `requests[].phase` | `queued`, `binding` (restoring cached state into a lane), `prefill`, `replay` (a resume recomputing its history), `pausing`, `paused`, `decode`, `control` (forced control tokens) or `finishing` |
 | `requests[].lane` | its lane while it holds one, else `null` |
 | `requests[].background` | the Engine's idle-time prefill of a finished turn |
+| `requests[].decision` | a `/v1/decide` question ([Decisions](#decisions)) |
 | `requests[].progress_owner`, `recovery_pending` | it owns the service turn; a resumed request still protects its recovery capacity |
 | `requests[].recovery_route` | `replay` when its latest resume recomputed history, else `none` |
 | `requests[].prompt_tokens`, `reused_tokens`, `computed_prompt_tokens`, `output_tokens` | its prompt, the prefix its binding reused, the prompt tokens computed since, and the tokens it has generated |
 | `requests[].preemptions`, `snapshot_restores`, `replay_restores`, `replayed_tokens` | its pauses, its resumes from a snapshot at the paused frontier and by Replay, and the history tokens Replay recomputed |
 | `requests[].age_s`, `paused_s`, `since_progress_s` | seconds since submission, paused in total, and since its last committed progress (prompt prefilled, history replayed or output committed; `null` before any) |
+
+A server request that continues after a server-side tool (Messages, Responses) runs one Engine request per
+generation; each of them joins the server request's `id`.
+
+### Slots
+
+`GET /slots` answers llama.cpp's slot array (its server's `GET /slots`), so supervisors and dashboards
+written for llama.cpp read Infernix's lanes unchanged: one object per lane in lane order, idle lanes and
+`--decision-lanes` included, from the same Engine publication as `/monitor`. It follows the server's API-key
+authentication, sends `Cache-Control: no-store`, and carries no request text. `?fail_on_no_slot=1` answers 503
+(`no_slot_available`) when every lane an ordinary request can take is held; a free decision lane does not
+count, since only questions take it. The launcher's port does not forward it (as for `/monitor`): ask the
+model's server.
+
+```bash
+curl http://127.0.0.1:8080/slots
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | the lane |
+| `id_task` | the Engine request id holding it (`engine_id` in `/monitor`), `-1` when idle |
+| `n_ctx` | `--max-context` |
+| `speculative` | a drafter is configured (`--spec` other than `none`) |
+| `is_processing` | a request holds the lane (binding into it, prefilling, replaying, generating, pausing or finishing) |
+| `next_token[0]` | `n_decoded`: tokens it has generated; `has_next_token`: as `is_processing`; `has_new_line` `false` and `n_remain` `-1` (not tracked) |
+| `infernix.phase` | `idle`, or the holder's `/monitor` phase |
+| `infernix.decision_lane` | the lane is one of the `--decision-lanes` |
+| `infernix.decision`, `background` | the holder is a `/v1/decide` question; the Engine's idle-time prefill |
+| `infernix.prompt_tokens`, `cached_tokens`, `computed_prompt_tokens`, `output_tokens` | as `/monitor`'s `prompt_tokens`, `reused_tokens`, `computed_prompt_tokens`, `output_tokens` |
+| `infernix.prefill_tps` | computed prompt tokens per second from its admission to its first token (to now while it has none); `null` before any |
+| `infernix.decode_tps` | tokens per second from its first output token to its latest; `null` before a second |
+| `infernix.age_s` | seconds since submission |
+| `infernix.request` | the server request (`id`, `label`, `protocol`) with the client's `X-Request-Id` and `X-Session-Id` (`client_request_id`, `session_id`: 1-128 characters of `[A-Za-z0-9._:-]`, else `null`); `null` for the Engine's idle-time prefill |
+
+The rates come from the Engine's own timestamps, so every poller sees the same figures however often it
+polls; they include the request's pauses and the other lanes' work between its units. llama.cpp's
+`params` (the request's sampling) are not reported; the `infernix` fields are absent on an idle lane.
 
 ## Structured request log
 
@@ -2877,7 +2934,7 @@ request joins that batch only after its single-request prefill finishes; when it
 cancelled, the next boundary rebuilds the batch without an empty row.
 
 `--max-pending-requests` bounds the requests waiting behind the active set. The total generation
-request lifetime capacity is `max_concurrency + max_pending_requests`, including requests still in
+request lifetime capacity is `max_concurrency + decision_lanes + max_pending_requests`, including requests still in
 CPU/media preparation and completed model results whose response has not yet been released. A full
 capacity returns HTTP 429 with code `server_overloaded` and a `Retry-After` header (seconds: the
 `--pending-timeout-ms` window, at least 1). Token-count requests (Anthropic
@@ -2890,7 +2947,9 @@ does not occur in time; a Messages or Responses streaming request still queued 5
 has started its stream by then and gets the timeout as the stream's error event instead.
 Once admitted, a request may pause for resource pressure without restarting this initial-admission
 deadline. Fresh requests enter in FIFO order with a bounded bypass allowance when an earlier request
-cannot fit. There is no admission ETA or unbounded overflow queue.
+cannot fit; `/v1/decide` questions enter ahead of the waiting requests that are not questions, within the
+same allowance ([Decisions](#decisions)).
+There is no admission ETA or unbounded overflow queue.
 
 Input memory is bounded by the outstanding-request count and the per-request
 `--max-request-mib` limit. Media preparation uses a shared permit pool sized from `--media-live-mib`
@@ -2988,6 +3047,14 @@ between requests, and snapshots of a lane's state at taps), with these differenc
   from that state, or rebuilds what the cache gave up with the prompt route over its prompt and decode-route calls
   of up to 16 positions over its reply: the bits those positions were first computed with. So a paused request's
   output is bit for bit the same on every route. Queue holds keep a paused request's resume point cached last.
+- **Requests that share a new prefix prefill it once**, as on the Qwen families (in-flight coalescing): a request
+  whose prompt shares more with a request still prefilling than the cache holds waits for that request's snapshot
+  where the two diverge, and a request bound below the end of cached blocks another prompt left (one document,
+  another question) snapshots that end, so the next question resumes there. Measured (RTX 5090, INT8 KV, the
+  launcher's 240K four-lane configuration, 2026-11-26): four questions at once on a cached 122K-token document 7.5K
+  tokens past its last snapshot 1.4-2.0 s to their first tokens instead of 1.2-7.1 s; of two asked one after the
+  other, the second 187 ms instead of 1,244 (the first 1,414 instead of 1,252: it snapshots the divergence), and four
+  more after them 185-745 ms.
 
 Measured (inkling2-mini, RTX 5090, BF16 KV, 2026-11-22, the median of 3 prompts): a cold 10,000-token prompt prefills
 in 609.9 ms publishing its blocks and taps against 609.5 ms without; a turn that continues it by 64 tokens gets its
@@ -3001,7 +3068,15 @@ image, its tail and its path's blocks, waiting for the write-backs that need) an
 from it. A snapshot's state image is about 200 MB beside 2 MiB of KV a 64-token block, so reading a short prompt back
 from the SSD is slower than its prefill and the source choice re-prefills it (by the cost model at 2 GB/s, below about
 2,800 tokens on the default route; on `--lossless`, whose prefill runs at about 340 to 450 tokens a second, it prefers the read
-at any length). `--cache-next-turn-ms` and `--cache-tool-hold-secs` are not built for Inkling 2 yet and are refused.
+at any length). `--cache-tool-hold-secs` is not built for Inkling 2 yet and is refused. The
+[next-turn prefill](#next-turn-prefill) is on by default after 1 s idle (`--cache-next-turn-ms 1000`; off with
+`--lossless`, whose prefill units take seconds): the cache keeps only prompt-computed state, so without it every
+next turn prefills the previous reply again, and the pass prefills the history on the prompt route, whose bits do
+not depend on where a call starts, so a turn resumed from it gives an uncached run's output on every route. On a
+~122K-token document with a ~1.2K-token reply, the next turn's first token came at 159 ms against 200-221 ms
+without the pass when it arrived after the pass, and at 258-288 ms when it arrived while the pass ran (it waits
+for the pass's unit, then resumes in a narrow call): hence the 1 s quiet period, longer than Qwen3.5's 150 ms, so
+an agent that answers within a second never meets a running pass.
 
 ### Next-turn prefill
 
@@ -3014,7 +3089,7 @@ so every next turn recomputes the previous reply. After each reply that ended on
 token or stop string; not one cut by its limit or cancelled), the server renders the conversation
 with that reply appended as its next request will (the request's template options; a tool result
 follows a reply that calls tools, a user turn any other), and once the server has had nothing to run
-for `--cache-next-turn-ms` (default 150 ms), prefills that history into the prefix cache as an
+for `--cache-next-turn-ms` (default 150 ms; Inkling 2 1 s), prefills that history into the prefix cache as an
 internal request. The next request then resumes at the history's end (on `--reproducible`, at the
 grid position at or before it, so its output still equals an uncached run's).
 
@@ -3034,6 +3109,14 @@ grid position at or before it, so its output still equals an uncached run's).
   the reply's end (94 % of continuing turns in a Dense8 replay), and on `--reproducible` a turn resumed
   from the pass's grid snapshot did not equal an uncached run, so `--reproducible` and `--lossless`
   refuse a non-zero `--cache-next-turn-ms` there.
+- Inkling 2: on after 1 s (off on `--lossless`). Its cache keeps only prompt-computed state, so every next turn
+  needs the pass. The unit a request waits out is the pass's whole prefill call: the reply (up to a 4,096-token call,
+  ~0.67 s at 122K context, derived from the prompt route's timing), after which a turn of that conversation resumes
+  in a narrow call (~125 ms at 122K). Measured on a ~122K-token document with ~1.2K-token replies sent back with
+  their reasoning, at a 150 ms quiet period: the next turn's first token 159 ms against 200-221 ms without the pass
+  when it came after the pass, 258-288 ms when it came during it; hence the 1 s default. At 1 s: a turn 0.2 s after
+  the reply level with no pass (no pass starts: 355 / 202 ms both), 1.1 s after it (the pass running) 194-213
+  against 196-213 ms (+7.5 % at worst), 3 s after it 158-159 against 200-228 ms (-21 to -30 %).
 
 Speculative backends preserve protocol output shapes, stop behavior, and usage accounting. If a stop
 truncates a multi-token MTP, DFlash or DFlash2 round, the Engine commits the exact accepted target prefix so

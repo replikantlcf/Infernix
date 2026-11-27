@@ -46,6 +46,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--vram-past-budget", false},
     ServeOptionArity{"--expert-tail-skip"},
     ServeOptionArity{"--max-concurrency"},
+    ServeOptionArity{"--decision-lanes"},
     ServeOptionArity{"--max-pending-requests"},
     ServeOptionArity{"--pending-timeout-ms"},
     ServeOptionArity{"--keep-alive-timeout-sec"},
@@ -97,6 +98,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--device"},
     ServeOptionArity{"--ram-free-mib"},
     ServeOptionArity{"--ram-resize"},
+    ServeOptionArity{"--cpu-rates"},
     ServeOptionArity{"--expert-ram-mib"},
     ServeOptionArity{"--expert-ram-layout"},
     ServeOptionArity{"--expert-pin-mib"},
@@ -316,6 +318,10 @@ std::string serve_usage_text(const char* argv0) {
            "                             whose experts stay in VRAM, e.g. the 27Bs), so one\n"
            "                             request may fill the KV cache\n"
            "  --max-concurrency N        max concurrent sequences, 1-8 (default 1)\n"
+           "  --decision-lanes N         N more lanes that only /v1/decide questions take, so a\n"
+           "                             decision never waits for a generating request; each\n"
+           "                             costs Device memory like any lane (logged at startup);\n"
+           "                             --max-concurrency plus N is at most 8 (default 0)\n"
            "  --prefill-chunk N          prefill chunk size in tokens, multiple of 128\n"
            "                             (default 16384 with offloaded experts, 1024 otherwise)\n"
            "  --use-original-int8-prefill-kernel\n"
@@ -493,6 +499,12 @@ std::string serve_usage_text(const char* argv0) {
            "                             available, until --ram-free-mib is, and take it\n"
            "                             back once --ram-free-mib plus 1 GiB stays free;\n"
            "                             off keeps their startup sizes\n"
+           "  --cpu-rates saved|measure  Qwen3.8-Flash-Next: saved (default) takes the CPU\n"
+           "                             expert team's rates from the saved quiet settle\n"
+           "                             beside the expert state when there is one, with\n"
+           "                             no readings at startup; measure reads them at\n"
+           "                             every start (each reading waits up to 20 s for a\n"
+           "                             quiet CPU)\n"
            "  --expert-ram-mib N|auto    Offloaded experts: Host RAM in MiB for the routed\n"
            "                             experts (auto: what --ram-free-mib and the other\n"
            "                             pins leave); less than all of them need reads the\n"
@@ -619,8 +631,9 @@ std::string serve_usage_text(const char* argv0) {
            "                             reply, prefill that conversation's history as its\n"
            "                             next request will render it (yields to any request\n"
            "                             at its next unit; never changes output). Default\n"
-           "                             150, 0 turns it off; Qwen3.8-Flash-Next: default 0,\n"
-           "                             refused with --reproducible and --lossless\n"
+           "                             150, 0 turns it off; Inkling 2: default 1000 (0 with\n"
+           "                             --lossless); Qwen3.8-Flash-Next: default 0, refused\n"
+           "                             with --reproducible and --lossless\n"
            "  --cache-host-state fp32|fp24|bf16\n"
            "                             host tier form of snapshot recurrent state: fp24\n"
            "                             and bf16 shrink each 27B snapshot by 36 and 72 MiB\n"
@@ -891,6 +904,18 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             return arguments[i].c_str();
         };
         if (find_option(arg) == nullptr) { throw std::invalid_argument("unknown argument: " + arg); }
+        // Options parsed outside the chain below: MSVC refuses an if/else-if chain nested more than 128 deep (C1061).
+        if (arg == "--cpu-rates") {
+            const std::string mode = require_value("--cpu-rates");
+            if (mode != "saved" && mode != "measure") { throw std::invalid_argument("--cpu-rates must be saved or measure"); }
+            options.cpu_rates_saved = mode == "saved";
+            continue;
+        }
+        if (arg == "--decision-lanes") {
+            options.decision_lanes = static_cast<std::uint32_t>(
+                parse_nonnegative_int(require_value("--decision-lanes"), "decision-lanes"));
+            continue;
+        }
         if (arg == "--host") {
             options.host = require_value("--host");
         } else if (arg == "--port") {
@@ -1472,6 +1497,9 @@ ServeOptions parse_serve_options(int argc, char** argv) {
     }
     if (options.max_concurrency == 0 || options.max_concurrency > kMaximumConcurrency) {
         throw std::invalid_argument("--max-concurrency must be in [1,8]");
+    }
+    if (options.decision_lanes > kMaximumConcurrency - options.max_concurrency) {
+        throw std::invalid_argument("--max-concurrency plus --decision-lanes must be at most 8");
     }
     // The HTTP pool starts one worker per admitted or pending request (and the Engine sizes its queue for them).
     if (options.max_pending_requests == 0 || options.max_pending_requests > kMaximumPendingRequests) {

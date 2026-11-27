@@ -88,6 +88,9 @@ struct ServeOptions {
     bool q8_weights                = false; // EngineOptions::q8_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 1;
+    // --decision-lanes: lanes beside max_concurrency that only /v1/decide questions take
+    // (EngineOptions::decision_lanes; the Engine runs max_concurrency + decision_lanes lanes).
+    std::uint32_t decision_lanes       = 0;
     // At most kMaximumPendingRequests: the HTTP pool starts a worker for each admitted or pending request.
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
@@ -135,6 +138,7 @@ struct ServeOptions {
     std::uint64_t ram_free_bytes           = kDefaultRamFreeBytes;
     bool ram_resize                        = true; // --ram-resize auto|off (infernix::EngineOptions::ram_resize)
     bool ram_resize_explicit               = false; // --ram-resize given (refuse_unsupported_options)
+    bool cpu_rates_saved                   = true; // --cpu-rates saved|measure (infernix::EngineOptions::cpu_rates_saved)
     std::optional<std::uint64_t> expert_ram_bytes; // --expert-ram-mib; empty: the RAM ledger's share
     std::optional<ExpertRamLayout> expert_ram_layout; // --expert-ram-layout (empty: the model's default)
     bool expert_csf = false;                          // --expert-csf

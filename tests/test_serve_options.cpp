@@ -300,9 +300,39 @@ int main() {
         }
     }
 
+    // --decision-lanes adds decision-only lanes beside --max-concurrency, within the 8-lane limit.
+    {
+        const auto lanes = parse({"infernix-serve", "model.ninfer", "--max-concurrency", "3",
+                                  "--decision-lanes", "1"});
+        failures += check(lanes.max_concurrency == 3 && lanes.decision_lanes == 1 &&
+                              parse({"infernix-serve", "model.ninfer"}).decision_lanes == 0,
+                          "--decision-lanes did not parse beside --max-concurrency (default 0)");
+        failures += check(parse({"infernix-serve", "model.ninfer", "--max-concurrency", "7",
+                                 "--decision-lanes", "1"})
+                                  .decision_lanes == 1,
+                          "seven general lanes and one decision lane were refused");
+        failures += check(parse_error({"infernix-serve", "model.ninfer", "--max-concurrency", "7",
+                                       "--decision-lanes", "2"})
+                                  .find("at most 8") != std::string::npos,
+                          "more than eight lanes in all were accepted");
+        failures += check(serve_usage_text("infernix-serve").find("--decision-lanes") !=
+                              std::string::npos,
+                          "serving help omits --decision-lanes");
+    }
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-tail-skip", "7"}).expert_tail_skip == 7 &&
                           parse({"infernix-serve", "model.ninfer"}).expert_tail_skip == 0,
                       "--expert-tail-skip did not parse (default off)");
+    failures += check(parse({"infernix-serve", "model.ninfer"}).cpu_rates_saved &&
+                          !parse({"infernix-serve", "model.ninfer", "--cpu-rates", "measure"}).cpu_rates_saved &&
+                          parse({"infernix-serve", "model.ninfer", "--cpu-rates", "saved"}).cpu_rates_saved,
+                      "--cpu-rates did not parse (default saved)");
+    {
+        bool rejected = false;
+        try {
+            (void)parse({"infernix-serve", "model.ninfer", "--cpu-rates", "sometimes"});
+        } catch (const std::invalid_argument&) { rejected = true; }
+        failures += check(rejected, "--cpu-rates accepted a value other than saved or measure");
+    }
     failures += check(parse({"infernix-serve", "model.ninfer", "--expert-a4-activations"}).expert_a4_activations &&
                           !parse({"infernix-serve", "model.ninfer"}).expert_a4_activations,
                       "--expert-a4-activations did not parse (default off)");

@@ -3,7 +3,11 @@
 #include "core/device.h"
 
 #include <atomic>
+#include <chrono>
 #include <cuda_runtime.h>
+#include <exception>
+#include <thread>
+#include <utility>
 
 namespace infernix::ops {
 namespace {
@@ -33,6 +37,46 @@ void load_kernel_images() {
 
 std::uint64_t kernel_images_pending_bytes() noexcept {
     return g_loaded.load(std::memory_order_relaxed) ? 0 : kImageBytes;
+}
+
+struct KernelImagesLoad::State {
+    std::thread thread;
+    std::exception_ptr error;
+    double seconds = 0.0;
+};
+
+KernelImagesLoad::KernelImagesLoad(int device) {
+    if (g_loaded.load(std::memory_order_relaxed)) { return; }
+    state_       = new State;
+    State* state = state_;
+    try {
+        state->thread = std::thread([state, device] {
+            try {
+                const auto begin = std::chrono::steady_clock::now();
+                CUDA_CHECK(cudaSetDevice(device)); // the device's primary context, the start's own
+                load_kernel_images();
+                state->seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count();
+            } catch (...) {
+                state->error = std::current_exception();
+            }
+        });
+    } catch (...) {
+        delete state_;
+        state_ = nullptr; // no thread: the first kernel launch reads the images, as before kernel_images
+    }
+}
+
+KernelImagesLoad::~KernelImagesLoad() {
+    if (state_ == nullptr) { return; }
+    if (state_->thread.joinable()) { state_->thread.join(); }
+    delete state_;
+}
+
+double KernelImagesLoad::finish() {
+    if (state_ == nullptr) { return 0.0; }
+    if (state_->thread.joinable()) { state_->thread.join(); }
+    if (state_->error) { std::rethrow_exception(std::exchange(state_->error, nullptr)); }
+    return state_->seconds;
 }
 
 } // namespace infernix::ops

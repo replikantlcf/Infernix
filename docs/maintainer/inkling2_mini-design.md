@@ -564,7 +564,7 @@ throughout, and the rule is explicit implementations per supported architecture.
 | Store | Content | Per token | Notes |
 |---|---|---:|---|
 | Main Text (paged, P = 64) | global KV of the 8 full-attention visits | INT8-G64 16.5 KiB; BF16 32 KiB | visit-indexed layers 0-7 = (5), (11, p1..p3), (17, p1..p3), (23) |
-| Draft Full (paged) | DSpark layer 1 context K/V | BF16 4 KiB | only with `--spec dspark`; BF16 as vLLM's SM12x draft KV |
+| Draft Full (paged) | DSpark layer 1 context K/V | INT8-G64 2.06 KiB; BF16 4 KiB with BF16 pools | only with `--spec dspark` (INT8 since 2026-11-26, §13.6) |
 | StateImage | rings and seeds below | fixed per lane | [§7.2](#72-stateimage) |
 
 ### 7.2 StateImage
@@ -604,7 +604,8 @@ form Qwen3.8-Flash-Next's binding takes:
 
 - **Pages.** The full visits' pools are one core `DeviceKVPagePool` of page-major planes (`[pages][8][64][row]`: a
   page is one contiguous run in each plane, so Host records copy whole pages), the lanes' block-table rows a
-  `KVExecutionTablePool`. With DSpark the pool has two more planes, the drafter's full layer's K and V (BF16), read
+  `KVExecutionTablePool`. With DSpark the pool has the drafter's full layer's K and V too: two BF16 planes with BF16
+  pools, four with every other format (INT8-G64 codes and side records, `ops::inkling2::DSparkInt8Cache`), read
   and written through the same rows, so a cached page carries the drafter's context with the model's. The lanes share
   the pool (`--kv-capacity`, at least one `--max-context`): a binding reserves its first unit (a resume: through its
   paused frontier and one round), `reserve_units` each later one (a prompt chunk, a decode round with a DSpark round's
@@ -635,7 +636,43 @@ form Qwen3.8-Flash-Next's binding takes:
   instead; the lossless route's model (about 0.27 s a call, 3.1 ms a token and 0.89 us a query-key pair) prefers the
   read at any length.
 - **Queue holds** (spec §9.6): the snapshot each queued request would resume from, a paused one's over its ledger.
-- **Not built yet**: next-turn prefill, tool-call holds and prefetching for waiting requests.
+- **In-flight coalescing** (spec §12.2, as the Qwen families coalesce; `await_sibling`, 2026-11-26): a fresh request that
+  shares more with a lane still prefilling its prompt than the cache serves now waits (no sources; the Engine quotes
+  it again at each of the sibling's prefill boundaries) for that lane's snapshot at their divergence: the block
+  boundary below it, added to the sibling's taps as an exact boundary tap, or a planned exact tap near it. It waits
+  only when the prefill it saves exceeds the split it adds and twice the sibling's predicted prefill to it is within
+  half the queue timeout. **Matched-end taps**: a lane bound below the end of its matched cached blocks (another
+  prompt shared them and diverged there, with no state to resume at that end) snapshots that end as a boundary, so the
+  next prompt diverging there resumes there. A split's price is the call it adds, whose narrow remainder walks every
+  key before it on the prompt kernel's few CTAs (§9.3): ~10 ms and 1.0 us a key before it (a 1-column call after
+  122,000 positions: 134.9 ms, 2026-11-26; a 56-token tail there 160 ms served), not the cost model's 30 ms. The cost
+  model also counts attention now: 1.0 ns a (query, key) pair (from the owner's configuration's INT8 prefill rates with
+  §9.3's far-unit skip: a cold 122,215-token prompt at 8,905 tokens a second, 7,544 tokens after 114,688 at 5,475),
+  which reprices source choice and snapshot eviction for every KV format from an INT8 fit. Resumed requests keep their
+  cold bits (the prefix cache test's case 13: sequential and concurrent questions over one document, the followers
+  and the third question resuming at the divergence). Measured (2026-11-26, RTX 5090, the owner's configuration,
+  seeded, two servers an arm): four questions at once on a cached 122K-token document with no state at its end (each
+  re-prefilling from a snapshot 7.5K tokens back) 1.2-7.1 s to their first tokens (mean 4.19 s, the same build
+  without either change) against 1.4-2.0 s (mean 1.70 s, coalesced, another run of the build with both); two questions
+  one after the other there 1,252 / 1,244 → 1,414 / 187 ms (the first pays the matched-end tap's split, ~160 ms, the
+  second resumes at it); four at once after them (both arms after the same two) 1,244-7,144 → 185-745 ms (mean 4,186 →
+  460 ms), the four's wall 13.1 → 7.0 s; a cold prompt unchanged.
+- **Next-turn prefill** (hybrid-prefix-cache-spec §7.9, built 2026-11-26): the frontend renders a finished turn's
+  history as the next request will (a probe message after the reply, the prompt cut after its opener token, so the
+  reply's block must end with `<|content_model_end_sampling|>`), and the Engine's idle pass prefills it as a
+  background request, which reuses and publishes like any other: the planner's prompt-tail tap is the history's end,
+  where the next request resumes. The pass computes on the prompt route, so a turn resumed from it equals an uncached
+  run (`infernix_inkling2_prefix_cache_real_test`'s case 14 on the default, DSpark and reproducible routes, with a
+  request arriving mid-pass admitted within a call). Measured (the owner's configuration, two servers an arm, three
+  conversations each on a cached ~122K-token document, ~0.7-1.2K-token replies): turn 2's first token 159 ms against
+  200-221 ms without the pass when it came 3 s after the reply, but 258-288 ms against 201-221 ms when it came 0.2 s
+  after (it waits for the running pass's unit, the whole reply, then resumes in a narrow call, ~125 ms at 122K). So
+  the quiet period defaults to 1 s here (Qwen3.5's 150 ms): a client answering within it never meets a pass; one
+  arriving in the next ~0.2 s (the reply's prefill at 122K) still does. Measured at 1 s (each phase its own
+  question): 0.2 s after the reply level with no pass (355 / 202 ms both), 1.1 s after it 194-213 against 196-213 ms
+  (+7.5 % at worst), 3 s after it 158-159 against 200-228 ms (−21 to −30 %). The gain reaches clients that send the
+  reply back as rendered (its reasoning included). Off by default on `--lossless`.
+- **Not built yet**: tool-call holds and prefetching for waiting requests.
 
 Sizes: an image is 190 MiB with BF16 windows, 107 MiB with INT8 windows (by default every profile but `bf16` and
 `bf16p`) and 158 MiB with `bf16p` windows, plus 9 MiB of drafter rings; restoring a BF16 one takes ~8 ms over the PCIe link,
@@ -884,7 +921,18 @@ the attention output; the cached K/V values are an observable boundary (the KV c
   separate prologue, hence the one-lane rule. The early pages: −0.43 % at one column at context 128 (2026-11-22).
 - **Shape (L15).** 512-thread CTAs; a unit's K and V pages copied to shared memory by cp.async (one stage; a 2-stage
   ring for multi-unit full splits is an M5 item); scores a thread per (row group, key) as 4 fold chains, the unit
-  softmax a warp per row, P×V a thread per (row group, 4 dims); accumulators in registers.
+  softmax a warp per row, P×V a thread per (row group, 4 dims); accumulators in registers. INT8 pools (and INT8
+  windows) take a staged instance (2026-11-26): a unit's codes and side records are copied by cp.async into a
+  16.5 KB code stage while the unit before it computes, then decoded from the stage into the tile, the same words in
+  the same order as the unstaged decode from global memory, which left a unit's load latency on the chain (one CTA an
+  SM, at the register limit: so a stage, not a register prefetch). Same bits (an 8-column decode call after 100,000
+  positions hashes the same either way; the op test's criteria unchanged). Measured (the forward test's captured
+  rounds, INT8 pools, RTX 5090): 4 lanes after 100,000 positions 17.78 → 15.25 ms at one column a lane, 29.14 → 26.63
+  at four, 41.71 → 39.47 at eight; one lane 7.79 → 7.05 (BF16 pools 7.32); one lane at 4K 5.02 → 4.98 and four at 2K
+  8.46 → 8.43 (not slower, so one instance serves every context, as the captured graphs need). Served (the owner's
+  configuration, DSpark auto, seeded, two servers an arm, two repetitions each): four requests on a ~122K-token prefix
+  230.5 → 246.4 tok/s (+6.9 %) and 276.9 → 300.7 (+8.6 %), every staged server ahead; one request there 165.5 →
+  177.8 and 176.6 (+7 %); four and one ~2K-token requests level (−0.3 to +0.6 %).
 - **Packing.** Per KV head, the 3 query heads × T columns form the rows (3T ≤ 48), so K/V tiles are read once per KV head.
 - **Splits.** Units are fixed absolute 64-key pages, so a query's arithmetic depends only on its own position and lane
   (sliding: one split per unit of its window, ≤ 17; full: 32 splits of ⌈units / 32⌉ units of the row's own key count,
@@ -907,6 +955,25 @@ bias tile is one [192 × 16] × [16 × 128] MMA into shared memory, gathered alo
 tiles outside the window; full visits skip the bias beyond distance 1024. P×V in FP16 on the exact route, as Qwen's
 prompt attention; longest-first CTA order and proportional shares as the BF16 prompt kernel. One prefill route at every
 width (a width threshold broke prefix restores on Flash-Next: L16).
+
+Built (`attention_prompt.cu`): a CTA per (64 columns, KV head) folds its rows' 64-key units in order, building each
+unit's relative-table slice and the warps' bias fold. A unit whose nearest key is a whole table past the CTA's first
+row (cdmin ≥ 1,024) builds no table and folds no bias, adding +0 as the fold of zeros would (2026-11-26; same bits: the
+forward test's prompt calls of 1, 64 and 4,096 columns after 122,000 positions hash the same with and without it).
+Measured (INT8 pools, RTX 5090): the 4,096-column call 903.8 → 700.2 ms (attention 717 → 513 ms), 64 columns 203.7 →
+153.4, one column 184.8 → 134.9. Served (the owner's configuration, two servers an arm): a cold 122,215-token prompt's
+first token 16.70 → 13.77 s (7,338 → 8,905 tokens a second), a question past a cached 114,688-token snapshot 1,807 →
+1,414 ms, a fully cached one 237 → 186 ms. A quantized pool's units are staged (2026-11-26): one key tile and two code
+planes in shared memory, the next unit's codes and side records copied by cp.async while this unit computes, then
+decoded from the plane into the tile (`decode_unit` over the staged codes: the same words), where the decode from
+global memory left a unit's load latency on the chain. Same bits (the prompt calls of 1 and 4,096 columns after
+122,000 positions hash as before); one column 134.9 → 125.2 ms, 4,096 columns 702 → 668 ms (INT8 pools; BF16 pools
+102 and 580 ms). The narrow calls stay slow: a call of one tile is 8 CTAs (the KV heads), each walking
+every key unit before it, ~0.9 us a key at 122K (attention 114.7 ms of the one-column call), so a resumed request's
+first token at long context waits ~125 ms for its last call, and units narrower than a wave of tiles lose prefill rate
+(§14.5). Splitting a row's keys into fixed absolute segments merged in order would keep calls width-invariant, but at a
+cost: wide calls would merge in place (a second accumulator set, past the kernel's registers) or write per-segment
+partials (0.4-1.5 GB of workspace at 240K for a 4,096-column call); not built.
 
 ### 9.4 Formats
 
@@ -1321,6 +1388,36 @@ softmax in registers, and a merge combines the ranges. Drafts only, as above; th
 configuration, §13.7) decoded 6.6 % faster than the deployed build of 2026-11-25 (243083c14, so the comparison also
 holds the later commits).
 
+Its splits on tensor cores (2026-11-26): scores as Sᵀ = K Qᵀ (m16n8k16 BF16 MMAs, a tile's 32 keys as M and the
+block's 24 query rows as three 8-row N tiles, so nothing is padded), the softmax as before, writing each p as two BF16
+terms (hi = bf16(p), lo = bf16(p − hi)), and P×V as Oᵀ = Vᵀ Pᵀ (warp w the dims 16w … 16w + 15, the hi terms' MMA and
+then the lo terms' per 16 keys); a partial tile's missing V rows are zeros, since their p are 0 and a stale row could
+hold a NaN. The op test's FP64 bound holds as before (worst 0.04-0.71) and a launch over blocks still equals the blocks'
+single launches bit for bit. Measured (RTX 5090, op bench, one row's 8 queries, against the FP32 folds): 2K keys 0.027
+→ 0.019-0.023 ms, 32K 0.132 → 0.098, 100K 0.367 → 0.255, 200K 0.735 → 0.491 (1.67 TB/s of keys and values, about the
+reads' floor on this card). Served (the owner's configuration, seeded, two servers an arm, two repetitions): a
+four-row round's device draft at ~122K 2.78-3.02 → 2.15-2.39 ms and a one-row round's 1.20 → 1.00 ms; four requests on
+a ~122K-token prefix +2.8 % tok/s warm (+1.6 % on the first repetition), one there +0.7 to +1.0 %. At ~2K the draft
+fell only ~0.06 ms of a ~12.7 ms round; the arms' +2.0 to +3.1 % there follows their acceptance (the drafts' bits
+differ: 0.470-0.523 against 0.453-0.501 accepted a draft), so 2K is level within that spread. Both served arms ran a
+build that also held a tensor-core decode and verify attention kernel this engine does not have, so the served figures
+are that build's.
+
+Its full-layer context in INT8 (2026-11-26): with every target pool format but BF16 (bf16p included) the drafter's
+context K and V take the
+INT8-G64 codes and side records of the full visits (`DSparkInt8Cache`: written by `dspark_rotate`, decoded in
+`dspark_attention`'s stage), about 2.06 KiB a token where the two BF16 planes took 4, so the pool holds 10 % more
+tokens (the owner's configuration: 556,224 against 503,680 in the same 9.8 GiB). BF16 pools keep BF16 planes. Drafts
+only. The op test's INT8 writes equal a host encoder bit for bit, and the attention stays within its FP64 bound (worst
+0.79). One row's attention (op bench) is slower at short contexts and faster at long ones: 2K keys 0.0185 → 0.0210 ms,
+8K 0.0308 → 0.0323, 32K 0.0985 → 0.0754, 100K-200K 0.255-0.489 → 0.221-0.418 (about 2.5 µs a row a round at 2K).
+Served (the owner's configuration, seeded, three servers an arm interleaved, two repetitions, against
+a switch that kept the BF16 planes, since removed): tok/s level across the eight phases (mean +0.1 %; four
+level, two +0.6 / +1.4 % and two −1.2 / −1.4 % beyond the arms' spread, each where the arms' drafts differed: same
+accepted counts, a few more drafted), accepted 16,556 of 29,368 drafts against 16,502 of 29,154. A prefix-cache file
+saved by an earlier build, whose pages hold the BF16 planes, is not reused (its fingerprint carries the build's
+identity).
+
 A Q8 head (`--q8-weights`, `--a8-activations`) then runs the drafter's 7 rows on 8-bit inputs (`Forward::project_head`
 with the drafter's own 8-bit input rows: `projections_mma`'s tensor cores instead of the skinny route's FMA chains;
 the only Q8 route that takes the head's unaligned FP32 rows). Drafts only, as above. Measured (2026-11-23, Basalt's
@@ -1341,9 +1438,11 @@ Built 2026-11-25 (the owner's request after the dashboard showed no drafts at th
   36 columns against single-column decoding. The sampler draws each column 8 rows at a time (its route for the widths
   plain rounds and a one-row round use). So a round of several rows commits each request's plain tokens on every route
   that drafts, the reproducible one included.
-- **Shape.** Every row's block is drafted at once (`Drafter::draft(steps, stream, rows)`: row 0 on the round's
-  stream, the others on streams of their own forked from it and joined back inside the draft's graph, each row with
-  a workspace, round words and draft slot of its own), then one verify call takes n (K + 1) columns: each row's
+- **Shape.** Every row's block is drafted in one chain (`Drafter::draft(steps, stream, rows)`, 2026-11-26): the
+  projections, norms and SwiGLU over all the blocks' rows at once on the decode projection route (16-column launches,
+  so each matrix is read once a 16 rows rather than once a row, and a row's drafts are its single-row drafts bit for
+  bit), the rotations, attention and Markov steps one launch over the blocks (each its own round words, lane, rows,
+  scratch and draft slot), the target head once over the blocks' final rows. Then one verify call takes n (K + 1) columns: each row's
   pending input and its share of the n × K drafts, the rows in lane order. Its graph is keyed by (rows, K), not by
   the shares: the forward alone (no launch names a lane: each lane's columns stay one attention group below the conv
   ring's and window's wide paths) with attention sized for a row's widest group (`CallPlan::group_width`, 8), so any
@@ -1364,8 +1463,13 @@ Built 2026-11-25 (the owner's request after the dashboard showed no drafts at th
   2 past what it verified, as a one-row round's. (Keyed by row count alone, costs measured at 100K steered 2K rounds,
   which kept drafting at 18 % acceptance and ran 17 % slower than plain, 2026-11-26.) A row count whose drafted
   rounds commit fewer tokens per host millisecond than its plain rounds decodes plainly, drafting again every 16
-  rounds; a plain round every 64 drafted rounds keeps the plain rate measured. A fixed `--draft-tokens N` verifies N
-  of each row every round.
+  rounds; a plain round every 64 drafted rounds keeps the plain rate measured. Both rates are the mean of a bucket's
+  first 10 samples, then the EWMA (2026-11-26): an EWMA seeded at full weight by a cold bucket's first round that
+  started low recovered by a tenth a probe, one probe in 16 rounds. Measured (five servers an arm, four ~2K-token
+  requests on each server's cold bucket): the rounds of several rows the rates left plain, the most any of a server's
+  four requests saw, 52-146 (mean 107) → 14-91 (mean 56); 491.3 → 501.4 tok/s (+2.1 %, the ranges overlapping, so
+  not established). A fixed `--draft-tokens N` verifies N of
+  each row every round.
 - **Eligibility.** Every row as a one-row round requires (its one pending input, F ≥ 1, no penalties, no token
   constraint), with a whole block of context left; a grammar row's columns sample under its own masks and a reasoning
   ban ends its row at the first close it draws. Otherwise, and without CUDA graphs, the round decodes plainly.
@@ -1379,7 +1483,15 @@ Built 2026-11-25 (the owner's request after the dashboard showed no drafts at th
 - **Measured, the rows at once and their shares** (2026-11-26, the same configuration and workloads, seeded so every
   arm samples the same text; §13.5's attention kernel in both arms). The rows' drafts on streams of their own against
   one after another: a four-row round's draft 2.7 → 2.0 ms at 100K, 141.2 / 142.4 against 139.3 / 138.6 tok/s (+2.1 %,
-  the worst pair +1.4 %), and 481.1 / 479.4 against 468.6 / 472.4 at 2K (+2.1 %, the worst pair +1.5 %). Shares dealt
+  the worst pair +1.4 %), and 481.1 / 479.4 against 468.6 / 472.4 at 2K (+2.1 %, the worst pair +1.5 %). One chain
+  over the rows against those streams (2026-11-26, two repetitions): a four-row round's device draft 1.54-1.59 →
+  1.04-1.13 ms at ~2K and 3.07-3.38 → 2.62-2.95 ms at ~122K; four ~2K-token requests +2.7 % tok/s warm (+1.4 % on the
+  first repetition), four on a ~122K-token prefix +0.4 % (ranges overlapping) and +1.4 %; at a fixed 3 drafts both
+  accept the same counts in the same rounds (both arms on a build that also held a tensor-core decode and verify
+  attention kernel this engine does not have). The chain's first form ran the wide projections on projections_mma, whose
+  unsplit K launches too few CTAs at 24-32 columns: 2.12-2.19 ms at 2K, −2.0 to −6.7 % tok/s. At 122K about 1.6 ms of
+  the four-row draft is each lane's own full-layer attention (gate: the attention skipped, 3.07-3.30 → 1.49-1.56 ms),
+  which no batching shares. Shares dealt
   by expected tokens against K each (3 servers an arm, 4 repetitions each, seeds shifted per repetition): at 100K the
   first repetition 155.6-157.6 against 150.0-151.2 tok/s (+3.9 %, the worst pair +2.9 %), the later ones (the whole
   prompt cached) +6.9 %, every server ahead of every K-each server at the same repetition; at 2K the later repetitions
@@ -1396,7 +1508,7 @@ Built 2026-11-25 (the owner's request after the dashboard showed no drafts at th
   Each request's tokens are its plain decoding's under natural shares and under a test seam's skewed ones (rows
   verifying none and all of their drafts, grammar rows among them; the Engine and constrained tests).
 - **Not yet:** the drafter's kernels run once a row (its layers' weights read n times; the rows overlap on their
-  streams); one launch over every row's columns, and a warm-up of a cold bucket's rates, are the next steps. A row
+  streams); one launch over every row's columns is the next step. A row
   took every draft it had while it could have drafted more in ~20 % of four-row rounds at 100K (its next round drafts
   2 past those, so the cap follows a round later).
 
@@ -1512,6 +1624,47 @@ only its last R positions are written to the ring, and only the positions some r
 tap) are projected into the drafter's context rings (Infernix's DFlash2 ring rule: the drafter's share of a 64K first
 token fell 220 → 75 ms). A tap is a Device copy of the StateImage; the rings are whole at any frontier because R ≤ the
 chunk width.
+
+### 14.5 Prompt units beside decoding lanes (measured, not adopted)
+
+The Engine runs a decode round, then one prompt unit, so lanes that decode wait a whole unit each cycle: beside a cold
+122K-token prompt in units of 4,096, three decoding requests got 4.7-5.1 stream events a second (263 alone), stalling
+up to 0.69 s (2026-11-26, RTX 5090, the owner's configuration). Units bounded at 0.2 s of predicted time while another
+lane decodes (~3,500 tokens at the start, ~900 at 115K) gave them 11.1-11.5 events a second, stalling up to 0.27 s
+(fixed 1,024-token units: 14.2, 0.21 s), but the prompt's first token came 14.18 → 16.93-16.98 s (1,024: 17.4 s), and
+its prefill's own device time rose 13.6 % (8,900 → 7,685 tokens a second, the request records), ~2.2 s of the 2.75:
+the prefill ran slower in the smaller units, not just interleaved (likely, unverified: a unit of ~900 columns at 115K
+fills 120 of the prompt kernel's CTAs, under one wave on 170 SMs; §9.3's grid is the call's 64-column tiles × the KV
+heads). Slower overall for a fairer share, so not adopted (candidates PF-01); a prompt kernel that splits a row's keys
+(the narrow call's own fix) would remove the reason.
+
+### 14.6 Prompts that arrive together (prefill groups)
+
+Built 2026-11-26. The Engine gave one prompt unit a cycle, so prompts admitted together reached their first tokens one
+call apart: four ~30-token chats at once 29-30 / 53-70 / 85-114 / 127-153 ms (each call 28 ms), four ~56-token
+questions on a cached ~122K-token document 153-180 / 316-328 / 450-498 / 647-662 ms (each call 150 ms), where one
+alone took 29 and 151-176 ms (the owner's configuration, seeded). A narrow call's time is mostly its fixed part (each
+lane's keys, the weights), so the Engine's prefill groups (engine-architecture "Prefill order") now run a cycle's
+permit with every other lane whose whole remaining prompt is one unit of at most 64 tokens
+(`Program::kPrefillCompanionTokens`) that keeps the call within the prefill chunk, in one prompt call
+(`Program::advance_prefill_group`): each lane's columns in tiles of its own (`attention_prompt`'s tile table, at most
+160 tiles of 64; a call of one lane keeps its implicit tiles), the head over the completing lanes' last columns at once
+(`Forward::head_rows`), one sample and one pending batch. Every prompt-route Op computes a column from its own inputs,
+so a lane's bits are its unit alone's: the forward test's prompt lanes case (three lanes after 0, 300 and 2,100
+positions, 200, 37 and 1 columns, every pool format and the INT8 and bf16p windows) compares the final hidden rows,
+the last columns' logits and each lane's state bit for bit. Not on `--lossless` (its calls are one lane's).
+
+Measured (2026-11-26, RTX 5090, INT8 KV). The forward test's prompt lanes profile: a lane joins a narrow call for
+1.3-2.1 ms against its call alone's 33.6 ms at 2K and 142.6 ms at 122K (four lanes of 32 columns at 2K 37.5 ms against
+134.8 one after another, four of 56 at 122K 148.6 against 570.3). Served (the owner's configuration, seeded, two servers
+an arm, two repetitions, against the groups off): four questions on a cached ~122K-token document, one of them
+recomputing 7.5K tokens, first tokens 1,347-1,376 ms against 1,358-1,896 (mean 1,363-1,374 against 1,624-1,625; the
+narrow ones wait for their sibling's blocks and now take its last call); with the document cached 174-353 against
+155-678 ms (mean 303-305 against 415-416; the off arm's 155 ms first request reused a deeper snapshot); four ~2K chats
+30-77 against 29-153 ms (mean 44-63 against 82-90). Tokens a second over the four requests level to +7 %. One request
+alone: level (decode -0.5 % to +0.5 % across two runs, the second with three servers an arm interleaved; first
+tokens equal). At a fixed 3 drafts every request drafted and accepted the same counts in both arms, so the drafter's
+context rows are unchanged.
 
 ---
 

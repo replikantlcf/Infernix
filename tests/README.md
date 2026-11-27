@@ -346,7 +346,9 @@ expert frames a Vision window may be lent (the image request waits or is refused
 `pair-window-dflash2` and `pair-window-mtp` scenarios compare a chat turn whose opener tap is taken inside
 its last pass with the cut one (the testing seam `set_pair_windows`), then sweep device-memory faults over
 paired turns, and `pair-window-restore` pairs a turn while its resume is still restoring from the Host
-(hybrid spec §7.10).
+(hybrid spec §7.10). Its `decision-lanes` scenario holds both general lanes of three with generating requests: an
+ordinary request stays queued beside the free decision lane, a decision takes it and answers while the generations
+still hold theirs, and publishes no endpoint snapshot (an ordinary request of its shape does: the positive control).
 `infernix_qwen4_exp_memory_exhausted_real_test` and `infernix_qwen3_5_memory_exhausted_real_test` (the
 dense `INFERNIX_TEST_ARTIFACT`) make the N-th CUDA call of the Engine's work report no device memory, over a
 sweep of N from binding through prefill into decode (`tests/memory_exhausted_recovery.h`): the request in
@@ -506,6 +508,15 @@ the tokenizer files the golden was made from, not an artifact: `py -3.11 -I
 tests/models/qwen3_5/generate_tokenizer_golden.py <artifact> <golden.json> <dir>` writes them from any
 Qwen3.5-family artifact (and regenerates the golden), and `INFERNIX_TEST_TOKENIZER_DIR=<dir>` runs the
 test (skipped without it, and for a tokenizer.json of another size).
+`infernix_qwen3_5_video_golden_real_test` (CPU) sends video messages through the real Frontend (its FFmpeg decode,
+frame sampling, resize and chat template) and compares the whole prompt with the reference processor's ids: lossless
+FFV1 videos of 2, 3 and 9 frames and 8 frames sampled to 4 (`tests/fixtures/qwen3_5/video_golden.json`). The
+reference is Qwen3VLProcessor as transformers up to 5.9 expands the template's video wrapper (the Qwen3.5-family
+checkpoints' versions; 5.10 and later keep the template's outer `<|vision_start|>`/`<|vision_end|>`, which the golden
+stores as `ids_token_only` for the record). `python -I -B tests/models/qwen3_5/generate_video_golden.py <artifact>
+<golden.json> <dir>` regenerates it with transformers 5.10 or later, torchvision and the ffmpeg command line, and
+writes the resource directory; `INFERNIX_TEST_VIDEO_RESOURCES_DIR=<dir>` runs the test (skipped without it, and for
+a tokenizer.json of another size).
 `infernix_inkling2_tokenizer_golden_real_test` does the same for Inkling 2's pipeline (no normalizer, the
 o200k-style split with case classes, `ignore_merges`): `py -3.11 -I tests/models/inkling2/generate_tokenizer_golden.py
 <checkpoint or artifact> <golden.json> <dir>` writes the fixture (`tests/fixtures/inkling2/tokenizer_golden.json`:
@@ -528,7 +539,9 @@ the prologue bit for bit its emulation, the output against FP64 over the represe
 pool again in every `--kv-dtype` form with its codes and side records bit for bit against a host encoder, bf16p equal
 to the bf16 storage of its words and a row with no packed form flagging its lane alone; the rotated vq2 / k4v2 pools
 against a host emulation of their Hadamard rotation and exhaustive pattern search, their rotated queries bit for bit and
-within FP64 of the rotation, attention against FP64 in the rotated domain). `infernix_w4a4_sparse_moe_test` also
+within FP64 of the rotation, attention against FP64 in the rotated domain) and the `inkling2_dspark` cases (the DSpark
+drafter's Ops against FP64 oracles, and a launch over several rounds' blocks giving each block's own launch bit for
+bit: rotate, attention, the Markov head). `infernix_w4a4_sparse_moe_test` also
 requires the one-column launch (`moe_single`) to give the separate kernels' routing and outputs byte for byte, eagerly
 and in graphs interleaving both paths.
 `infernix_inkling2_chat_template_test` (CPU only) renders `tools/chat_templates/inkling2.jinja` (the checkpoint's,
@@ -555,8 +568,12 @@ in groups) and checks a prompt that opens the answer (it ends with `<|message_mo
 reasoning, and its session publishes the first token as content).
 `infernix_inkling2_forward_real_test` (GPU) runs the forward on `INFERNIX_INKLING2_ARTIFACT` against a CPU reference's
 per-visit dump (`INFERNIX_INKLING2_REFERENCE`, a path prefix of `.bin`/`.json`): teacher-forced stages within 2^-5 of
-their row maximum, the greedy continuation's argmax, decode = verify bit for bit; its header says what it reports
-rather than judges and why. `INFERNIX_INKLING2_PACK` loads with the bf16_p12 packing (its bits must not change:
+their row maximum, the greedy continuation's argmax, decode = verify bit for bit; three lanes' prompt units in one
+prompt call (200, 37 and 1 columns, then 56, 30 and 1, after 0, 300 and 2,100 positions) equal to each lane's call alone
+in final hidden rows, last-column logits and state, bit for bit under every pool format and the INT8 and bf16p windows
+(the Engine's prefill groups); its header says what it reports rather than judges and why.
+`INFERNIX_INKLING2_PROMPT_LANES_PROFILE=n` (with `INFERNIX_INKLING2_PROMPT_WIDTH`, `INFERNIX_INKLING2_CONTEXT`) times
+one prompt call of n lanes against each lane's call alone. `INFERNIX_INKLING2_PACK` loads with the bf16_p12 packing (its bits must not change:
 `INFERNIX_INKLING2_LOGITS_GUARD` compares them); `INFERNIX_INKLING2_Q8` loads with `--q8-weights`' conversion (other
 bits, so the reference criteria do not apply: for its timing, its invariance checks and a census of its FP16 group
 scales). `infernix_inkling2_projections_test` (GPU) requires the fused
@@ -567,7 +584,9 @@ column equal to the same column projected alone.
 `infernix_qwen4_exp_forward_real_test --pack-bf16` loads Flash-Next packed as the Engine does.
 `infernix_inkling2_engine_real_test` (GPU, the same variables) runs Inkling 2 through the public Engine against an eager
 one-request Engine prefilling 16 columns a call: the golden prompt's greedy continuation, CUDA graphs, four sampled
-requests at C = 2, 4 and 8, prefill chunks of 7, and a CausalScoring Engine's logits equal to the forward test's
+requests at C = 2, 4 and 8, prefill chunks of 7, three prompts queued behind a 900-token prompt at the default chunk
+(prefill groups: their solo tokens, and at least one prefilled in another lane's prompt call; again under DSpark with
+the parsed reply's reasoning ban among them), and a CausalScoring Engine's logits equal to the forward test's
 prompt route (`INFERNIX_INKLING2_PROMPT_LOGITS_GUARD`, which the forward test's `INFERNIX_INKLING2_PROMPT_LOGITS_OUT`
 writes; without it that one check is skipped and says so) byte for byte; on a 2,300-token prompt at context 4,096, wide prefill (chunks of 100,
 128, 1,000 and 4,096, one beside a decoding request) gives the greedy continuation and the scoring logits of chunks of
@@ -605,7 +624,15 @@ beside a reply; two 12,000-token prompts with 6,000-token replies in a 32,768-to
 be preemptions, and each request's tokens must equal its tokens alone in an Engine whose pool holds every lane. It
 reports the snapshot restores, replays, replayed tokens and time paused, and checks that the owner's launcher configuration of
 2026-11-25 (240,000 tokens, four lanes, INT8 KV, vision offloaded, the embedding on the host, DSpark with
-`--lm-head-draft`) plans, starts and serves a request (`INFERNIX_INKLING2_NO_OWNER_CONFIG` skips that).
+`--lm-head-draft`) plans, starts and serves a request (`INFERNIX_INKLING2_NO_OWNER_CONFIG` skips that). Its first case
+cancels two requests once one is paused and serves a third: the Program must keep no capture result once idle (neither
+the cancelled pause's nor a released lane's last capture landing after its release; `INFERNIX_INKLING2_ONLY_CANCEL_CASE`
+runs that case alone).
+`infernix_inkling2_prefix_cache_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`; its cases listed in its header) resumes
+requests from the prefix cache and requires a cold run's bits; case 14, the idle next-turn prefill on the default,
+DSpark and reproducible routes, requires the next turn to resume at the history's end with an uncached run's tokens and
+a request arriving mid-pass to be admitted within about one call (`INFERNIX_INKLING2_PREFIX_NEXT_TURN_ONLY` runs it
+alone, as `INFERNIX_INKLING2_PREFIX_SSD_ONLY` and `INFERNIX_INKLING2_PREFIX_RAM_ONLY` run theirs).
 `infernix_inkling2_withdraw_real_test` (GPU, `INFERNIX_INKLING2_ARTIFACT`) reports a row as non-finite through
 `runtime::testing::set_nonfinite_fault`, as the other families' withdrawal tests do: a failed prompt's entries leave the
 prefix cache (its retry resumes from nothing and equals a cache-off run, which also reports its

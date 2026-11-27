@@ -533,13 +533,14 @@ void test_option_support() {
     row("--q8-weights", false, false, false, false, true);
     row("--kv-window-dtype", false, false, false, false, true);
     row("--expert-state", false, false, true, true, false);
+    row("--cpu-rates", false, false, false, true, false);
     row("--expert-tail-skip", false, false, true, true, false);
     row("--embedding-host", true, true, false, false, true);
     row("--rope-yarn-factor", true, true, true, true, false);
     row("--logits-dtype", true, true, true, true, false);
     row("--cache-host-state", true, true, true, false, false);
     row("--device-snapshot-slots", true, true, true, false, false);
-    row("--cache-next-turn-ms", true, true, true, true, false);
+    row("--cache-next-turn-ms", true, true, true, true, true);
     row("--draft-model", false, false, false, true, false);
     row("--draft-tree-nodes", true, true, true, false, false);
     row("--ngram-draft-tokens", true, true, true, true, false);

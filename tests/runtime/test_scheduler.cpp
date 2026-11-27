@@ -50,8 +50,11 @@ struct Request {
 
     [[nodiscard]] bool is_model_finished() const { return phase == Phase::Finished; }
 
+    [[nodiscard]] bool is_decision() const { return decision; }
+
     std::uint64_t id                 = 0;
     std::uint32_t remaining          = 0; // prompt tokens still to prefill
+    bool decision                    = false;
     std::uint32_t admission_bypasses = 0;
     Phase phase                      = Phase::Waiting;
     bool recovery_pending            = false;
@@ -73,6 +76,12 @@ RequestPtr request(std::uint64_t id, Request::Phase phase = Request::Phase::Wait
     value->id       = id;
     value->phase    = phase;
     value->sequence = id;
+    return value;
+}
+
+RequestPtr decision(std::uint64_t id, Request::Phase phase = Request::Phase::Waiting) {
+    auto value      = request(id, phase);
+    value->decision = true;
     return value;
 }
 
@@ -513,6 +522,177 @@ void test_decode_and_control_membership() {
             "compact control membership changed committed control spans or request order");
 }
 
+void test_decisions_queue_first() {
+    std::deque<RequestPtr> fresh;
+    for (const auto& item : {request(1), decision(2), request(3), decision(4)}) {
+        Scheduler::enqueue(fresh, item, 2);
+    }
+    const auto ids = [&] {
+        std::vector<std::uint64_t> order;
+        for (const auto& item : fresh) { order.push_back(item->id); }
+        return order;
+    };
+    require(ids() == std::vector<std::uint64_t>({2, 4, 1, 3}),
+            "decisions were not queued ahead of other requests in arrival order");
+    // Each request a decision passed was charged one bypass of its FIFO allowance.
+    require(fresh[2]->admission_bypasses == 2 && fresh[3]->admission_bypasses == 1,
+            "passing a waiting request did not charge its bypass allowance");
+
+    // Admitting the decision at the head charges nobody again.
+    Scheduler scheduler;
+    scheduler.begin_admission_scan();
+    const auto candidates = scheduler.fresh_candidates(fresh, 2);
+    require(!candidates.empty() && candidates.front()->id == 2,
+            "the queued decision was not the first admission candidate");
+    scheduler.admitted(fresh, *fresh.front(), 2);
+    require(fresh[2]->admission_bypasses == 2 && fresh[3]->admission_bypasses == 1,
+            "admitting a queued decision counted as a FIFO bypass");
+}
+
+void test_decisions_keep_the_fifo_bound() {
+    // A stream of decisions passes a waiting request at most `concurrency` times: later ones queue
+    // behind it, in arrival order.
+    std::deque<RequestPtr> fresh;
+    Scheduler::enqueue(fresh, request(1), 2);
+    for (std::uint64_t id = 2; id <= 6; ++id) { Scheduler::enqueue(fresh, decision(id), 2); }
+    std::vector<std::uint64_t> order;
+    for (const auto& item : fresh) { order.push_back(item->id); }
+    require(order == std::vector<std::uint64_t>({2, 3, 1, 4, 5, 6}),
+            "a stream of decisions passed a waiting request beyond its FIFO allowance");
+
+    // A request that arrives after the stream is passed only by the decisions after it.
+    Scheduler::enqueue(fresh, request(7), 2);
+    Scheduler::enqueue(fresh, decision(8), 2);
+    require(fresh[5]->id == 6 && fresh[6]->id == 8 && fresh[7]->id == 7,
+            "a decision did not queue after the decisions ahead of it");
+
+    // The admission scan stops at the request whose allowance is spent: no decision behind it is a
+    // candidate, so the exhausted request is admitted before them.
+    Scheduler scheduler;
+    scheduler.begin_admission_scan();
+    fresh.pop_front();
+    fresh.pop_front();
+    const auto candidates = scheduler.fresh_candidates(fresh, 2);
+    require(candidates.size() == 1 && candidates.front()->id == 1,
+            "a decision was an admission candidate ahead of a request whose allowance was spent");
+}
+
+void test_decisions_keep_their_queue_order_in_the_scan() {
+    // Behind a head that cannot be admitted, the decisions are tried first and in queue order (their
+    // ids need not follow it), then the other requests in the rotation.
+    std::deque<RequestPtr> fresh{request(1), decision(5), decision(3), request(2), request(4)};
+    Scheduler scheduler;
+    scheduler.begin_admission_scan();
+    const auto candidates = scheduler.fresh_candidates(fresh, 4);
+    std::vector<std::uint64_t> order;
+    for (const auto& item : candidates) { order.push_back(item->id); }
+    require(order == std::vector<std::uint64_t>({1, 5, 3, 2, 4}),
+            "the admission scan did not try the decisions in queue order ahead of the others");
+}
+
+void test_decision_lanes() {
+    std::array<bool, 4> taken{};
+    const auto is_free = [&](std::uint32_t lane) { return !taken[lane]; };
+    // Four lanes, the last one reserved: a decision takes it first, others never do.
+    require(Scheduler::free_lane(4, 1, true, is_free) == 3u,
+            "a decision did not take the reserved lane first");
+    require(Scheduler::free_lane(4, 1, false, is_free) == 0u,
+            "an ordinary request did not take the first general lane");
+    taken = {true, true, true, false};
+    require(!Scheduler::free_lane(4, 1, false, is_free),
+            "an ordinary request took the decision lane");
+    require(Scheduler::free_lane(4, 1, true, is_free) == 3u,
+            "a decision could not take its free lane while the general lanes were busy");
+    taken = {true, false, true, true};
+    require(Scheduler::free_lane(4, 1, true, is_free) == 1u,
+            "a decision did not fall back to a general lane when the decision lane was busy");
+    taken = {false, false, false, false};
+    require(Scheduler::free_lane(4, 0, false, is_free) == 0u &&
+                Scheduler::free_lane(4, 0, true, is_free) == 0u,
+            "without decision lanes, lane choice changed");
+}
+
+void test_decision_prefill_turn() {
+    Scheduler scheduler;
+    Slots slots{};
+    slots[0]            = request(1, Request::Phase::Prefill);
+    slots[1]            = request(2, Request::Phase::Prefill);
+    slots[0]->remaining = slots[1]->remaining = 1000;
+    slots[2]            = decision(5, Request::Phase::Prefill);
+    slots[3]            = decision(4, Request::Phase::Replay);
+    require(scheduler.next_prefill(slots, 4) == 3u,
+            "the oldest prefilling or replaying decision did not take the next prefill turn");
+    scheduler.prefill_executed(3, 4, slots, 16, true);
+    slots[3]->phase = Request::Phase::Finished;
+    require(scheduler.next_prefill(slots, 4) == 2u, "the second decision lost its turn");
+    scheduler.prefill_executed(2, 4, slots, 16, true);
+    slots[2]->phase = Request::Phase::Finished;
+    // Decisions took their turns out of order: the rotation resumes where it was (equal prompts, so
+    // the aged keys tie and the rotation decides).
+    for (const std::uint32_t expected : {0U, 1U, 0U}) {
+        const auto lane = scheduler.next_prefill(slots, 4);
+        require(lane == expected, "decision turns disturbed the prefill rotation");
+        scheduler.prefill_executed(*lane, 4, slots, 16);
+    }
+}
+
+void test_decisions_keep_the_prefill_bound() {
+    // A stream of prefilling decisions keeps the turn only until a waiting request's aged key falls
+    // below zero (others prefilled more than twice its remaining prompt): then the aged order serves it.
+    Scheduler scheduler;
+    Slots slots{};
+    slots[0]            = request(1, Request::Phase::Prefill);
+    slots[0]->remaining = 40;
+    std::uint64_t next  = 100;
+    std::uint32_t units = 0;
+    for (;;) {
+        if (!slots[1]) {
+            slots[1]            = decision(next++, Request::Phase::Prefill);
+            slots[1]->remaining = 16;
+        }
+        const auto lane = scheduler.next_prefill(slots, 2);
+        require(lane.has_value(), "no prefill unit was scheduled");
+        if (*lane == 0) { break; }
+        scheduler.prefill_executed(1, 2, slots, 16, true);
+        slots[1].reset();
+        require(++units <= 6, "a stream of decisions held the prefill turn past the ageing bound");
+    }
+    require(units == 6, "a waiting request took the turn from a decision before its bound");
+
+    // A Replay that has waited at all is overdue too.
+    Scheduler replay_scheduler;
+    slots[0]            = request(2, Request::Phase::Replay);
+    slots[1]            = decision(next++, Request::Phase::Prefill);
+    slots[1]->remaining = 16;
+    require(replay_scheduler.next_prefill(slots, 2) == 1u, "a fresh Replay outranked a decision");
+    replay_scheduler.prefill_executed(1, 2, slots, 16, true);
+    require(replay_scheduler.next_prefill(slots, 2) == 0u,
+            "a Replay that waited was not served before the next decision unit");
+}
+
+void test_decision_is_last_victim() {
+    Scheduler scheduler;
+    Slots slots{};
+    auto a = slots[0] = request(10, Request::Phase::Decode);
+    auto b = slots[1] = request(20, Request::Phase::Decode);
+    auto c = slots[2] = decision(30, Request::Phase::Prefill);
+    auto d = slots[3] = decision(40, Request::Phase::Prefill);
+    for (const auto& value : {a, b, c, d}) { admit(scheduler, value); }
+    // a owns the turn: the younger decisions stay while an ordinary resident can be paused.
+    scheduler.require_progress(a->id);
+    require(scheduler.preemption_victim(slots, 4) == 1u,
+            "a younger decision was preempted while an ordinary resident could be");
+    const std::array excluded{1U};
+    require(scheduler.preemption_victim(slots, 4, excluded) == 3u,
+            "the youngest decision was not the victim with no other candidate");
+    slots[1].reset();
+    require(scheduler.preemption_victim(slots, 4) == 3u,
+            "a decision was never a victim, even with no other candidate");
+    slots[3].reset();
+    slots[2].reset();
+    require(!scheduler.preemption_victim(slots, 4), "the turn's owner was preempted");
+}
+
 } // namespace
 
 int main() {
@@ -527,6 +707,13 @@ int main() {
         test_blocked_owner_leaves_the_prefill_permit();
         test_finished_resident_is_a_pending_release();
         test_decode_and_control_membership();
+        test_decisions_queue_first();
+        test_decisions_keep_the_fifo_bound();
+        test_decisions_keep_their_queue_order_in_the_scan();
+        test_decision_lanes();
+        test_decision_prefill_turn();
+        test_decisions_keep_the_prefill_bound();
+        test_decision_is_last_victim();
         std::cout << "ok\n";
         return 0;
     } catch (const std::exception& error) {

@@ -42,6 +42,7 @@ RULES: dict[str, Rule] = {
     # MODEL & CONTEXT
     "--max-context": Rule(OWNED, "the tool runs 16384 (raise it for eval/chat with --context)"),
     "--max-concurrency": Rule(OWNED, "the tool runs one sequence"),
+    "--decision-lanes": Rule(DROP, "lanes for /v1/decide questions: " + _TRAFFIC),
     "--prefill-chunk": Rule(CARRY, _MEMORY),
     "--use-original-int8-prefill-kernel": Rule(CARRY, _NUMERICS),
     "--use-original-nvfp4-prefill-kernel": Rule(CARRY, _NUMERICS),
@@ -85,6 +86,7 @@ RULES: dict[str, Rule] = {
     "--expert-ram-layout": Rule(CARRY, _MEMORY),
     "--expert-pin-mib": Rule(CARRY, _MEMORY),
     "--expert-csf": Rule(CARRY, _MEMORY),
+    "--cpu-rates": Rule(CARRY, "where the CPU expert team's rates come from: placement only, never the output"),
     # KV CACHE
     "--kv-capacity": Rule(OWNED, "sized by the engine from the tool's context and concurrency"),
     "--vram-headroom-mib": Rule(CARRY, _MEMORY),

@@ -35,6 +35,7 @@ constexpr std::array kRules = {
     Rule{"--expert-csf", kOffload},
     Rule{"--expert-pin-mib", kOffload},
     Rule{"--expert-state", kOffload},
+    Rule{"--cpu-rates", kFlash},             // only Flash-Next's start reads the stored rates
     Rule{"--expert-stripe", kOffload},
     Rule{"--expert-tail-skip", kOffload},   // refused without offloaded experts
     Rule{"--route-trace", kOffload},
@@ -55,7 +56,6 @@ constexpr std::array kRules = {
     Rule{"--cache-host-state", kQwen35},    // Flash-Next and Inkling refuse everything but fp32
     Rule{"--device-snapshot-slots", kQwen35}, // refused by Flash-Next and Inkling
     Rule{"--cache-tool-hold-secs", kQwen35},  // refused by Flash-Next and Inkling
-    Rule{"--cache-next-turn-ms", kQwen},    // refused by Inkling
     Rule{"--context-cost-presets", kQwen},  // Inkling's prefix cache has no cost model
     // Speculative decoding.
     Rule{"--draft-model", kFlash},

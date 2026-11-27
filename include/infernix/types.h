@@ -778,6 +778,11 @@ struct EngineOptions {
     // does the same by default at rank 7 (STRATA_ROUTE_TAIL_SKIP=7).
     std::uint32_t expert_tail_skip = 0;
     std::uint32_t max_concurrency      = 1;
+    // Decision lanes: the last `decision_lanes` of the max_concurrency lanes admit only decision
+    // requests (ExecutionOptions::decision), so a decision never waits for a generating request to
+    // finish. Less than max_concurrency; 0 reserves none. Decisions are queued first and get the
+    // next prefill turn whether or not lanes are reserved (resource-scheduling §5.4).
+    std::uint32_t decision_lanes       = 0;
     std::uint32_t max_pending_requests = 16;
     std::uint32_t pending_timeout_ms   = 30000;
     // Prompt tokens per prefill call, a multiple of 128; 0 takes the model's default: 16,384 for
@@ -905,6 +910,11 @@ struct EngineOptions {
     // more than that plus 1 GiB has stayed available for 10 s (runtime::expert_offload::RamMonitor). Off: every tier
     // keeps its startup size.
     bool ram_resize = true;
+    // Offloaded experts (--cpu-rates saved|measure): the CPU expert team's rates come from the saved quiet settle of
+    // this machine and configuration beside the expert state (<expert state>.cpu-rates) when it exists, with no
+    // readings at startup (true, the default); false takes the readings at every start, confirmed against the saved
+    // ones (each waits up to 20 s for a quiet CPU).
+    bool cpu_rates_saved = true;
     // Qwen3.8-Flash-Next (--expert-ram-mib): at most this much Host RAM for the routed experts.
     // Less than every expert needs selects the SSD tier: the experts not in RAM are read from the
     // artifact when used. Empty: what the RAM ledger leaves after the reserve and every other pin.
@@ -1089,6 +1099,11 @@ struct ExecutionOptions {
     std::vector<TokenId> readout_tokens;
     // Restricts each output token to its step's permitted set. Empty constrains nothing.
     TokenConstraint constraint;
+    // A short decision (one /v1/decide question): queued ahead of other waiting requests, may take
+    // a decision lane (EngineOptions::decision_lanes), takes the next prefill turn, is paused under
+    // resource pressure only when no other request can be and, on the Qwen3.5 family, publishes no
+    // endpoint snapshot into the prefix cache (its prompt blocks and taps are published as usual).
+    bool decision = false;
 };
 
 struct OutputOptions {
@@ -1183,6 +1198,9 @@ struct OwnedMedia {
     std::string media_type;
     std::string source_name;
     ImageResizePolicy image_resize_policy = ImageResizePolicy::Downsize;
+    // An image's longest side is scaled to at most this many pixels, aspect kept, before the model's
+    // own resize (OpenAI's detail 'low' = 512); 0 = the model's native geometry.
+    std::uint32_t image_max_long_side = 0;
 };
 
 struct ToolCall {
@@ -2384,6 +2402,9 @@ struct RuntimeHostWorkStats {
 
     std::uint64_t stats_publication_ns          = 0;
     std::uint64_t stats_publication_invocations = 0;
+    // Prefill units (of prefill_units) that ran in another lane's prompt call: a prefill group's companions
+    // (engine-architecture "Prefill order"; Inkling 2).
+    std::uint64_t prefill_shared_units = 0;
 };
 
 // Monotonic execution counters, boundary-consistent current gauges, and explicitly named last
@@ -2584,6 +2605,8 @@ struct RequestMonitorEntry {
     std::optional<std::uint32_t> lane;
     // The Engine's own idle-time prefill of a finished turn (no client).
     bool background = false;
+    // A decision (ExecutionOptions::decision).
+    bool decision = false;
     // It owns the current service turn (resource pressure), and a resumed request still protects
     // its recovery capacity.
     bool progress_owner   = false;
@@ -2604,6 +2627,14 @@ struct RequestMonitorEntry {
     // Since its last committed progress (prompt prefilled, history replayed, output committed);
     // none before any.
     std::optional<double> since_progress_seconds;
+    // From its first admission to its first output token (to now while it has none); none before admission.
+    // Its pauses and the other lanes' units in between included: the request's own prefill rate is
+    // computed_prompt_tokens over it.
+    std::optional<double> prefill_seconds;
+    // From its first output token to its latest; none before a second, or for a request that observes no wall
+    // timings (GenerationObservationOptions::phase_timings or live_timings; every server request does). Its
+    // decode rate is (output_tokens - 1) over it, pauses included.
+    std::optional<double> decode_seconds;
 };
 
 // The requests the Engine holds: residents in lane order, the one binding, the paused ones, then

@@ -36,6 +36,8 @@ GenerationRequest question_request(const DecideRequest& request, const DecideQue
     // The decision is read, and a primitive generated, where the answer starts: on a model that writes its own reply
     // header (Inkling 2) the prompt ends with it.
     generation.open_answer = true;
+    // Queued first, on a decision lane when one is reserved (--decision-lanes).
+    generation.decision = true;
     // Greedy and penalty-free: penalties would push a repeated digit away from the answer.
     generation.sampling.temperature       = 0.0;
     generation.sampling.presence_penalty  = 0.0;
@@ -115,6 +117,8 @@ void HttpServer::handle_decide(const httplib::Request& req, httplib::Response& r
             .stream                 = false,
             .output_tokens_explicit = true,
             .label                  = request_label(req),
+            .client_request_id      = client_header_id(req, "x-request-id"),
+            .session_id             = client_header_id(req, "x-session-id"),
         };
         try {
             run.prepared.emplace(service_->prepare(

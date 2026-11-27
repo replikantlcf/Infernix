@@ -145,8 +145,20 @@ struct ContentPart {
     // A PDF page image resolve_documents rendered: the vision budget bounds it, so the request's media byte budget,
     // already charged with the PDF, does not count it again.
     bool derived = false;
+    // The longest side, in pixels, the image is scaled to before the Vision frontend; 0 = the model's
+    // native geometry. OpenAI's detail 'low' sets kLowDetailLongSide (image_detail_long_side).
+    std::uint32_t image_max_long_side = 0;
     std::optional<CacheBoundary> cache_boundary_after;
 };
+
+// OpenAI's image detail: 'low' asks for a small, cheap picture (OpenAI reads it at 512 x 512), so the
+// image's longest side is capped at 512 px, aspect kept; 'auto', 'high' and any other value take the
+// model's native geometry. A client's unknown value is no reason to refuse its picture.
+inline constexpr std::uint32_t kLowDetailLongSide = 512;
+
+[[nodiscard]] inline std::uint32_t image_detail_long_side(std::string_view detail) noexcept {
+    return detail == "low" ? kLowDetailLongSide : 0U;
+}
 
 struct ToolDefinition {
     std::string name;
@@ -301,6 +313,8 @@ struct GenerationRequest {
     infernix::TokenConstraint token_constraint;
     // Tokens that end generation once committed (a scalar's closing brace).
     std::vector<infernix::TokenId> stop_token_ids;
+    // A /v1/decide question: scheduled as a decision (ExecutionOptions::decision, --decision-lanes).
+    bool decision = false;
 
     [[nodiscard]] bool uses_tools() const noexcept {
         return !tools.empty() && tool_choice.mode != ToolChoiceMode::None &&

@@ -3,6 +3,7 @@
 #include "core/device.h"
 #include "core/host_memory.h"
 #include "core/vram_budget.h"
+#include "infernix/ops/kernel_images.h"
 #include "models/inkling2/execution/forward.h"
 #include "models/inkling2/load.h"
 #include "runtime/engine/diagnostics.h"
@@ -41,6 +42,8 @@ constexpr const char* kQwenPromptKernel =
 constexpr const char* kQwenMedia =
     "sizes the Qwen models' media pipeline; Inkling 2's frontend decodes each image without it";
 constexpr const char* kNoNgrams = "configures n-gram drafting, which Inkling 2 does not have (its drafter is DSpark)";
+// The idle next-turn prefill's default quiet period (--cache-next-turn-ms; see normalize's note).
+constexpr std::chrono::milliseconds kInkling2NextTurnPrefillQuiet{1000};
 
 void report(const EngineOptions& options, const std::string& text) {
     publish_diagnostic(options.diagnostic_observer, DiagnosticLevel::Info, "%s", text.c_str());
@@ -100,6 +103,9 @@ models::inkling2::ProgramOptions program_options(const EngineOptions& options, s
             .prefix_max_new_taps   = options.context_cache.hybrid.max_new_taps.value_or(8U),
             .prefix_ladder_tokens  = options.context_cache.hybrid.tap_ladder_tokens.value_or(4096U),
             .prefix_min_gap_tokens = options.context_cache.hybrid.tap_min_gap_tokens.value_or(1024U),
+            // A request waiting for a sibling's snapshot stays in the FIFO, so the predicted wait is kept well inside
+            // its queue timeout (as the Qwen families keep it).
+            .prefix_coalesce_wait_seconds = static_cast<double>(options.pending_timeout_ms) / 1000.0 / 2.0,
             .prefix_save           = options.context_cache.hybrid.persistent_save,
             .prefix_ssd_bytes      = options.context_cache.ssd_capacity_bytes,
             .prefix_ssd_directory  = options.context_cache.ssd_directory,
@@ -372,8 +378,6 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                "the prefix cache keeps snapshot state exact (--cache-host-state fp32)");
         refuse(hybrid.tool_call_hold.value_or(std::chrono::milliseconds{0}).count() != 0,
                "the prefix cache has no tool-call holds");
-        refuse(hybrid.next_turn_prefill_quiet.value_or(std::chrono::milliseconds{0}).count() != 0,
-               "no idle next-turn prefill yet");
     }
     if (options.purpose == EnginePurpose::Generation) {
         // The VRAM and RAM figures size --max-context auto, --kv-capacity auto (the KV pool the lanes share) and the
@@ -416,7 +420,19 @@ EngineOptions normalize_inkling2_options(EngineOptions options, bool bundled_dra
                "the prefix cache keeps its snapshots in the Host tier: --host-context-mib must be positive");
         hybrid.device_snapshot_slots   = 0U;
         hybrid.tool_call_hold          = std::chrono::milliseconds{0};
-        hybrid.next_turn_prefill_quiet = std::chrono::milliseconds{0};
+        // Idle-time prefill of finished turns (hybrid-prefix-cache-spec §7.9): the cache keeps prompt-computed state
+        // only, so a next turn would otherwise prefill the previous reply again; the pass prefills it on the prompt
+        // route, whose bits do not depend on where a call starts, so a turn resumed from it equals an uncached run. The
+        // default quiet is 1 s, not Qwen3.5's 150 ms: a turn that arrives while the pass runs waits for its unit (the
+        // whole reply) and then resumes in a narrow call, which costs ~125 ms at 122K (2026-11-26, a ~1.2K-token reply
+        // on a 122K document: 258-288 ms to the first token against 201-221 ms without the pass at a 0.2 s pause, 159
+        // against 200-221 ms at 3 s). Off by default on --lossless: the pass yields at a prefill unit, which that route
+        // (340-450 tokens a second) takes seconds to finish.
+        hybrid.next_turn_prefill_quiet = hybrid.next_turn_prefill_quiet.value_or(
+            options.lossless ? std::chrono::milliseconds{0} : kInkling2NextTurnPrefillQuiet);
+        refuse(hybrid.next_turn_prefill_quiet->count() < 0 ||
+                   *hybrid.next_turn_prefill_quiet > std::chrono::milliseconds{3'600'000},
+               "idle prefill quiet period must be in [0,3600000] ms");
         hybrid.max_new_taps            = hybrid.max_new_taps.value_or(8U);
         hybrid.tap_ladder_tokens = hybrid.tap_ladder_tokens.value_or(std::max<std::uint32_t>(4096U, 2U * options.prefill_chunk));
         hybrid.tap_min_gap_tokens = hybrid.tap_min_gap_tokens.value_or(std::max<std::uint32_t>(1024U, options.prefill_chunk));
@@ -580,7 +596,11 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
     std::string template_override;
     if (!options.chat_template_path.empty()) { template_override = read_text(options.chat_template_path); }
     const std::uint64_t pinned_bytes = plan.materialization().pinned_capacity_bytes;
+    // The kernel images load beside the weights: the RAM plan above counted them as the process's growth.
+    ops::KernelImagesLoad kernel_images(device.device);
     auto model = models::inkling2::materialize_model(std::move(plan), device, &options.startup_observer);
+    device.synchronize();
+    report_kernel_images(options, kernel_images.finish());
     const auto* vision_host = model->vision_host() ? &*model->vision_host() : nullptr;
     if (options.max_context_auto) {
         const VramSnapshot after = open_vram_budget_source(device.device, options.vram_past_budget)->query();
@@ -725,7 +745,8 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         // the metrics, the request log and the startup lines, as the Qwen families fill theirs: the requested mode
         // (auto stays auto), the pool's pages in the occupied-pages gauge's unit (the scratch page holds nothing; fixed
         // at startup, so its maximum too), the bytes the plan counted and what the pool was sized from; the automatic
-        // headroom is set below. The minimum reservation and the slack have no Inkling counterpart: left 0.
+        // headroom is set below; the planned slack is what the pool was sized from less the plan's bytes, as Flash-Next
+        // reports it. The minimum reservation has no Inkling counterpart: left 0.
         KvCapacityResolution& resolution = instance->kv_capacity_resolution;
         resolution.mode                  = options.kv_capacity.mode;
         resolution.main_page_groups      = planned_device.kv_pages > 0 ? planned_device.kv_pages - 1U : 0U;
@@ -734,6 +755,9 @@ ConstructedInkling2 construct_inkling2(const EngineOptions& requested, DeviceCon
         resolution.bytes_per_additional_main_page_group = static_cast<std::size_t>(planned_device.page_bytes);
         resolution.runtime_reservation_bytes            = static_cast<std::size_t>(planned_device.fixed_bytes());
         resolution.available_after_weights_bytes        = static_cast<std::size_t>(pool_sizing_bytes);
+        resolution.planned_slack_bytes                  = pool_sizing_bytes > planned_device.fixed_bytes()
+                                                              ? static_cast<std::size_t>(pool_sizing_bytes - planned_device.fixed_bytes())
+                                                              : 0U;
         resolution.available_after_startup_bytes =
             free_device_bytes(open_vram_budget_source(device.device, options.vram_past_budget)->query());
     }

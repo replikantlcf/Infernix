@@ -3,7 +3,8 @@
 // the call's columns, KV head) over the rows' fixed absolute 64-key units.
 //
 // A CTA's 12 warps take 16 rows each (16 consecutive columns of one of the group's 3 query heads). Per unit (K and V
-// pages in a double-buffered cp.async ring, 16-byte chunks XOR-swizzled by row):
+// pages in a double-buffered cp.async ring, 16-byte chunks XOR-swizzled by row; a quantized pool's codes in a cp.async
+// code stage while the unit before computes, decoded into one tile stage):
 //   bias    the warp's rows' relative bias for the unit's 79 distances, bf16(r . P[:, d]) by m16n8k16 (A the rows' r,
 //           B the table's columns; 0 past distance 1023), staged as BF16 [16][80]
 //   scores  S = q k^T by m16n8k16 in BF16 from zero over the head dimension, s = S * fl32(1/sqrt 128) + bias,
@@ -55,13 +56,32 @@ constexpr int kStages        = 2;
 
 constexpr int kTableColumns  = 128; // the distances a CTA's rows meet in one unit: 64 rows + 64 keys - 1, whole
 
-struct Shared {
-    std::uint16_t k[kStages][kPageElements];
-    std::uint16_t v[kStages][kPageElements];
+// A call of several lanes' columns (prefill groups): each CTA's columns [begin, end), at most kTileColumns of one lane
+// (each lane's columns from its first in tiles of 64). count 0: one lane's call, CTA t its columns 64 t .. 64 t + 63.
+constexpr int kMaxPromptTiles = 160; // 8 lanes, a call of at most 9,728 columns
+struct PromptTiles {
+    std::int32_t count = 0;
+    std::int32_t begin[kMaxPromptTiles] = {}, end[kMaxPromptTiles] = {};
+};
+
+// The quantized instance's code stage: a unit's codes and side records, a plane each (codes, then side records at a
+// fixed offset), sized for the largest form's rows (bf16p: 192 code bytes and 16 side bytes).
+constexpr int kCodeRowBytes = 192, kSideRowBytes = 16;
+constexpr int kCodePlane    = kKeyUnit * (kCodeRowBytes + kSideRowBytes);
+
+// BF16 pools: two tile stages (a unit's pages copied by cp.async while the unit before it computes). Quantized pools:
+// one tile stage and the code stage (a unit's codes copied by cp.async while the unit before it computes, then decoded
+// from the stage into the tile).
+template <bool Quantized>
+struct SharedT {
+    static constexpr int kTiles = Quantized ? 1 : kStages;
+    std::uint16_t k[kTiles][kPageElements];
+    std::uint16_t v[kTiles][kPageElements];
     std::uint16_t bias[kWarps][16][kBiasColumns];
     std::uint16_t table[kTableColumns][kRelDim]; // the relative table's columns of the unit's distances, transposed
+    alignas(16) std::uint8_t code[Quantized ? 2 * kCodePlane : 16];
 };
-static_assert(sizeof(Shared) <= 99 * 1024);
+static_assert(sizeof(SharedT<false>) <= 99 * 1024 && sizeof(SharedT<true>) <= 99 * 1024);
 
 // Element (row, column) of a swizzled page: 16-byte chunk (column / 8) XOR (row & 7).
 __device__ __forceinline__ int swz(int row, int col) { return row * kD + (((col >> 3) ^ (row & 7)) << 3) + (col & 7); }
@@ -121,14 +141,15 @@ __device__ __forceinline__ void unrotate_rows(float (&acc)[16][4], int t4) {
 
 // Quantized: the instance for a quantized pool or window ring (attention.cu's split): the BF16 instance has no decoders.
 template <bool Quantized>
-__global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const AttentionArgs a) {
+__global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const AttentionArgs a, const PromptTiles tiles) {
     extern __shared__ __align__(16) unsigned char smem_raw[];
-    Shared& sm = *reinterpret_cast<Shared*>(smem_raw);
+    SharedT<Quantized>& sm = *reinterpret_cast<SharedT<Quantized>*>(smem_raw);
     const int tile = static_cast<int>(blockIdx.x), kv = static_cast<int>(blockIdx.y);
     const int tid = static_cast<int>(threadIdx.x), warp = tid >> 5, ln = tid & 31;
     const int g = ln >> 2, t4 = ln & 3;
     const bool full = a.layer.full;
-    const int c0 = tile * kTileColumns, c_end = min(a.columns, c0 + kTileColumns);
+    const int c0    = tiles.count == 0 ? tile * kTileColumns : tiles.begin[tile];
+    const int c_end = tiles.count == 0 ? min(a.columns, c0 + kTileColumns) : tiles.end[tile];
     pdl::enter();
     const int lane  = a.map.lane[c0];
     const int first = a.map.first[lane];
@@ -178,50 +199,100 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
     for (int n = 0; n < 16; ++n) { acc[n][0] = acc[n][1] = acc[n][2] = acc[n][3] = 0.0F; }
     float m_row[2] = {neg_inf(), neg_inf()}, l_row[2] = {0.0F, 0.0F};
 
+    // BF16: a unit's K and V pages into a tile stage.
     const auto load_unit = [&](int stage, int unit) {
         const std::size_t page = kv_row(a.kv, lane, kv, unit * kKeyUnit);
+        for (int i = tid; i < 2 * kKeyUnit * (kD / 8); i += kThreads) {
+            const int plane = i / (kKeyUnit * (kD / 8)), rest = i % (kKeyUnit * (kD / 8));
+            const int row = rest / (kD / 8), chunk = rest % (kD / 8);
+            const std::uint16_t* src = (plane == 0 ? a.kv.k : a.kv.v) + page + row * kD + 8 * chunk;
+            std::uint16_t* dst = (plane == 0 ? sm.k[stage] : sm.v[stage]) + swz(row, 8 * chunk);
+            ops::cp_async<16, Cache::cg>(dst, src);
+        }
+        ops::cp_commit();
+    };
+    // Quantized: a unit's codes and side records into the code stage (its rows are consecutive, so each plane's codes
+    // and side records are contiguous, whole 16-byte copies), then, from the stage, into the tile's represented words
+    // by decode_unit over a view of the stage: the words a decode from global memory gives.
+    const auto stage_codes = [&](int unit) {
         if constexpr (Quantized) {
-            // A quantized pool's or window ring's rows decoded into the stage's represented words (synchronous: the other
-            // stage is the one being read).
-            detail::decode_unit(a.kv, page, sm.k[stage], sm.v[stage], [](int row, int d) { return swz(row, d); }, tid,
-                                kThreads);
-        } else {
-            for (int i = tid; i < 2 * kKeyUnit * (kD / 8); i += kThreads) {
-                const int plane = i / (kKeyUnit * (kD / 8)), rest = i % (kKeyUnit * (kD / 8));
-                const int row = rest / (kD / 8), chunk = rest % (kD / 8);
-                const std::uint16_t* src = (plane == 0 ? a.kv.k : a.kv.v) + page + row * kD + 8 * chunk;
-                std::uint16_t* dst = (plane == 0 ? sm.k[stage] : sm.v[stage]) + swz(row, 8 * chunk);
-                ops::cp_async<16, Cache::cg>(dst, src);
+            const std::size_t page = kv_row(a.kv, lane, kv, unit * kKeyUnit);
+            for (int plane = 0; plane < 2; ++plane) {
+                const detail::KvForm form = detail::plane_form(a.kv, plane);
+                const int code_copies = kKeyUnit * detail::code_bytes(form) / 16;
+                const int side_copies = kKeyUnit * detail::side_bytes(form) / 16;
+                const std::uint8_t* codes = detail::row_codes(a.kv, plane, form, page);
+                const std::uint8_t* side  = detail::row_side(a.kv, plane, form, page);
+                std::uint8_t* dst         = sm.code + plane * kCodePlane;
+                for (int i = tid; i < code_copies + side_copies; i += kThreads) {
+                    if (i < code_copies) {
+                        ops::cp_async<16, Cache::cg>(dst + 16 * i, codes + 16 * i);
+                    } else {
+                        ops::cp_async<16, Cache::cg>(dst + kKeyUnit * kCodeRowBytes + 16 * (i - code_copies),
+                                                     side + 16 * (i - code_copies));
+                    }
+                }
             }
             ops::cp_commit();
         }
     };
+    const auto decode_staged = [&] {
+        if constexpr (Quantized) {
+            KvView staged = a.kv;
+            staged.k      = reinterpret_cast<std::uint16_t*>(sm.code);
+            staged.v      = reinterpret_cast<std::uint16_t*>(sm.code + kCodePlane);
+            staged.k_side = sm.code + kKeyUnit * kCodeRowBytes;
+            staged.v_side = sm.code + kCodePlane + kKeyUnit * kCodeRowBytes;
+            detail::decode_unit(staged, 0, sm.k[0], sm.v[0], [](int row, int d) { return swz(row, d); }, tid, kThreads);
+        }
+    };
 
-    if (lo <= hi) { load_unit(0, lo); }
-    for (int unit = lo; unit <= hi; ++unit) {
-        const int stage = (unit - lo) & 1;
-        if (unit + 1 <= hi) {
-            load_unit(stage ^ 1, unit + 1);
-            ops::cp_wait<1>();
-        } else {
+    if (lo <= hi) {
+        if constexpr (Quantized) {
+            stage_codes(lo);
             ops::cp_wait<0>();
+            __syncthreads();
+            decode_staged();
+        } else {
+            load_unit(0, lo);
         }
-        __syncthreads();
+    }
+    for (int unit = lo; unit <= hi; ++unit) {
+        int stage = 0;
+        if constexpr (Quantized) {
+            __syncthreads(); // the tile holds this unit; every reader of the code stage is done
+            if (unit + 1 <= hi) { stage_codes(unit + 1); }
+        } else {
+            stage = (unit - lo) & 1;
+            if (unit + 1 <= hi) {
+                load_unit(stage ^ 1, unit + 1);
+                ops::cp_wait<1>();
+            } else {
+                ops::cp_wait<0>();
+            }
+            __syncthreads();
+        }
         // The relative table's columns for this unit's distances cdmin .. cdmin + 127 (cdmin = p_first - j0 - 63),
-        // transposed; zero past the table.
+        // transposed; zero past the table. A unit whose nearest distance is past the table (far: every key of it at
+        // least kRelativeExtent before the CTA's first row) has each bias the fma fold of zeros, +0: it builds no table
+        // and folds no bias, the same bits (CTA-uniform; units ascend, so the far ones come first and no later unit
+        // reads a table a far one skipped).
         const int j0 = unit * kKeyUnit, cdmin = p_first - j0 - 63;
-        for (int i = tid; i < kTableColumns * kRelDim; i += kThreads) {
-            const int dim = i / kTableColumns, dl = i % kTableColumns, d = cdmin + dl;
-            sm.table[dl][dim] = d >= 0 && d < kRelativeExtent ? __ldg(a.layer.relative_table + dim * kRelativeExtent + d)
-                                                               : std::uint16_t{0};
+        const bool far = cdmin >= kRelativeExtent;
+        if (!far) {
+            for (int i = tid; i < kTableColumns * kRelDim; i += kThreads) {
+                const int dim = i / kTableColumns, dl = i % kTableColumns, d = cdmin + dl;
+                sm.table[dl][dim] = d >= 0 && d < kRelativeExtent ? __ldg(a.layer.relative_table + dim * kRelativeExtent + d)
+                                                                   : std::uint16_t{0};
+            }
+            __syncthreads();
         }
-        __syncthreads();
         if (warp_live && unit >= w_lo && unit <= w_hi) {
             // The warp's bias for distances wdmin .. wdmin + 79 (wdmin = wpos0 - j0 - 63; row r, key c: index r - c + 63)
             // in the decode route's arithmetic: bf16 of the fma fold of r[i] P[i][d] over i in order. Lane l: row l & 15,
             // indices (l >> 4) + 2k.
             const int off = wc0 - c0;
-            for (int idx = ln >> 4; idx < kBiasColumns - 1; idx += 2) {
+            for (int idx = far ? kBiasColumns : ln >> 4; idx < kBiasColumns - 1; idx += 2) {
                 const uint4* col = reinterpret_cast<const uint4*>(sm.table[off + idx]);
                 const uint4 w0 = col[0], w1 = col[1];
                 const std::uint32_t words[8] = {w0.x, w0.y, w0.z, w0.w, w1.x, w1.y, w1.z, w1.w};
@@ -264,7 +335,7 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
                     const int r  = g + 8 * hr;
                     const int kpos = j0 + key, dist = pos_g[hr] - kpos;
                     const bool visible = dist >= 0 && (full || dist < kWindow) && kpos >= first;
-                    const float bias = canon::bf16_to_f32(sm.bias[warp][r][r - key + 63]);
+                    const float bias = far ? 0.0F : canon::bf16_to_f32(sm.bias[warp][r][r - key + 63]);
                     const float s    = canon::add_rn(canon::mul_rn(sc[nt][e], kInvSqrtD), bias);
                     sc[nt][e]        = visible ? canon::mul_rn(s, kLog2e) : neg_inf();
                     mu[hr]           = sc[nt][e] > mu[hr] ? sc[nt][e] : mu[hr];
@@ -330,6 +401,13 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
             }
         }
         __syncthreads(); // the stage is refilled next
+        if constexpr (Quantized) {
+            if (unit + 1 <= hi) {
+                ops::cp_wait<0>();
+                __syncthreads(); // every thread's copies into the code stage have landed
+                decode_staged();
+            }
+        }
     }
     pdl::trigger_dependents();
     if (!warp_live) { return; }
@@ -364,27 +442,57 @@ __global__ void __launch_bounds__(kThreads, 1) attention_prompt_kernel(const Att
 
 void attention_prompt(const AttentionArgs& a, cudaStream_t stream) {
     if (a.columns <= 0 || a.columns > a.ws.capacity || a.host_groups == nullptr || a.groups <= 0) {
-        throw std::invalid_argument("inkling2 attention_prompt: 1..capacity columns of one lane, its groups on the host");
+        throw std::invalid_argument("inkling2 attention_prompt: 1..capacity columns, its groups on the host");
     }
-    for (int g = 1; g < a.groups; ++g) {
-        if (a.host_groups[3 * g + 2] != a.host_groups[2]) {
-            throw std::invalid_argument("inkling2 attention_prompt: a prompt call is one lane's columns");
+    // Several lanes: each lane's consecutive columns (no padding) in tiles of its own from its first column.
+    PromptTiles tiles;
+    bool one_lane = true;
+    for (int g = 1; g < a.groups; ++g) { one_lane = one_lane && a.host_groups[3 * g + 2] == a.host_groups[2]; }
+    if (!one_lane) {
+        std::int32_t covered = 0, tile_lane = -1;
+        for (int g = 0; g < a.groups; ++g) {
+            const std::int32_t col = a.host_groups[3 * g], count = a.host_groups[3 * g + 1], lane = a.host_groups[3 * g + 2];
+            covered += count;
+            for (std::int32_t c = col; c < col + count; ++c) {
+                // The column extends the open tile if it is the same lane's next column and the tile has room.
+                const bool extend = tiles.count > 0 && lane == tile_lane && tiles.end[tiles.count - 1] == c &&
+                                    tiles.end[tiles.count - 1] - tiles.begin[tiles.count - 1] < kTileColumns;
+                if (extend) {
+                    ++tiles.end[tiles.count - 1];
+                    continue;
+                }
+                if (tiles.count == kMaxPromptTiles) {
+                    throw std::invalid_argument("inkling2 attention_prompt: a call of several lanes takes at most 160 tiles");
+                }
+                tiles.begin[tiles.count] = c;
+                tiles.end[tiles.count]   = c + 1;
+                ++tiles.count;
+                tile_lane = lane;
+            }
+        }
+        if (covered != a.columns) {
+            throw std::invalid_argument("inkling2 attention_prompt: a call of several lanes has no padding columns");
         }
     }
     detail::check_attention_args(a);
     detail::launch_attention_prologue(a, stream);
-    constexpr int bytes = static_cast<int>(sizeof(Shared));
+    constexpr int plain_bytes = static_cast<int>(sizeof(SharedT<false>));
+    constexpr int coded_bytes = static_cast<int>(sizeof(SharedT<true>));
     static const bool attribute = [] {
-        for (auto* kernel : {attention_prompt_kernel<false>, attention_prompt_kernel<true>}) {
-            CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, bytes));
-        }
+        CUDA_CHECK(cudaFuncSetAttribute(attention_prompt_kernel<false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        plain_bytes));
+        CUDA_CHECK(cudaFuncSetAttribute(attention_prompt_kernel<true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                        coded_bytes));
         return true;
     }();
     (void)attribute;
-    const dim3 grid(static_cast<unsigned>((a.columns + kTileColumns - 1) / kTileColumns), kKvHeads);
-    const pdl::LaunchConfig config{grid, dim3(kThreads), static_cast<std::size_t>(bytes), stream};
-    CUDA_CHECK(detail::quantized_pool(a) ? pdl::launch_consumer(config, attention_prompt_kernel<true>, a)
-                                         : pdl::launch_consumer(config, attention_prompt_kernel<false>, a));
+    const bool quantized = detail::quantized_pool(a);
+    const dim3 grid(static_cast<unsigned>(tiles.count != 0 ? tiles.count : (a.columns + kTileColumns - 1) / kTileColumns),
+                    kKvHeads);
+    const pdl::LaunchConfig config{grid, dim3(kThreads), static_cast<std::size_t>(quantized ? coded_bytes : plain_bytes),
+                                   stream};
+    CUDA_CHECK(quantized ? pdl::launch_consumer(config, attention_prompt_kernel<true>, a, tiles)
+                         : pdl::launch_consumer(config, attention_prompt_kernel<false>, a, tiles));
 }
 
 } // namespace infernix::ops::inkling2

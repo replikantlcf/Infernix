@@ -99,7 +99,7 @@ public:
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options)
         : instance_(instance), device_(device), max_context_(options.max_context),
-          max_concurrency_(options.max_concurrency),
+          max_concurrency_(options.max_concurrency), decision_lanes_(options.decision_lanes),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -113,7 +113,8 @@ public:
                                         std::chrono::milliseconds{0})
                                   : std::chrono::milliseconds{0}) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+            decision_lanes_ >= max_concurrency_ || options.max_pending_requests == 0 ||
+            pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         paused_.reserve(max_outstanding_);
@@ -377,7 +378,9 @@ public:
                                                 std::move(observation), pending_deadline, ready);
             ++next_request_id_;
             ++next_publication_order_;
-            pending_.push_back(request);
+            // A decision enters ahead of the waiting requests that are not decisions and can still be
+            // passed (Scheduler::enqueue).
+            Scheduling::enqueue(pending_, request, max_concurrency_);
         } catch (...) {
             release_reserved_capacity();
             throw;
@@ -1632,10 +1635,12 @@ private:
         }
     }
 
+    // `grouped`: a prefill group's lane (run_prefill_group), whose completion the group's one pending batch commits.
     void
     resolve_prefill_progress(const std::shared_ptr<Request>& request,
                              typename ModelContract::PrefillProgress&& progress,
-                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                             bool grouped = false) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
@@ -1672,7 +1677,7 @@ private:
         // stops waiting there too.
         if (progress.capacity_released || progress.snapshot_published || sibling_wait_) { request_admission_check(); }
         if (!progress.complete) { return; }
-        if (!request->lane || !progress.pending) {
+        if (!request->lane || grouped == progress.pending.has_value()) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
         if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
@@ -1681,6 +1686,7 @@ private:
         const std::uint32_t lane = request->lane->value;
         request->begin           = progress.summary;
         request->readout         = std::move(progress.readout);
+        if (grouped) { return; }
         const std::array<std::uint32_t, 1> lanes{lane};
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
@@ -1719,6 +1725,85 @@ private:
         return complete;
     }
 
+    // A Program whose prompt calls take several lanes' prefill units (engine-architecture "Prefill order").
+    static constexpr bool kPrefillGroups =
+        requires(typename ModelContract::Program& program, std::span<const SequenceHandle> s, const SequenceHandle& h) {
+            { program.prefill_joins(s, h) } -> std::same_as<bool>;
+            program.advance_prefill_group(s, nullptr, nullptr);
+        };
+
+    // Whether the lane's request may be in a prefill group: prefilling its own prompt (not a Replay), a client's (not
+    // the idle next-turn pass), live and runnable (not cancelled, pausing, held by a context transaction or waiting
+    // for its grammar).
+    [[nodiscard]] bool prefill_groupable(std::uint32_t lane) const {
+        const auto& request = slots_[lane];
+        return request && request->sequence && request->is_prefilling() && !request->is_replaying() &&
+               !request->background && request->model_state != EngineRequestState::Pausing &&
+               !request->cancelled.load(std::memory_order_acquire) &&
+               !instance_.program->context_blocks(*request->sequence) && !request->output.constraint_pending();
+    }
+
+    // One prompt call of the lanes' prefill units (`lanes[0]` the permit's), each lane's progress resolved as
+    // run_prefill_step resolves it, and the lanes that completed their prompt committed together.
+    void run_prefill_group(std::span<const std::uint32_t> lanes,
+                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
+        EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
+        std::vector<std::shared_ptr<Request>> requests;
+        std::vector<SequenceHandle> sequences;
+        RoundMasks masks;
+        bool masked = false;
+        for (std::size_t row = 0; row < lanes.size(); ++row) {
+            const auto request = slots_[lanes[row]];
+            if (request == nullptr || !request->is_prefilling() || !request->sequence) {
+                throw std::logic_error("staged prefill group lane has invalid request state");
+            }
+            requests.push_back(request);
+            sequences.push_back(*request->sequence);
+            masks.outputs[row] = &request->output;
+            masked             = masked || masks.needed(row);
+        }
+        setup.finish();
+        ProgramCallScope program_call(*this);
+        auto progress = instance_.program->advance_prefill_group(sequences, &program_call.failed_timing(),
+                                                                  masked ? &masks : nullptr);
+        program_call.finish(progress.timing);
+        cumulative_stats_.host_work.prefill_shared_units += lanes.size() - 1;
+        try {
+            if (progress.lanes.size() != lanes.size()) {
+                throw std::logic_error("prefill group progress has a row count other than its lanes'");
+            }
+            std::array<std::uint32_t, kMaximumConcurrency> completed{};
+            for (std::size_t i = 0; i < progress.completed.size(); ++i) {
+                if (progress.completed[i] >= lanes.size() || !progress.lanes[progress.completed[i]].complete) {
+                    throw std::logic_error("prefill group names a completed row that did not complete");
+                }
+                completed[i] = lanes[progress.completed[i]];
+            }
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                if (!requests[row]->first_output_timing) {
+                    record_execution_work(requests[row]->prefill_work, progress.timing);
+                }
+                resolve_prefill_progress(requests[row], std::move(progress.lanes[row]), cancelled_at_unit_start, true);
+            }
+            if (progress.completed.empty() != !progress.pending) {
+                throw std::logic_error("prefill group's pending batch disagrees with its completed rows");
+            }
+            if (progress.pending) {
+                auto pending = std::move(*progress.pending);
+                progress.pending.reset();
+                commit_pending(std::move(pending), std::span<const std::uint32_t>(completed.data(), progress.completed.size()),
+                               false, cancelled_at_unit_start);
+                // A completed prompt returns what its prefill held, which a request waiting for KV growth may need.
+                request_admission_check();
+            }
+        } catch (...) {
+            if (progress.pending) { (void)instance_.program->abort_pending(std::move(*progress.pending)); }
+            throw;
+        }
+        publish_runtime_stats();
+    }
+
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
         if (!request->base_plan) {
             // The proposal-only ngram view binds once, before the prompt moves into its plan;
@@ -1736,13 +1821,14 @@ private:
         }
     }
 
-    [[nodiscard]] std::optional<std::uint32_t> free_lane() const noexcept {
-        for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
-            if (!slots_[lane] && (!materializing_ || materializing_->destination.value != lane)) {
-                return lane;
-            }
-        }
-        return std::nullopt;
+    // A free lane `request` may bind: decision lanes take only decisions (resource-scheduling §5.4).
+    [[nodiscard]] std::optional<std::uint32_t> free_lane(bool decision) const noexcept {
+        return Scheduling::free_lane(max_concurrency_, decision_lanes_, decision,
+                                     [this](std::uint32_t lane) {
+                                         return !slots_[lane] &&
+                                                (!materializing_ ||
+                                                 materializing_->destination.value != lane);
+                                     });
     }
 
     [[nodiscard]] bool resident_empty() const noexcept {
@@ -1878,9 +1964,16 @@ private:
         };
     }
 
-    // Pauses the progress owner's victim, the next one when a resident cannot pause now.
-    bool pause_reclaim_victim() {
+    // Pauses the progress owner's victim, the next one when a resident cannot pause now. `general`: the
+    // owner needs a general lane (it is not a decision), so the decision lanes' residents are passed over.
+    bool pause_reclaim_victim(bool general = false) {
         std::vector<std::uint32_t> skipped;
+        if (general) {
+            for (std::uint32_t lane = max_concurrency_ - std::min(decision_lanes_, max_concurrency_);
+                 lane < max_concurrency_; ++lane) {
+                skipped.push_back(lane);
+            }
+        }
         while (const auto victim = scheduler_.preemption_victim(slots_, max_concurrency_, skipped, pause_cost())) {
             if (pause_resident(*victim)) { return true; }
             if (instance_.program->has_context_transaction()) { return false; }
@@ -2080,7 +2173,6 @@ private:
     // resident for its lane or capacity; otherwise admits a fresh request.
     bool try_admit_one(bool restoring) {
         if (instance_.program->has_context_transaction()) { return false; }
-        const auto lane  = free_lane();
         const auto owner = scheduler_.progress_owner();
         const auto suspended =
             restoring ? std::find_if(paused_.begin(), paused_.end(),
@@ -2089,14 +2181,20 @@ private:
         if (restoring && suspended == paused_.end()) { return false; }
         // The owner needs a lane: the resident whose pause recomputes least, the next one when it cannot
         // pause now (while the owner is paused no resident reserves a unit, so a victim that refused would
-        // never reach a boundary where it can).
-        if (!lane && restoring) { return pause_reclaim_victim(); }
+        // never reach a boundary where it can). A paused request that is not a decision needs a general
+        // lane, so pausing a decision lane's resident would not seat it.
+        if (restoring && !free_lane((*suspended)->is_decision())) {
+            return pause_reclaim_victim(!(*suspended)->is_decision());
+        }
         if (admission_decision_ && (admission_decision_->restoring != restoring ||
                                     (restoring && *suspended != admission_decision_->request))) {
             admission_decision_.reset();
         }
-        // A decision is only ever kept across a pause it started, which frees a lane.
-        if (!lane) { admission_decision_.reset(); }
+        // A decision is only ever kept across a pause it started, which frees a lane (a general one for a
+        // request that is not a decision): without a lane its request could not bind below.
+        if (admission_decision_ && !free_lane(admission_decision_->request->is_decision())) {
+            admission_decision_.reset();
+        }
         std::vector<std::shared_ptr<Request>> candidates;
         if (admission_decision_) {
             candidates.push_back(admission_decision_->request);
@@ -2107,6 +2205,7 @@ private:
             candidates = scheduler_.fresh_candidates(pending_, max_concurrency_);
         }
         for (const auto& request : candidates) {
+            const auto lane = free_lane(request->is_decision());
             if (!admission_decision_) {
                 if (!restoring) {
                     scheduler_.admission_candidate_checked(request->id);
@@ -2361,6 +2460,8 @@ private:
     // lent to resident growth, and only the owner may change capacity ownership.
     void reserve_resident_units(ReservationScope scope = ReservationScope::Round) {
         runnable_units_.fill(false);
+        prefill_primary_.reset();
+        prefill_companions_.clear();
         std::optional<std::uint32_t> recovering;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
             const auto& request = slots_[lane];
@@ -2424,9 +2525,15 @@ private:
                 candidates.push_back(lane);
             }
         }
+        // The priority row first (the progress owner, or a protected recovery), then decisions
+        // (they finish within a few units), then original ticket order.
         std::sort(candidates.begin(), candidates.end(), [&](auto a, auto b) {
             if (a == b) { return false; }
             if (priority == a || priority == b) { return priority == a; }
+            if (recovering == a || recovering == b) { return recovering == a; }
+            if (slots_[a]->is_decision() != slots_[b]->is_decision()) {
+                return slots_[a]->is_decision();
+            }
             return slots_[a]->id < slots_[b]->id;
         });
         // Set once the owner's capacity is in hand-over (a pause or a transfer for it): the rest
@@ -2510,6 +2617,28 @@ private:
                 (slots_[lane]->sequence &&
                  instance_.program->context_blocks(*slots_[lane]->sequence))) {
                 runnable_units_[lane] = false;
+            }
+        }
+        // The permit's companions (engine-architecture "Prefill order"): with the permit's lane prefilling, each other
+        // lane whose whole remaining prompt the Program lets join its prompt call (Program::prefill_joins), on a
+        // reservation of its own. A companion never reclaims, pauses or waits for capacity, and none joins during a
+        // service turn or a hand-over.
+        if constexpr (kPrefillGroups) {
+            if (prefill && !owner && !handed_over && runnable_units_[*prefill] && prefill_groupable(*prefill)) {
+                std::vector<SequenceHandle> group{*slots_[*prefill]->sequence};
+                for (std::uint32_t offset = 1; offset < max_concurrency_; ++offset) {
+                    const std::uint32_t lane = (*prefill + offset) % max_concurrency_;
+                    if (!prefill_view[lane] || !prefill_groupable(lane) ||
+                        !instance_.program->prefill_joins(group, *slots_[lane]->sequence)) {
+                        continue;
+                    }
+                    const ExecutionUnit unit{*slots_[lane]->sequence, UnitKind::Prefill, 0U};
+                    if (!instance_.program->reserve_units({&unit, 1})) { continue; }
+                    runnable_units_[lane] = true;
+                    group.push_back(*slots_[lane]->sequence);
+                    prefill_companions_.push_back(lane);
+                }
+                if (!prefill_companions_.empty()) { prefill_primary_ = *prefill; }
             }
         }
     }
@@ -3217,12 +3346,37 @@ private:
                         prefill_slots[lane].reset();
                     }
                 }
-                const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                std::optional<std::uint32_t> lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                // The permit's lane leads its companions' prompt call (reserve_resident_units), each companion still
+                // runnable and still admitted by the Program.
+                std::vector<std::uint32_t> group;
+                if constexpr (kPrefillGroups) {
+                    if (prefill_primary_ && prefill_slots[*prefill_primary_] && prefill_groupable(*prefill_primary_)) {
+                        lane = prefill_primary_;
+                        group.push_back(*lane);
+                        std::vector<SequenceHandle> sequences{*slots_[*lane]->sequence};
+                        for (const std::uint32_t companion : prefill_companions_) {
+                            if (!prefill_slots[companion] || !prefill_groupable(companion) ||
+                                !instance_.program->prefill_joins(sequences, *slots_[companion]->sequence)) {
+                                continue;
+                            }
+                            group.push_back(companion);
+                            sequences.push_back(*slots_[companion]->sequence);
+                        }
+                    }
+                }
                 if (lane) {
                     const auto request = slots_[*lane];
                     set_host_work_class(HostWorkClass::Prefill);
                     // The unit's tokens age the other prefilling lanes (Scheduler::next_prefill).
                     const std::uint64_t tokens_before = request->computed_prompt_tokens + request->replayed_tokens;
+                    // A group's companions, held across the call (a completed one may leave its slot).
+                    std::vector<std::shared_ptr<Request>> companions;
+                    std::vector<std::uint64_t> companion_before;
+                    for (std::size_t i = 1; i < group.size(); ++i) {
+                        companions.push_back(slots_[group[i]]);
+                        companion_before.push_back(companions.back()->computed_prompt_tokens);
+                    }
                     if (request->is_replaying()) {
                         const auto replay_started = Clock::now();
                         const ServiceMark mark    = service_mark();
@@ -3257,17 +3411,34 @@ private:
                     } else {
                         const auto prefill_started = Clock::now();
                         const ServiceMark mark     = service_mark();
-                        (void)run_prefill_step(*lane, snapshot_cancellations());
+                        if constexpr (kPrefillGroups) {
+                            if (group.size() > 1) {
+                                run_prefill_group(group, snapshot_cancellations());
+                            } else {
+                                (void)run_prefill_step(*lane, snapshot_cancellations());
+                            }
+                        } else {
+                            (void)run_prefill_step(*lane, snapshot_cancellations());
+                        }
                         charge_service(mark);
                         cumulative_stats_.execution.prefill.add(
                             elapsed_ns(prefill_started, Clock::now()));
                     }
-                    const std::uint64_t unit_tokens =
-                        request->computed_prompt_tokens + request->replayed_tokens - tokens_before;
-                    scheduler_.prefill_executed(*lane, max_concurrency_, slots_,
-                                                static_cast<std::uint32_t>(std::min<std::uint64_t>(
-                                                    unit_tokens, std::numeric_limits<std::uint32_t>::max())));
+                    // A decision's unit is taken out of order: it, and its group's companions, leave the
+                    // rotation where it was (Scheduler::prefill_executed).
+                    const bool decision_led = request->is_decision();
+                    const auto age = [&](std::uint32_t at, std::uint64_t tokens) {
+                        scheduler_.prefill_executed(at, max_concurrency_, slots_,
+                                                    static_cast<std::uint32_t>(std::min<std::uint64_t>(
+                                                        tokens, std::numeric_limits<std::uint32_t>::max())),
+                                                    decision_led);
+                    };
+                    age(*lane, request->computed_prompt_tokens + request->replayed_tokens - tokens_before);
                     update_recovery(request);
+                    for (std::size_t i = 0; i < companions.size(); ++i) {
+                        age(group[i + 1], companions[i]->computed_prompt_tokens - companion_before[i]);
+                        update_recovery(companions[i]);
+                    }
                     executed = true;
                 }
                 watch_progress(executed);
@@ -3306,6 +3477,8 @@ private:
     DeviceContext& device_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
+    // The last decision_lanes_ lanes take only decisions (EngineOptions::decision_lanes).
+    const std::uint32_t decision_lanes_;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool queue_holds_;
@@ -3339,6 +3512,10 @@ private:
     std::vector<std::shared_ptr<Request>> paused_;
     Scheduling scheduler_;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
+    // This cycle's prefill permit's lane and its companions (reserve_resident_units; engine-architecture "Prefill
+    // order"): lanes whose whole remaining prompt joins the permit's prompt call. Empty without one.
+    std::optional<std::uint32_t> prefill_primary_;
+    std::vector<std::uint32_t> prefill_companions_;
     std::atomic<bool> admission_check_pending_{false};
     // worker: a queued request's last quote had no source because it waits for a prefilling sibling's
     // snapshot; every prefill boundary then re-arms admission (hybrid-prefix-cache-spec §12.2).

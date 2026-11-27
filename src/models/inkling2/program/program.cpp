@@ -150,14 +150,19 @@ ops::w4a4_moe::ExpertActivation expert_activation(const ProgramOptions& o) {
                           : ops::w4a4_moe::ExpertActivation::Checkpoint;
 }
 
+// Whether the drafter's full layer keeps its context in INT8 (DSparkInt8Cache): with every target pool format but BF16,
+// whose pages it shares (drafts only: no output depends on it; 10 % more tokens in the pool, design §13.6).
+bool dspark_int8(ops::inkling2::KvCodec codec) { return codec != ops::inkling2::KvCodec::Bf16; }
+
 // The planes of one full visit's page: K and V (16-bit words, BF16 storage), and a quantized form's side records.
 std::size_t kv_planes_per_visit(ops::inkling2::KvCodec codec) { return codec == ops::inkling2::KvCodec::Bf16 ? 2 : 4; }
 
 // The full visits' page geometry (core/paged_kv_cache.h): per full visit its K and V planes, then a quantized form's
 // K and V side planes, each page-major [pages][kKvHeads][64][a row] (attention_common.cuh kv_row): a row of 128 BF16
 // (K) or FP16 (V; BF16 on the lossless route, `lossless`) words, or a quantized form's codes and side record
-// (inkling2_attention.h KvCodec); then, with DSpark, the drafter's full layer's K and V (BF16, inkling2_dspark.h), so a
-// page carries the drafter's context with the target's.
+// (inkling2_attention.h KvCodec); then, with DSpark, the drafter's full layer's K and V (BF16, inkling2_dspark.h; with
+// every other pool format INT8: K and V codes, then K and V side records, ops::inkling2::DSparkInt8Cache), so a page
+// carries the drafter's context with the target's.
 KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec codec, bool dspark, bool lossless) {
     const ops::inkling2::KvRowBytes b = ops::inkling2::kv_row_bytes(codec);
     const auto plane                  = [](DType dtype, std::int32_t row) {
@@ -179,14 +184,46 @@ KVPageGeometry kv_page_geometry(std::int32_t full_visits, ops::inkling2::KvCodec
     if (dspark) {
         static_assert(ops::inkling2::kDSparkKvHeads == ops::inkling2::kKvHeads &&
                       ops::inkling2::kDSparkHeadDim == ops::inkling2::kHeadDim);
-        g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
-        g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
+        if (dspark_int8(codec)) {
+            const ops::inkling2::KvRowBytes i8 = ops::inkling2::kv_row_bytes(ops::inkling2::KvCodec::Int8G64);
+            g.planes.push_back(plane(DType::U8, i8.key_code));
+            g.planes.push_back(plane(DType::U8, i8.value_code));
+            g.planes.push_back(plane(DType::U8, i8.key_side));
+            g.planes.push_back(plane(DType::U8, i8.value_side));
+        } else {
+            g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
+            g.planes.push_back(plane(DType::BF16, ops::inkling2::kDSparkHeadDim));
+        }
     }
     return g;
 }
 
 // Whether the Program runs the drafter (its two planes in every page).
 bool dspark_planes(const ProgramOptions& o) { return o.dspark && !o.causal_scoring; }
+
+// The prompt route's time (runtime/prefix_cache/cost.h's model): a linear fit of its measured rates (RTX 5090,
+// infernix_bench C = 1, pp2048, 2026-11-21: 9,514 tokens a second in chunks of 512, 16,400 in chunks of 2,048): ~30 ms
+// a call and 1 / 21,600 s a token, and attention's 1.0 ns a (query, key) pair (2026-11-26, the owner's configuration,
+// INT8 KV, chunks of 4,096, the prompt kernel's far-unit skip in: a cold 122,215-token prompt at 8,905 tokens a second,
+// 0.96 ns; 7,544 tokens after 114,688 at 5,475, 1.08 ns). It prices the prefix cache's sources and its coalescing
+// waits (await_sibling); a narrow call's own cost is split_seconds'.
+runtime::prefix_cache::CacheCostModel prompt_cost(const ProgramOptions& o) {
+    runtime::prefix_cache::CacheCostModel cost;
+    cost.chunk_tokens           = o.prefill_chunk;
+    cost.chunk_seconds          = 30.0e-3;
+    cost.token_seconds          = 1.0 / 21600.0;
+    cost.attention_pair_seconds = 1.0e-9;
+    if (o.lossless) {
+        // The lossless route's calls (lossless-route.md §3a; inkling2-mini, RTX 5090, 2026-11-23): about 0.27 s a call
+        // (infernix --lossless, one-column decode calls at a 20-token context, 3.6 tok/s), then 3.1 ms a token and
+        // 0.89 us a (query, key) pair, fitted to its scoring runs (infernix-perplexity: 11 windows of 2,048 tokens in
+        // 93.7 s, 2 of 9,216 in 133.5 s).
+        cost.chunk_seconds          = 0.27;
+        cost.token_seconds          = 3.1e-3;
+        cost.attention_pair_seconds = 0.89e-6;
+    }
+    return cost;
+}
 
 // The full visits' page pool (its scratch page included), shared by the lanes, and their block-table rows in one
 // backing allocation. The pool holds at least one lane's whole context, so a request alone always completes.
@@ -296,6 +333,7 @@ struct Lane {
     std::uint64_t policy_rounds = 0;
     std::int32_t step_cap = ops::inkling2::kMarkovSteps; // the calibrated length's Markov steps a round drafts
     std::uint64_t rounds = 0, drafted = 0, accepted = 0, fallback = 0;
+    std::uint64_t rates_plain = 0; // its rounds of several rows the measured rates left plain (dspark_rows_round)
     double draft_ms = 0, gap_ms = 0, verify_ms = 0; // device-side sums over the rounds (CUDA events)
     std::array<std::uint64_t, ops::inkling2::kMarkovSteps> accepted_at{}; // rounds accepting draft i
     // The prefix cache: whether the request reuses and publishes, its keys (a block past the prompt's full blocks under
@@ -329,6 +367,9 @@ struct ResumeStateImpl {
     std::uint32_t target  = 0;
     bool generated        = false;
     std::uint64_t capture = 0;
+    // Keeps the Program's record of the lane's capture ids (ProgramImpl::paused_captures_) for as long as this state
+    // lives; null when the lane captured nothing.
+    std::shared_ptr<const void> captures_owner;
 };
 
 class ProgramImpl {
@@ -438,12 +479,18 @@ public:
             if (o_.draft_tokens < 1 || o_.draft_tokens > static_cast<std::uint32_t>(ops::inkling2::kMarkovSteps)) {
                 throw std::invalid_argument("Inkling 2: DSpark drafts 1-7 tokens a round");
             }
-            // The full layer's context: the pool's last two planes, through the lanes' block-table rows.
+            // The full layer's context: the pool's last two planes (BF16), or last four (INT8: codes then side records),
+            // through the lanes' block-table rows.
             const std::size_t planes = pool_->plane_count();
-            const DSparkPagedContext full{.k            = static_cast<std::uint16_t*>(pool_->plane(planes - 2).data),
-                                          .v            = static_cast<std::uint16_t*>(pool_->plane(planes - 1).data),
-                                          .table        = view_.table,
-                                          .table_stride = view_.table_stride};
+            DSparkPagedContext full{.table = view_.table, .table_stride = view_.table_stride};
+            if (dspark_int8(o_.kv_codec)) {
+                const auto u8 = [&](std::size_t i) { return static_cast<std::uint8_t*>(pool_->plane(i).data); };
+                full.int8 = {.codes_k = u8(planes - 4), .codes_v = u8(planes - 3), .side_k = u8(planes - 2),
+                             .side_v = u8(planes - 1)};
+            } else {
+                full.k = static_cast<std::uint16_t*>(pool_->plane(planes - 2).data);
+                full.v = static_cast<std::uint16_t*>(pool_->plane(planes - 1).data);
+            }
             drafter_ = std::make_unique<Drafter>(p_, forward_, static_cast<std::int32_t>(lanes_.size()), o_.max_context,
                                                  forward_capacity(o_), full);
         }
@@ -463,23 +510,10 @@ public:
                                .ladder_tokens  = o_.prefix_ladder_tokens,
                                .min_gap_tokens = o_.prefix_min_gap_tokens};
             config.kv_pages = pool_->capacity_pages();
-            // The source choice's machine model (runtime/prefix_cache/cost.h), a linear fit of the prompt route's measured
-            // rates (RTX 5090, infernix_bench C = 1, pp2048, 2026-11-21: 9,514 tokens a second in chunks of 512, 16,400
-            // in chunks of 2,048): ~30 ms a call and 1 / 21,600 s a token. Host-to-Device at 22 GB/s, an estimate for
-            // the PCIe x8 link (restores are not measured yet). It only ranks a snapshot against a root start.
-            config.index.cost.chunk_tokens           = o_.prefill_chunk;
-            config.index.cost.chunk_seconds          = 30.0e-3;
-            config.index.cost.token_seconds          = 1.0 / 21600.0;
-            config.index.cost.attention_pair_seconds = 0.0;
-            if (o_.lossless) {
-                // The lossless route's calls (lossless-route.md §3a; inkling2-mini, RTX 5090, 2026-11-23): about 0.27 s a
-                // call (infernix --lossless, one-column decode calls at a 20-token context, 3.6 tok/s), then 3.1 ms a
-                // token and 0.89 us a (query, key) pair, fitted to its scoring runs (infernix-perplexity: 11 windows of
-                // 2,048 tokens in 93.7 s, 2 of 9,216 in 133.5 s).
-                config.index.cost.chunk_seconds          = 0.27;
-                config.index.cost.token_seconds          = 3.1e-3;
-                config.index.cost.attention_pair_seconds = 0.89e-6;
-            }
+            // The source choice's machine model (runtime/prefix_cache/cost.h): the prompt route's rates (prompt_cost) and
+            // Host-to-Device at 22 GB/s, an estimate for the PCIe x8 link (restores are not measured yet). It ranks a
+            // snapshot against a root start, values snapshots for eviction and prices a coalescing wait (await_sibling).
+            config.index.cost                        = prompt_cost_;
             config.index.cost.h2d_bytes_per_second   = 22.0e9;
             config.ssd_bytes                         = o_.prefix_ssd_bytes;
             config.ssd_directory                     = o_.prefix_ssd_directory;
@@ -531,9 +565,10 @@ public:
         }
         base->tokens                          = std::move(data->token_ids);
         base->options                         = options;
-        // Background requests (next-turn prefill) are not built for this model; a request that may not reuse history
-        // also publishes none.
-        base->reuse        = prefix_ != nullptr && options.allow_prefix_reuse && !options.background && data->reusable;
+        // A request that may not reuse history also publishes none. A background request (the Engine's idle next-turn
+        // prefill: a finished turn's history as the next request renders it, one output token) reuses and publishes
+        // as any other: its taps are what the next request resumes from.
+        base->reuse        = prefix_ != nullptr && options.allow_prefix_reuse && data->reusable;
         base->block_hashes = std::move(data->block_hashes);
         base->block_extras = std::move(data->block_extras);
         base->tap_hints    = std::move(data->tap_hints);
@@ -597,15 +632,17 @@ public:
         std::erase_if(match.candidates, [&](const pc::MatchCandidate& c) {
             return excluded(spans, c.frontier) || c.filling_blocks != 0;
         });
-        if (match.candidates.empty()) { return {root}; }
         std::optional<std::size_t> picked;
         if (r != nullptr) {
             for (std::size_t i = 0; i < match.candidates.size(); ++i) {
                 if (!picked || match.candidates[i].frontier > match.candidates[*picked].frontier) { picked = i; }
             }
-        } else {
+        } else if (!match.candidates.empty()) {
             picked = prefix_->index().choose(match, n).candidate;
         }
+        // A fresh request sharing more with a prefilling sibling than the cache serves now waits for its snapshot
+        // (await_sibling): no sources, and the Engine quotes it again at each of the sibling's prefill boundaries.
+        if (r == nullptr && await_sibling(b, picked ? match.candidates[*picked].frontier : 0U)) { return {}; }
         if (!picked) { return {root}; }
         const pc::MatchCandidate& c = match.candidates[*picked];
         if (c.ssd_bytes != 0) {
@@ -629,6 +666,91 @@ public:
         chosen.reuse_path          = PrefixReusePath::HybridSnapshot;
         chosen.cached_block_tokens = root.cached_block_tokens;
         return {chosen, root};
+    }
+
+    // In-flight coalescing (hybrid-prefix-cache-spec §12.2, as the Qwen families coalesce): a fresh request whose prompt
+    // shares more with a lane still prefilling its prompt than the cache serves now (`reuse`: its chosen source's
+    // frontier, 0 at a root start) waits for that lane's snapshot at their divergence instead of prefilling the shared
+    // part again (four requests over one long document and different questions prefill the document's tail once).
+    // The target is the block boundary below the divergence (whole blocks of equal keys, a block's key carrying the
+    // media items that begin before its end, and equal tokens; at most n - 1 and inside the sibling's prompt), added to
+    // the sibling's taps as an exact boundary tap (neither lineage supersedes its snapshot); a planned exact tap of the
+    // sibling's at or below it serves instead when prefilling the tokens between them costs no more than a call. It
+    // waits only when the prefill it saves exceeds the split it may add, and when twice the sibling's predicted prefill
+    // to the target (other lanes' decode rounds interleave) is within the wait limit. The resumed request's bits are its
+    // cold run's: the prompt route is chunk-invariant and a snapshot is the state its positions computed.
+    // What an exact tap at `position` adds to the prefill it splits: a call, whose narrow remainder's attention walks
+    // every key before it on few CTAs (the prompt kernel's grid is its 64-column tiles x the KV heads), not the cost
+    // model's chunk_seconds alone. Measured (2026-11-26, RTX 5090, INT8 KV, the forward test's prefill profile after
+    // 122,000 positions): a 1-column call 134.9 ms, 125.5 of it attention; ~10 ms plus 1.0 us a key before it (served:
+    // a 56-token tail after 122,176 160 ms).
+    [[nodiscard]] double split_seconds(std::uint32_t position) const noexcept {
+        return prompt_cost_.chunk_seconds + 1.0e-6 * static_cast<double>(position);
+    }
+
+    [[nodiscard]] bool await_sibling(const BasePlanImpl& b, std::uint32_t reuse) {
+        namespace pc = runtime::prefix_cache;
+        if (o_.prefix_coalesce_wait_seconds <= 0.0) { return false; }
+        const auto n = static_cast<std::uint32_t>(b.tokens.size());
+        if (n < 2) { return false; }
+        const pc::CacheCostModel& cost = prefix_->index().config().cost;
+        const auto extra = [](const std::vector<std::uint64_t>& extras, std::size_t i) {
+            return i < extras.size() ? extras[i] : 0U;
+        };
+        struct Wait {
+            std::uint32_t lane = 0, target = 0;
+            bool plan_tap = false;
+        };
+        std::optional<Wait> best;
+        for (std::uint32_t i = 0; i < lanes_.size(); ++i) {
+            const Lane& lane = lanes_[i];
+            if (!lane.bound || lane.replay || !lane.prefix.reuse || lane.processed >= lane.prompt_tokens) { continue; }
+            const std::uint32_t limit = std::min<std::uint32_t>(n - 1U, lane.prompt_tokens - 1U);
+            const auto equal          = static_cast<std::uint32_t>(
+                std::mismatch(b.tokens.begin(), b.tokens.begin() + limit, lane.tokens.begin()).first - b.tokens.begin());
+            std::size_t blocks = equal / pc::kBlockTokens;
+            for (std::size_t k = 0; k < blocks; ++k) {
+                if (k >= b.block_hashes.size() || k >= lane.prefix.hashes.size() || b.block_hashes[k] != lane.prefix.hashes[k] ||
+                    extra(b.block_extras, k) != extra(lane.prefix.extras, k)) {
+                    blocks = k;
+                    break;
+                }
+            }
+            const auto aligned = static_cast<std::uint32_t>(blocks * pc::kBlockTokens);
+            if (aligned <= reuse || aligned <= lane.processed || aligned <= lane.prefix.base) { continue; }
+            Wait wait{.lane = i, .target = aligned, .plan_tap = true};
+            for (const pc::PlannedTap& tap : lane.prefix.taps) {
+                if (tap.position > aligned) { break; }
+                if (tap.placement != pc::TapPlacement::Exact || tap.position <= lane.processed || tap.position <= reuse) {
+                    continue;
+                }
+                if (tap.position == aligned || cost.prefill_seconds(tap.position, aligned - tap.position) <= split_seconds(aligned)) {
+                    wait = Wait{.lane = i, .target = tap.position, .plan_tap = false}; // planned already
+                }
+            }
+            if (excluded(image_spans(lane.images), wait.target) ||
+                std::find(lane.prefix.frontiers.begin(), lane.prefix.frontiers.end(), wait.target) != lane.prefix.frontiers.end()) {
+                continue;
+            }
+            const double saved     = cost.prefill_seconds(reuse, wait.target - reuse);
+            const double predicted = 2.0 * cost.prefill_seconds(lane.processed, wait.target - lane.processed);
+            if (saved > (wait.plan_tap ? split_seconds(wait.target) : 0.0) && predicted <= o_.prefix_coalesce_wait_seconds &&
+                (!best || wait.target > best->target)) {
+                best = wait;
+            }
+        }
+        if (!best) { return false; }
+        // The snapshot the waiting request resumes from is where two conversations diverge: a boundary.
+        std::vector<pc::PlannedTap>& taps = lanes_[best->lane].prefix.taps;
+        const auto at = std::lower_bound(taps.begin(), taps.end(), best->target,
+                                         [](const pc::PlannedTap& tap, std::uint32_t position) { return tap.position < position; });
+        if (at != taps.end() && at->position == best->target) {
+            at->boundary  = true;
+            at->placement = pc::TapPlacement::Exact;
+        } else {
+            taps.insert(at, pc::PlannedTap{.position = best->target, .placement = pc::TapPlacement::Exact, .boundary = true});
+        }
+        return true;
     }
 
     // Makes `pages` free in the pool: evicts cached blocks (none a lane maps), waiting for a transfer when only
@@ -685,6 +807,7 @@ public:
         }
         ResumeStateImpl* r = ContractAccess::resume_impl(resume);
         if (resume != nullptr && r == nullptr) { throw std::logic_error("Inkling 2: a resume carries no state"); }
+        sweep_paused_captures();
         namespace pc            = runtime::prefix_cache;
         const BasePlanImpl& b   = *base.impl_;
         const std::uint32_t idx = lane_id.value;
@@ -746,6 +869,13 @@ public:
         Lane& lane = lanes_[lane_id.value];
         if (r != nullptr) {
             // The request as its pause left it: its ledger, sampling, constraint, timings and speculative counters.
+            // Its capture ids are the lane's again (forgotten at its release), so the Program's record of them goes.
+            if (r->captures_owner) {
+                std::erase_if(paused_captures_, [&](const PausedCaptures& p) {
+                    return !p.owner.owner_before(r->captures_owner) && !r->captures_owner.owner_before(p.owner);
+                });
+                r->captures_owner.reset();
+            }
             lane                = r->lane;
             lane.prefix.path    = {};
             lane.prefix.taps    = {};
@@ -893,6 +1023,25 @@ public:
         for (const pc::MatchCandidate& c : match.candidates) { lane.prefix.frontiers.push_back(c.frontier); }
         const auto spans = exclusions(b);
         lane.prefix.taps = pc::plan_taps(n, lane.prefix.base, b.tap_hints, lane.prefix.frontiers, spans, prefix_->taps());
+        // Cached blocks past the lane's base with no state to resume at their end: another prompt shares them and
+        // diverged there (one document, another question), so the next prompt diverging at or past that end would
+        // prefill from the base again. An exact boundary tap at the matched path's end serves it (in-flight coalescing's
+        // tap, for a request that arrives after this one), when the tokens it saves cost more than the split.
+        const auto matched = static_cast<std::uint32_t>(match.path.size()) * pc::kBlockTokens;
+        const pc::CacheCostModel& cost = prefix_->index().config().cost;
+        if (matched > lane.prefix.base + pc::kMinimumTapSeparation && matched <= n - 1U && !excluded(spans, matched) &&
+            std::find(lane.prefix.frontiers.begin(), lane.prefix.frontiers.end(), matched) == lane.prefix.frontiers.end() &&
+            cost.prefill_seconds(lane.prefix.base, matched - lane.prefix.base) > split_seconds(matched)) {
+            std::vector<pc::PlannedTap>& taps = lane.prefix.taps;
+            const auto at = std::lower_bound(taps.begin(), taps.end(), matched,
+                                             [](const pc::PlannedTap& tap, std::uint32_t position) { return tap.position < position; });
+            if (at != taps.end() && at->position == matched) {
+                at->boundary  = true;
+                at->placement = pc::TapPlacement::Exact;
+            } else {
+                taps.insert(at, pc::PlannedTap{.position = matched, .placement = pc::TapPlacement::Exact, .boundary = true});
+            }
+        }
     }
 
     ContextProgress poll_context() {
@@ -928,6 +1077,7 @@ public:
     // request's output equals a cold one's). The lane is then released and the Engine receives the ResumeState.
     bool start_pause(SequenceHandle sequence) {
         if (binding_ || pause_ || pending_) { return false; }
+        sweep_paused_captures();
         const std::uint32_t index = lane_of(sequence);
         Lane& lane                = lanes_[index];
         {
@@ -951,6 +1101,10 @@ public:
         saved->lane.prefix.restore.reset();
         saved->lane.prefix.capture = 0;
         saved->lane.constraint_round.clear();
+        if (prefix_ && !saved->lane.prefix.captures.empty()) {
+            saved->captures_owner = std::make_shared<const int>(0);
+            paused_captures_.push_back({saved->captures_owner, saved->lane.prefix.captures});
+        }
         release(index, true);
         const std::uint32_t frontier = saved->target;
         pause_.emplace(ContractAccess::resume(std::move(saved), frontier));
@@ -1115,20 +1269,191 @@ public:
     }
 
     // ---------------------------------------------------------------- execution
+    // A lane's next prefill unit: the prefill chunk, ended at an exact tap the image after the call would not reach
+    // (every chunk gives the same bits).
+    [[nodiscard]] std::uint32_t prefill_unit(const Lane& lane) const {
+        std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, lane.prompt_tokens - lane.processed);
+        for (const runtime::prefix_cache::PlannedTap& tap : lane.prefix.taps) {
+            if (tap.placement != runtime::prefix_cache::TapPlacement::Exact || tap.position <= lane.processed) { continue; }
+            if (tap.position + capture_reach() < lane.processed + chunk) { chunk = tap.position - lane.processed; }
+            break;
+        }
+        return chunk;
+    }
+
+    // The prefilling lane of `sequence` (its prompt not done, not replaying), or null.
+    [[nodiscard]] const Lane* prefilling(SequenceHandle sequence) const noexcept {
+        if (!valid(sequence)) { return nullptr; }
+        const Lane& lane = lanes_[ContractAccess::lane(sequence)];
+        return lane.processed < lane.prompt_tokens && !lane.replay ? &lane : nullptr;
+    }
+
+    // Program::prefill_joins.
+    [[nodiscard]] bool prefill_joins(std::span<const SequenceHandle> units, SequenceHandle companion) const {
+        if (lossless_ || units.empty() || units.size() >= lanes_.size()) { return false; }
+        const Lane* joining = prefilling(companion);
+        if (joining == nullptr) { return false; }
+        const std::uint32_t unit = prefill_unit(*joining);
+        if (joining->processed + unit != joining->prompt_tokens || unit > Program::kPrefillCompanionTokens) { return false; }
+        std::uint64_t columns = unit;
+        for (const SequenceHandle& s : units) {
+            const Lane* lane = prefilling(s);
+            if (lane == nullptr || lane == joining) { return false; }
+            columns += prefill_unit(*lane);
+        }
+        return columns <= static_cast<std::uint64_t>(forward_.capacity());
+    }
+
+    // A provider's rows rows[r] as its rows r: a prefill group's sampling lanes (their positions in the group).
+    class RowSubset final : public runtime::TokenMaskProvider {
+    public:
+        RowSubset(runtime::TokenMaskProvider& base, std::span<const std::uint32_t> rows) noexcept : base_(base), rows_(rows) {}
+        [[nodiscard]] bool constrained(std::size_t row) const noexcept override { return base_.constrained(rows_[row]); }
+        [[nodiscard]] runtime::ReasoningBan reasoning_ban(std::size_t row) const noexcept override {
+            return base_.reasoning_ban(rows_[row]);
+        }
+        std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts, std::span<std::uint32_t> words) override {
+            return base_.fill(rows_[row], drafts, words);
+        }
+        void uploaded(std::size_t row, std::size_t bytes) noexcept override { base_.uploaded(rows_[row], bytes); }
+
+    private:
+        runtime::TokenMaskProvider& base_;
+        std::span<const std::uint32_t> rows_;
+    };
+
+    // Program::advance_prefill_group: each lane's unit as advance_prefill runs it, the lanes' columns in the call's
+    // order, the head over the completing lanes' last columns at once (Forward::head_rows) and one sample of them.
+    PrefillGroupProgress advance_prefill_group(std::span<const SequenceHandle> sequences, runtime::TokenMaskProvider* masks) {
+        const auto start = Clock::now();
+        if (pending_) { throw std::logic_error("Inkling 2: a pending batch awaits its commit"); }
+        if (lossless_ || sequences.empty() || sequences.size() > lanes_.size()) {
+            throw std::invalid_argument("Inkling 2: a prefill group is 1-8 prefilling lanes, not on --lossless");
+        }
+        struct Unit {
+            std::uint32_t index = 0, chunk = 0, column = 0;
+            bool last = false, timed = false;
+            std::array<cudaEvent_t, 2> events{};
+        };
+        std::vector<Unit> units;
+        CallPlan call;
+        call.prompt = true;
+        std::uint32_t call_lanes = 0;
+        for (const SequenceHandle& s : sequences) {
+            Unit u;
+            u.index = lane_of(s);
+            if (prefilling(s) == nullptr) { throw std::logic_error("Inkling 2: a prefill group's lane is not prefilling"); }
+            for (const Unit& other : units) {
+                if (other.index == u.index) { throw std::logic_error("Inkling 2: a lane twice in a prefill group"); }
+            }
+            const Lane& lane = lanes_[u.index];
+            u.chunk          = prefill_unit(lane);
+            u.last           = lane.processed + u.chunk == lane.prompt_tokens;
+            u.column         = static_cast<std::uint32_t>(call.tokens.size());
+            for (std::uint32_t i = 0; i < u.chunk; ++i) {
+                call.tokens.push_back(lane.tokens[lane.processed + i]);
+                call.lane.push_back(static_cast<std::int32_t>(u.index));
+                call.position.push_back(static_cast<std::int32_t>(lane.processed + i));
+            }
+            call_lanes = std::max(call_lanes, u.index + 1);
+            units.push_back(u);
+        }
+        if (call.tokens.size() > static_cast<std::size_t>(forward_.capacity())) {
+            throw std::logic_error("Inkling 2: a prefill group wider than the prefill chunk");
+        }
+        // first: each sequence's first position (every lane's sequence starts at 0).
+        call.first.assign(call_lanes, 0);
+        // Each lane's device prefill time is the whole call's (its unit took that long): a pair of events a timed lane,
+        // as advance_prefill's.
+        for (Unit& u : units) {
+            Lane& lane = lanes_[u.index];
+            settle_prefill_events(lane, false);
+            u.timed = lane.processed + u.chunk > lane.counted;
+            if (u.timed) {
+                u.events = take_timing_pair();
+                lane.prefill_events.push_back(u.events);
+            }
+        }
+        upload(call);
+        for (const Unit& u : units) {
+            if (u.timed) { CUDA_CHECK(cudaEventRecord(u.events[0], device_.stream)); }
+        }
+        run_forward(0, 0, [&] {
+            for (const Unit& u : units) {
+                const Lane& lane = lanes_[u.index];
+                overlay_images(lane.images, lane.processed, u.chunk, u.column);
+            }
+        });
+        if (drafter_) { drafter_->append(0, static_cast<std::int32_t>(call.tokens.size()), device_.stream); }
+        PrefillGroupProgress out;
+        std::vector<std::int32_t> heads;
+        for (std::uint32_t i = 0; i < units.size(); ++i) {
+            if (!units[i].last) { continue; }
+            heads.push_back(static_cast<std::int32_t>(units[i].column + units[i].chunk - 1));
+            out.completed.push_back(i);
+        }
+        if (!heads.empty()) { forward_.head_rows(heads, device_.stream); }
+        for (const Unit& u : units) {
+            if (u.timed) { CUDA_CHECK(cudaEventRecord(u.events[1], device_.stream)); }
+        }
+        for (const Unit& u : units) {
+            Lane& lane = lanes_[u.index];
+            lane.processed += u.chunk;
+            const std::size_t captured = lane.prefix.captures.size();
+            publish_prefill(u.index);
+            PrefillProgress p;
+            p.snapshot_published = lane.prefix.captures.size() != captured;
+            p.summary = {.prompt_tokens        = lane.prompt_tokens,
+                         .reused_prompt_tokens = lane.reused_prompt,
+                         .prefix_reuse_path = lane.reused_prompt != 0 ? PrefixReusePath::HybridSnapshot : PrefixReusePath::Root};
+            p.processed_prompt_tokens = lane.processed > lane.counted ? lane.processed - lane.counted : 0U;
+            lane.counted              = std::max(lane.counted, lane.processed);
+            p.complete                = u.last;
+            out.lanes.push_back(std::move(p));
+        }
+        if (!out.completed.empty()) {
+            const std::uint64_t transaction = ++transaction_;
+            std::vector<SequenceHandle> rows;
+            std::vector<std::uint32_t> indices;
+            std::vector<std::int32_t> logit_rows;
+            for (std::size_t r = 0; r < out.completed.size(); ++r) {
+                const std::uint32_t index = units[out.completed[r]].index;
+                rows.push_back(handle(index));
+                indices.push_back(index);
+                logit_rows.push_back(static_cast<std::int32_t>(r)); // head_rows' row r
+                // A readout reads its logits before a token constraint masks them in place for the sampler.
+                const Lane& lane = lanes_[index];
+                if (!lane.options.readout_tokens.empty()) {
+                    out.lanes[out.completed[r]].readout = readout(lane, static_cast<std::int32_t>(r));
+                }
+            }
+            std::optional<RowSubset> subset;
+            if (masks != nullptr) { subset.emplace(*masks, out.completed); }
+            sample(rows, indices, logit_rows, ops::kSamplePurposePrefill, subset ? &*subset : nullptr);
+            for (const Unit& u : units) { settle_prefill_events(lanes_[u.index], true); } // the sample synchronized
+            out.timing = timing_since(start);
+            out.pending.emplace(ContractAccess::batch(this, transaction, rows, {sampled_tokens_.data(), rows.size()},
+                                                      out.timing, {failures_.data(), rows.size()}));
+            pending_      = transaction;
+            pending_kind_ = PendingKind::Prefill;
+        } else {
+            out.timing = timing_since(start);
+        }
+        for (std::size_t i = 0; i < units.size(); ++i) {
+            lanes_[units[i].index].prefill_ns += elapsed_ns(start);
+            out.lanes[i].timing = out.timing;
+        }
+        return out;
+    }
+
     PrefillProgress advance_prefill(SequenceHandle sequence, runtime::TokenMaskProvider* masks) {
         const auto start = Clock::now();
         if (pending_) { throw std::logic_error("Inkling 2: a pending batch awaits its commit"); }
         const std::uint32_t index = lane_of(sequence);
         Lane& lane                = lanes_[index];
         if (lane.processed >= lane.prompt_tokens) { throw std::logic_error("Inkling 2: the prompt is already prefilled"); }
-        std::uint32_t chunk = std::min<std::uint32_t>(o_.prefill_chunk, lane.prompt_tokens - lane.processed);
-        // An exact tap the image after this call would not reach ends the call there (every chunk gives the same bits).
-        for (const runtime::prefix_cache::PlannedTap& tap : lane.prefix.taps) {
-            if (tap.placement != runtime::prefix_cache::TapPlacement::Exact || tap.position <= lane.processed) { continue; }
-            if (tap.position + capture_reach() < lane.processed + chunk) { chunk = tap.position - lane.processed; }
-            break;
-        }
-        const bool last = lane.processed + chunk == lane.prompt_tokens;
+        const std::uint32_t chunk = prefill_unit(lane);
+        const bool last           = lane.processed + chunk == lane.prompt_tokens;
         CallPlan call;
         // first: the sequence's first position (every lane's sequence starts at 0), not the call's first column.
         call.first.assign(index + 1, 0);
@@ -1264,11 +1589,13 @@ public:
             RowsCost& cost = rows_cost(sequences);
             if (drafted) {
                 // A drafted round whose width verified nothing: its drafts were spent for the rows' plain tokens.
-                ewma(cost.draft_wall, static_cast<double>(ns) * 1e-6);
-                ewma(cost.draft_tokens, static_cast<double>(rows.size()));
+                ++cost.draft_samples;
+                rate(cost.draft_wall, static_cast<double>(ns) * 1e-6, cost.draft_samples);
+                rate(cost.draft_tokens, static_cast<double>(rows.size()), cost.draft_samples);
             } else if (device_ms > 0.0F) {
-                ewma(cost.plain_ms, device_ms);
-                ewma(cost.plain_wall, static_cast<double>(ns) * 1e-6);
+                ++cost.plain_samples;
+                rate(cost.plain_ms, device_ms, cost.plain_samples);
+                rate(cost.plain_wall, static_cast<double>(ns) * 1e-6, cost.plain_samples);
             }
         }
         for (const std::uint32_t index : rows) {
@@ -1692,7 +2019,20 @@ private:
             drop_prefill_events(lanes_[index]);
             lanes_[index] = Lane{};
             clear_failed_prefix();
+            sweep_paused_captures();
+            inkling2::testing::record_known_captures(prefix_ ? prefix_->known_captures() : 0U);
         }
+    }
+    // The capture ids of paused requests whose ResumeState is gone (the Engine dropped a request cancelled while
+    // paused): forgotten (paused_captures_).
+    void sweep_paused_captures() noexcept {
+        std::erase_if(paused_captures_, [&](const PausedCaptures& p) {
+            if (!p.owner.expired()) { return false; }
+            if (prefix_) {
+                for (const std::uint64_t id : p.ids) { prefix_->forget_capture(id); }
+            }
+            return true;
+        });
     }
     // bf16p: forgets a lane's rows with no packed form (a new request, or rejected draft rows the next calls overwrite).
     // A fresh lane's quantized windows (BF16 windows are zeroed with its image).
@@ -2357,6 +2697,7 @@ private:
         }
         prefix_->clear();
         prefix_withdrawal_ = {}; // its references would name the rebuilt index's entries
+        paused_captures_.clear(); // and so would the capture ids (the cleared cache knows none)
         prefix_failed_     = false;
     }
 
@@ -2384,11 +2725,11 @@ private:
     }
 
     // The image rows of a prompt chunk [first, first + count) over its embedding columns (after the embedding norm,
-    // as the reference scatters them): each overlapping image encoded, unless the tower still holds its rows (an
-    // image across chunks encodes once), and its overlapping rows copied. `encoded_set_` keeps the encoded image's
-    // prompt alive, so its address names it until another image is encoded.
+    // as the reference scatters them; the chunk's first column `column` of the call): each overlapping image encoded,
+    // unless the tower still holds its rows (an image across chunks encodes once), and its overlapping rows copied.
+    // `encoded_set_` keeps the encoded image's prompt alive, so its address names it until another image is encoded.
     void overlay_images(const std::shared_ptr<const std::vector<PromptImage>>& images, std::uint32_t first,
-                        std::uint32_t count) {
+                        std::uint32_t count, std::uint32_t column = 0) {
         if (!images) { return; }
         const std::size_t width = c_.hidden_size;
         for (std::size_t i = 0; i < images->size(); ++i) {
@@ -2404,7 +2745,7 @@ private:
                 encoded_index_ = i;
             }
             const std::uint32_t lo = std::max(begin, first), hi = std::min(end, first + count);
-            CUDA_CHECK(cudaMemcpyAsync(forward_.buffers().e + (lo - first) * width, encoded_rows_ + (lo - begin) * width,
+            CUDA_CHECK(cudaMemcpyAsync(forward_.buffers().e + (column + lo - first) * width, encoded_rows_ + (lo - begin) * width,
                                        (hi - lo) * width * 2, cudaMemcpyDeviceToDevice, device_.stream));
         }
     }
@@ -2671,6 +3012,7 @@ private:
         double plain_ms = 0;                                         // a plain round's forward and sample (device)
         std::array<double, ops::inkling2::kDSparkBlock> verify_ms{}; // [k]: the verify call of 1 + k columns a row
         double plain_wall = 0, draft_wall = 0, draft_tokens = 0;     // host ms of a round; a drafted round's tokens
+        std::uint64_t plain_samples = 0, draft_samples = 0;          // the rates' samples so far (rate)
         std::uint64_t rounds = 0, skipped = 0;                       // drafted rounds; plain ones since the last draft
         // What the policy did since the last report (report_rows): the widths it chose, the rounds it left plain, the
         // dealt rounds' expected tokens over K each's at the same columns, and the rounds that dealt a row every draft
@@ -2705,6 +3047,14 @@ private:
     static constexpr std::uint64_t kRowsPlainProbe = 64;
     static void ewma(double& value, double sample) noexcept {
         value = value == 0.0 ? sample : (1.0 - kCostWeight) * value + kCostWeight * sample;
+    }
+    // The plain and drafted rates: the mean of a bucket's first 1 / kCostWeight samples, then the EWMA. An EWMA seeded
+    // at full weight by a cold bucket's first round (its captures excluded, its text's first tokens) that started low
+    // recovered by a tenth a probe, one probe in kRowsProbe rounds: cold 2K buckets of four rows left 143-375 rounds
+    // plain where drafting was faster (2026-11-26). `samples` counts this one.
+    static void rate(double& value, double sample, std::uint64_t samples) noexcept {
+        const double weight = std::max(kCostWeight, 1.0 / static_cast<double>(samples));
+        value               = samples <= 1 ? sample : (1.0 - weight) * value + weight * sample;
     }
 
     // Whether every row could draft: its one pending input (no forced tokens), its drafter context (F >= 1), a whole
@@ -2747,6 +3097,7 @@ private:
             return true;
         }
         ++cost.plain_rounds;
+        for (const SequenceHandle& s : sequences) { ++lanes_[lane_of(s)].rates_plain; }
         return false;
     }
 
@@ -3075,8 +3426,9 @@ private:
         const std::uint64_t transaction = ++transaction_;
         const std::uint64_t ns          = elapsed_ns(start);
         if (!round_captured_) {
-            ewma(cost.draft_wall, static_cast<double>(ns) * 1e-6);
-            ewma(cost.draft_tokens, static_cast<double>(committed));
+            ++cost.draft_samples;
+            rate(cost.draft_wall, static_cast<double>(ns) * 1e-6, cost.draft_samples);
+            rate(cost.draft_tokens, static_cast<double>(committed), cost.draft_samples);
         }
         for (std::size_t r = 0; r < n; ++r) {
             lanes_[index[r]].decode_ns += ns;
@@ -3178,13 +3530,15 @@ private:
         if (!drafter_ || lane.rounds == 0 || !o_.diagnostics.callback) { return; }
         try {
             const double n = static_cast<double>(lane.rounds);
-            char text[256];
+            char text[320];
             std::snprintf(text, sizeof(text),
                           "Inkling 2 DSpark: %llu rounds (%llu plain), %llu of %llu drafts accepted; a round's draft "
-                          "%.3f ms, host gap %.3f ms, verify call %.3f ms (device means)",
+                          "%.3f ms, host gap %.3f ms, verify call %.3f ms (device means); %llu rounds of several rows "
+                          "plain by the rates",
                           static_cast<unsigned long long>(lane.rounds), static_cast<unsigned long long>(lane.fallback),
                           static_cast<unsigned long long>(lane.accepted), static_cast<unsigned long long>(lane.drafted),
-                          lane.draft_ms / n, lane.gap_ms / n, lane.verify_ms / n);
+                          lane.draft_ms / n, lane.gap_ms / n, lane.verify_ms / n,
+                          static_cast<unsigned long long>(lane.rates_plain));
             o_.diagnostics.callback(Diagnostic{.level = DiagnosticLevel::Debug, .message = text});
         } catch (...) {}
     }
@@ -3701,6 +4055,7 @@ private:
     const TextConfig& c_;
     DeviceContext& device_;
     ProgramOptions o_;
+    const runtime::prefix_cache::CacheCostModel prompt_cost_ = prompt_cost(o_); // after o_
     ProgramDevicePlan plan_;
     Forward forward_;
     std::unique_ptr<LosslessForward> lossless_; // --lossless (scored windows; generation's cache form)
@@ -3774,6 +4129,15 @@ private:
     std::uint64_t prefix_saves_        = 0; // saves of the cache file that succeeded
     // Entries a withdrawal found pinned by another lane: withdrawn at a later release or before a save.
     runtime::prefix_cache::Withdrawal prefix_withdrawal_;
+    // The capture ids a paused request's ResumeState keeps (for a withdrawal after its resume), each with a token the
+    // ResumeState holds: the Engine drops a cancelled paused request's state without telling the Program, so an
+    // expired token's ids are forgotten at the next pause, binding or release (sweep_paused_captures). A resume's
+    // binding takes its ids back (its lane forgets them at its release).
+    struct PausedCaptures {
+        std::weak_ptr<const void> owner;
+        std::vector<std::uint64_t> ids;
+    };
+    std::vector<PausedCaptures> paused_captures_;
     std::optional<runtime::prefix_cache::PersistResult> prefix_shutdown_save_;
     // bf16p: device [kMaximumConcurrency], each lane's lowest appended position with no packed form, and its last
     // reading.
@@ -4048,6 +4412,15 @@ runtime::ResourceReservation Program::reserve_units(std::span<const ExecutionUni
 
 PrefillProgress Program::advance_prefill(SequenceHandle sequence, runtime::ExecutionTiming*, runtime::TokenMaskProvider* masks) {
     return impl_->advance_prefill(sequence, masks);
+}
+
+bool Program::prefill_joins(std::span<const SequenceHandle> units, SequenceHandle companion) const {
+    return impl_->prefill_joins(units, companion);
+}
+
+PrefillGroupProgress Program::advance_prefill_group(std::span<const SequenceHandle> sequences, runtime::ExecutionTiming*,
+                                                    runtime::TokenMaskProvider* masks) {
+    return impl_->advance_prefill_group(sequences, masks);
 }
 
 PendingBatch Program::decode(std::span<const SequenceHandle> sequences, std::span<const runtime::RoundBudget> budgets,

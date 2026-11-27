@@ -147,6 +147,8 @@ RequestBasePlan ProgramImpl::plan_request(PreparedPromptData&& prompt,
     base->background                     = options.background;
     base->summary.publish_continuation =
         options.allow_prefix_reuse && prompt.identity.reusable && context_cache.enabled;
+    // Its blocks and taps still publish without the endpoint (ResolvedExecutionOptions::publish_endpoint).
+    base->summary.publish_endpoint = options.publish_endpoint;
     if (prompt.has_media()) {
         if (!workspace_plan.vision) {
             throw std::logic_error("Vision prompt has no startup workspace plan");

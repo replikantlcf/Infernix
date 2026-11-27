@@ -120,6 +120,41 @@ public:
         return membership;
     }
 
+    // Decisions (Request::is_decision) enter the fresh queue ahead of the waiting requests that are not
+    // decisions, in arrival order among themselves, and each request a decision passes is charged one
+    // bypass of its FIFO allowance (`concurrency`, as fresh_candidates and admitted charge a younger
+    // admission): a decision stops behind a request whose allowance is spent. So every waiting request is
+    // still admitted after at most `concurrency` requests that arrived after it, decisions included
+    // (resource-scheduling §5.1 and §5.4), however many decisions arrive.
+    static void enqueue(std::deque<RequestPtr>& fresh, RequestPtr request, std::uint32_t concurrency) {
+        if (!request->is_decision()) {
+            fresh.push_back(std::move(request));
+            return;
+        }
+        std::size_t at = fresh.size();
+        while (at > 0 && !fresh[at - 1]->is_decision() && fresh[at - 1]->admission_bypasses < concurrency) { --at; }
+        for (std::size_t i = at; i < fresh.size(); ++i) { ++fresh[i]->admission_bypasses; }
+        fresh.insert(fresh.begin() + static_cast<std::ptrdiff_t>(at), std::move(request));
+    }
+
+    // The lane a request may bind. The last `decision_lanes` lanes take only decisions; a decision
+    // tries them first, then the general lanes. `is_free(lane)` reports an unoccupied lane.
+    template <class IsFree>
+    [[nodiscard]] static std::optional<std::uint32_t>
+    free_lane(std::uint32_t concurrency, std::uint32_t decision_lanes, bool decision,
+              const IsFree& is_free) {
+        const std::uint32_t general = concurrency - std::min(decision_lanes, concurrency);
+        if (decision) {
+            for (std::uint32_t lane = general; lane < concurrency; ++lane) {
+                if (is_free(lane)) { return lane; }
+            }
+        }
+        for (std::uint32_t lane = 0; lane < general; ++lane) {
+            if (is_free(lane)) { return lane; }
+        }
+        return std::nullopt;
+    }
+
     // The lane whose prefill or Replay unit runs next: the least remaining prompt first, aged
     // (engine-architecture §"Prefill order"). A lane's key is the prompt tokens it still prefills (a
     // Replay counts none: it resumes a request that already had its turn) minus half the tokens other
@@ -128,10 +163,27 @@ public:
     // together reach their first tokens one after another instead of all together, and a short prompt
     // beside a long one goes first; a waiting lane outranks any newcomer once others have prefilled twice
     // its remaining prompt, which bounds its wait. Ties go to the rotation order after the last lane
-    // served. Each unit keeps the request's own chunk grid: only the order of units changes.
+    // served. Each unit keeps the request's own chunk grid: only the order of units changes. A
+    // prefilling or replaying decision (the oldest one) goes ahead of that order, so a decision waits
+    // at most one prefill unit of another request, unless a lane that is not a decision has waited past
+    // its bound (its key below 0: other lanes, decisions included, prefilled more than twice its remaining
+    // prompt while it waited, or a Replay waited at all): the aged order then serves it first, so the
+    // bound holds however many decisions arrive.
     template <class Slots>
     [[nodiscard]] std::optional<std::uint32_t>
     next_prefill(const Slots& slots, std::uint32_t concurrency) const noexcept {
+        std::optional<std::uint32_t> decision;
+        bool overdue = false;
+        for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
+            const auto& request = slots[lane];
+            if (!request || !(request->is_prefilling() || request->is_replaying())) { continue; }
+            if (!request->is_decision()) {
+                overdue = overdue || prefill_key(*request, lane) < 0;
+            } else if (!decision || request->id < slots[*decision]->id) {
+                decision = lane;
+            }
+        }
+        if (decision && !overdue) { return decision; }
         std::optional<std::uint32_t> best;
         std::int64_t best_key = 0;
         for (std::uint32_t offset = 0; offset < concurrency; ++offset) {
@@ -178,11 +230,12 @@ public:
     }
 
     // After lane `lane`'s unit prefilled or replayed `tokens`: every other lane still prefilling or
-    // replaying waited that long.
+    // replaying waited that long. A decision's unit is taken out of order, so it leaves the rotation
+    // where it was.
     template <class Slots>
     void prefill_executed(std::uint32_t lane, std::uint32_t concurrency, const Slots& slots,
-                          std::uint32_t tokens) noexcept {
-        prefill_cursor_ = (lane + 1U) % concurrency;
+                          std::uint32_t tokens, bool decision = false) noexcept {
+        if (!decision) { prefill_cursor_ = (lane + 1U) % concurrency; }
         for (std::uint32_t other = 0; other < concurrency; ++other) {
             const auto& request = slots[other];
             if (other == lane || !request || !(request->is_prefilling() || request->is_replaying())) {
@@ -242,11 +295,13 @@ public:
         }
         if (admission_scan_remaining_.empty()) { return candidates; }
         candidates.push_back(fresh.front());
-        std::vector<RequestPtr> younger;
+        // Behind the head: the decisions first, in queue order (their place is their priority, and ids no
+        // longer follow it), then the other requests in the rotation after the last one checked.
+        std::vector<RequestPtr> decisions, younger;
         for (std::size_t i = 1; i < limit; ++i) {
             if (std::find(admission_scan_remaining_.begin(), admission_scan_remaining_.end(),
                           fresh[i]->id) != admission_scan_remaining_.end()) {
-                younger.push_back(fresh[i]);
+                (fresh[i]->is_decision() ? decisions : younger).push_back(fresh[i]);
             }
         }
         std::sort(younger.begin(), younger.end(),
@@ -255,8 +310,9 @@ public:
             return request->id > scan_after_;
         });
         std::rotate(younger.begin(), next, younger.end());
-        const auto count = std::min<std::size_t>(concurrency, younger.size());
-        candidates.insert(candidates.end(), younger.begin(), younger.begin() + count);
+        decisions.insert(decisions.end(), younger.begin(), younger.end());
+        const auto count = std::min<std::size_t>(concurrency, decisions.size());
+        candidates.insert(candidates.end(), decisions.begin(), decisions.begin() + count);
         return candidates;
     }
 
@@ -353,7 +409,9 @@ public:
     // could not pause): the one whose pause costs the fewest tokens to recompute on resume
     // (`replay(lane)`, the Program's pause_replay_tokens: none where the pause publishes the lane's
     // state at its frontier, from the deepest snapshot where it cannot, as a Qwen3.5 prefill whose
-    // DFlash2 ring is not whole), the youngest among equals. None without a turn.
+    // DFlash2 ring is not whole), the youngest among equals. None without a turn. A decision is a
+    // victim only when no other resident can be one: it finishes within a few units, and pausing it
+    // would cost a Replay for nothing.
     template <class Slots, class Replay = UniformPauseCost>
     [[nodiscard]] std::optional<std::uint32_t>
     preemption_victim(const Slots& slots, std::uint32_t concurrency,
@@ -363,6 +421,8 @@ public:
         if (!owner) { return std::nullopt; }
         std::optional<std::uint32_t> chosen;
         std::uint32_t chosen_cost = 0;
+        std::optional<std::uint32_t> chosen_decision;
+        std::uint32_t chosen_decision_cost = 0;
         for (std::uint32_t lane = 0; lane < concurrency; ++lane) {
             const auto& request = slots[lane];
             if (!request || request->id == *owner || request->is_materializing() ||
@@ -371,13 +431,14 @@ public:
                 continue;
             }
             const std::uint32_t cost = replay(lane);
-            if (!chosen || cost < chosen_cost ||
-                (cost == chosen_cost && request->id > slots[*chosen]->id)) {
-                chosen      = lane;
-                chosen_cost = cost;
+            auto& pick      = request->is_decision() ? chosen_decision : chosen;
+            auto& pick_cost = request->is_decision() ? chosen_decision_cost : chosen_cost;
+            if (!pick || cost < pick_cost || (cost == pick_cost && request->id > slots[*pick]->id)) {
+                pick      = lane;
+                pick_cost = cost;
             }
         }
-        return chosen;
+        return chosen ? chosen : chosen_decision;
     }
 
     // A turn grants 30 seconds of useful execution before it passes (the owner's choice, 2026-11-16, candidates

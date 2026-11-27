@@ -299,9 +299,9 @@ response events.
 A worker cycle first advances context transactions and terminal states and processes
 cancellation, ends a service turn that has served its slice, and while a turn is held under KV
 pressure tries a complete resume of its owner if it is paused. It then acquires unit permits row by
-row for resident requests (the turn's owner first, then original ticket order), uses the remaining
-headroom to try fresh admission when no turn is held, and then executes the runnable control and decode
-work and one prefill/Replay chunk. A protected resume gets the chunk first; decode batches use the
+row for resident requests (the turn's owner first, then a protected recovery, then decisions, then
+original ticket order), uses the remaining headroom to try fresh admission when no turn is held, and
+then executes the runnable control and decode work and one prefill/Replay chunk. A protected resume gets the chunk first; decode batches use the
 actual `B`.
 
 **Prefill order.** Among the other resident prefills and Replays, the chunk goes to the least remaining
@@ -312,8 +312,20 @@ its first token keeps the chunk, because its key falls by each token it prefills
 half of each, so prompts that arrive together reach their first tokens one after another (T, 2T, ... for
 equal prompts of time T, where a rotation gave them all about N x T), and a short prompt beside a long one
 goes first. A waiting lane outranks any newcomer once other lanes have prefilled twice its remaining
-prompt, which bounds its wait. Only the order of chunks changes: each request keeps its own chunk grid,
-so no output bit depends on it.
+prompt, which bounds its wait. A prefilling or replaying decision goes ahead of this order unless a lane
+that is not a decision has passed that bound (resource-scheduling §5.4). Only the order of chunks changes:
+each request keeps its own chunk grid, so no output bit depends on it.
+
+**Prefill groups.** A Program whose prompt calls take several lanes (Inkling 2: `prefill_joins`,
+`advance_prefill_group`) runs the permit's unit with companions: each other prefilling lane whose whole
+remaining prompt is one unit the Program admits (Inkling 2: at most 64 tokens, the call within the prefill
+chunk) joins the permit's prompt call, on a unit reservation of its own taken after the cycle's other
+rows'. A companion never reclaims, pauses or waits for capacity, and none joins during a service turn or
+a hand-over; a Replay, the next-turn pass and a lane waiting for its grammar never join. The lanes that
+complete sample together and commit as one pending batch; each lane's prefill time is the whole call's.
+The prompt route computes every column from its own inputs, so each lane's bits are its unit alone's (the
+forward test's prompt lanes case), and prompts admitted in one cycle reach their first tokens together
+instead of one call apart: a narrow call's time is mostly its fixed part.
 
 The Program's `reserve_units` atomically acquires the typed incremental demand of one call set; the
 Engine calls it row by row to form the runnable subset. One row lacking resources does not stop other

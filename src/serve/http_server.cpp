@@ -227,7 +227,8 @@ std::string_view canonical_api_path(std::string_view path) noexcept {
 
 httplib::TaskQueue* new_http_worker_pool(const ServeOptions& options) {
     const std::size_t queued_requests =
-        static_cast<std::size_t>(options.max_concurrency) + options.max_pending_requests;
+        static_cast<std::size_t>(options.max_concurrency) + options.decision_lanes +
+        options.max_pending_requests;
     const std::size_t worker_count = queued_requests + 1;
     // cpp-httplib runs each accepted connection's keep-alive loop as one pool task, so an
     // open connection — idle or not — occupies its worker for the whole idle window. Stock
@@ -266,8 +267,12 @@ HttpServer::HttpServer(ServeOptions options, std::shared_ptr<spdlog::logger> log
 HttpServer::RequestLifecycle::RequestLifecycle(HttpServer& owner, RequestLogContext context)
     : owner_(&owner), context_(std::move(context)) {
     owner_->record_request_start(context_);
-    owner_->live_requests_.begin(context_.id, context_.label, context_.protocol, context_.prompt_tokens,
-                                 context_.started);
+    owner_->live_requests_.begin(context_.id,
+                                 {.label             = context_.label,
+                                  .protocol          = context_.protocol,
+                                  .client_request_id = context_.client_request_id,
+                                  .session_id        = context_.session_id},
+                                 context_.prompt_tokens, context_.started);
 }
 
 HttpServer::RequestLifecycle::~RequestLifecycle() { owner_->live_requests_.end(context_.id); }
@@ -636,6 +641,26 @@ void HttpServer::register_routes() {
         res.set_header("Cache-Control", "no-store");
         res.set_content(render_monitor_json(service_->request_monitor(),
                                             live_requests_.rows(LiveRequests::Clock::now()), unix_time_seconds()),
+                        "application/json; charset=utf-8");
+    });
+    // llama.cpp's slot array, one object per lane (render_slots_json); ?fail_on_no_slot=1 answers 503 when
+    // every general lane is held, as llama.cpp's server does.
+    server_.Get("/slots", [this](const httplib::Request& req, httplib::Response& res) {
+        const infernix::EngineOptions& engine = service_->engine_options();
+        const SlotsFacts facts{.lanes          = engine.max_concurrency,
+                               .decision_lanes = engine.decision_lanes,
+                               .n_ctx          = engine.max_context,
+                               .speculative    = engine.speculative.backend != infernix::SpeculativeBackend::None};
+        const infernix::RequestMonitor monitor = service_->request_monitor();
+        res.set_header("Cache-Control", "no-store");
+        if (req.get_param_value("fail_on_no_slot") == "1" && slots_all_busy(monitor, facts)) {
+            write_openai_error(res, ApiError{.status  = 503,
+                                             .type    = "unavailable_error",
+                                             .message = "no slot available",
+                                             .code    = "no_slot_available"});
+            return;
+        }
+        res.set_content(render_slots_json(monitor, live_requests_.rows(LiveRequests::Clock::now()), facts),
                         "application/json; charset=utf-8");
     });
     server_.Get(api_route_pattern(R"(/models/(.+))"),
